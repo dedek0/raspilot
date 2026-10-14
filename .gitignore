@@ -1,0 +1,16 @@
+# Ambientes virtuais e caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Relatórios gerados (mantém apenas .gitkeep)
+reports/*
+!reports/.gitkeep
+
+# Artefatos locais
+*.egg-info/
+dist/
+build/
+.DS_Store

@@ -1,0 +1,2 @@
+# RASPilot — dependências de desenvolvimento/testes
+pytest>=7.0.0
