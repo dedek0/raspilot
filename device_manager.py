@@ -160,6 +160,50 @@ class DeviceManager:
         full_cmd += cmd
         return self._run(full_cmd, timeout=timeout)
 
+    def run_shell(self, command: str, timeout: int = DEFAULT_ADB_TIMEOUT) -> dict:
+        """Executa um comando shell no dispositivo **sem** levantar exceção.
+
+        Pensado para os checks de auditoria: qualquer falha (dispositivo
+        offline, comando inexistente, permissão negada) é capturada e
+        devolvida estruturada, para que o check registre ``error`` e
+        continue com os demais vetores.
+
+        Args:
+            command: Comando shell completo (ex: ``"ls /system/bin/su"``).
+                Pode usar pipes/redirecionamentos — o shell do dispositivo
+                processa a string inteira.
+            timeout: Timeout em segundos.
+
+        Returns:
+            Dict com ``ok`` (bool), ``rc`` (int), ``stdout`` e ``stderr``
+            (str). Em falha de execução local: ``ok=False, rc=-1``.
+        """
+        full_cmd = ["adb"]
+        if self.device_id:
+            full_cmd += ["-s", self.device_id]
+        full_cmd += ["shell", command]
+        try:
+            proc = subprocess.run(
+                full_cmd, capture_output=True, text=True, timeout=timeout, check=False
+            )
+            return {
+                "ok": proc.returncode == 0,
+                "rc": proc.returncode,
+                "stdout": (proc.stdout or "").strip(),
+                "stderr": (proc.stderr or "").strip(),
+            }
+        except FileNotFoundError as exc:
+            logger.warning("adb não encontrado no PATH: %s", exc)
+            return {"ok": False, "rc": -1, "stdout": "", "stderr": str(exc)}
+        except subprocess.TimeoutExpired:
+            logger.warning("Timeout (%ss) no shell: %s", timeout, command)
+            return {
+                "ok": False,
+                "rc": -1,
+                "stdout": "",
+                "stderr": f"timeout após {timeout}s",
+            }
+
     # ------------------------------------------------------------------
     # Conexão ADB
     # ------------------------------------------------------------------
