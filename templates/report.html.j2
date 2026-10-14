@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<!--
+  RASPilot — Relatório de Auditoria RASP
+  Template Jinja2 — gerado automaticamente; não edite manualmente.
+-->
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ tool_name }} — Relatório de Auditoria RASP — {{ metadata.package }}</title>
+<style>
+  :root {
+    --ok: #16a34a; --ok-bg: #dcfce7;
+    --fail: #dc2626; --fail-bg: #fee2e2;
+    --warn: #d97706; --warn-bg: #fef3c7;
+    --error: #7c3aed; --error-bg: #ede9fe;
+    --na: #6b7280; --na-bg: #f3f4f6;
+    --ink: #111827; --muted: #6b7280; --line: #e5e7eb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: #f9fafb; color: var(--ink); line-height: 1.5;
+  }
+  header {
+    background: linear-gradient(135deg, #0f172a, #1e3a5f);
+    color: #f8fafc; padding: 28px 32px;
+  }
+  .logo {
+    font-size: 28px; font-weight: 800; letter-spacing: 0.5px;
+  }
+  .logo .pilot { color: #38bdf8; }
+  .tagline { color: #cbd5e1; font-size: 14px; margin-top: 4px; }
+  main { max-width: 1000px; margin: 0 auto; padding: 24px 16px 64px; }
+  .meta {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px; margin: 20px 0 28px;
+  }
+  .meta .card {
+    background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
+  }
+  .meta .card .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .meta .card .value { font-weight: 600; margin-top: 2px; word-break: break-all; }
+  h2 { font-size: 20px; margin: 32px 0 12px; }
+  .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+  .summary-card {
+    background: #fff; border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px; border-left: 6px solid var(--na);
+  }
+  .summary-card.ok { border-left-color: var(--ok); }
+  .summary-card.falhou { border-left-color: var(--fail); }
+  .summary-card.error { border-left-color: var(--error); }
+  .summary-card.na { border-left-color: var(--na); }
+  .summary-card.skip { border-left-color: var(--na); }
+  .summary-card h3 { margin: 0 0 8px; font-size: 15px; }
+  .badge {
+    display: inline-block; padding: 2px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 700; letter-spacing: .03em;
+  }
+  .badge.ok { background: var(--ok-bg); color: var(--ok); }
+  .badge.falhou { background: var(--fail-bg); color: var(--fail); }
+  .badge.error { background: var(--error-bg); color: var(--error); }
+  .badge.na { background: var(--na-bg); color: var(--na); }
+  .badge.skip { background: var(--na-bg); color: var(--na); }
+  .summary-card ul { margin: 8px 0 0; padding-left: 18px; font-size: 13px; color: var(--muted); }
+  details {
+    background: #fff; border: 1px solid var(--line); border-radius: 10px;
+    margin: 12px 0; padding: 12px 16px;
+  }
+  details summary { cursor: pointer; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { background: #f8fafc; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  pre {
+    background: #0f172a; color: #e2e8f0; border-radius: 8px;
+    padding: 14px; overflow-x: auto; font-size: 12px;
+  }
+  footer { text-align: center; color: var(--muted); font-size: 12px; padding: 24px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">✈ <span>RASP</span><span class="pilot">ilot</span></div>
+  <div class="tagline">Piloto Automático de Auditoria RASP para Android — v{{ tool_version }}</div>
+</header>
+
+<main>
+  <div class="meta">
+    <div class="card"><div class="label">Pacote auditado</div><div class="value">{{ metadata.package }}</div></div>
+    <div class="card"><div class="label">Dispositivo</div><div class="value">{{ metadata.device.model }} ({{ metadata.device.serial }})</div></div>
+    <div class="card"><div class="label">Android</div><div class="value">{{ metadata.device.android_version }} (SDK {{ metadata.device.sdk }})</div></div>
+    <div class="card"><div class="label">ABI</div><div class="value">{{ metadata.device.abi }}</div></div>
+    <div class="card"><div class="label">Gerado em</div><div class="value">{{ generated_at }}</div></div>
+  </div>
+
+  <h2>Resumo das proteções</h2>
+  <p style="color:var(--muted);font-size:13px;margin-top:-4px;">
+    <strong>OK</strong> = a proteção do app funcionou ·
+    <strong>FALHOU</strong> = o bypass venceu ·
+    <strong>N/A</strong> = não aplicável ·
+    <strong>SKIP</strong> = pulado via --skip ·
+    <strong>ERROR</strong> = verificação não executou
+  </p>
+  <div class="summary-grid">
+    {% for name, s in summary.items() %}
+    {% set cls = s.status | lower %}
+    <div class="summary-card {{ 'falhou' if s.status == 'FALHOU' else cls }}">
+      <h3>{{ name }} <span class="badge {{ 'falhou' if s.status == 'FALHOU' else cls }}">{{ s.status }}</span></h3>
+      <ul>
+        {% for k, v in s.items() if k != 'status' %}
+        <li><strong>{{ k }}:</strong> {{ v }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endfor %}
+  </div>
+
+  <h2>Evidências detalhadas</h2>
+  {% for name, result in details.items() %}
+  <details {% if summary.get(name) and summary[name].status in ['FALHOU', 'ERROR'] %}open{% endif %}>
+    <summary>{{ name }} — {{ summary.get(name, {}).get('status', '—') }}</summary>
+    <table>
+      <thead><tr><th>Propriedade</th><th>Valor</th></tr></thead>
+      <tbody>
+        {% for k, v in result.items() %}
+        <tr>
+          <td><code>{{ k }}</code></td>
+          <td>
+            {% if v is mapping %}
+              <table style="margin:0;">
+                {% for sk, sv in v.items() %}
+                <tr><td><code>{{ sk }}</code></td><td>{{ sv if sv is not mapping else sv | tojson }}</td></tr>
+                {% endfor %}
+              </table>
+            {% elif v is iterable and v is not string %}
+              {{ v | join(', ') if v else '—' }}
+            {% else %}
+              {{ v if v is not none else '—' }}
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </details>
+  {% endfor %}
+
+  <h2>JSON completo</h2>
+  <details>
+    <summary>Ver documento JSON (consumo por LLMs / MCP)</summary>
+    <pre>{{ json_blob }}</pre>
+  </details>
+</main>
+
+<footer>{{ tool_name }} v{{ tool_version }} — Piloto Automático de Auditoria RASP para Android</footer>
+</body>
+</html>

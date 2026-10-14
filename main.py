@@ -10,6 +10,7 @@ Uso básico::
 
     python main.py --package com.example.app
     python main.py --package com.example.app --wifi 192.168.0.10:5555
+    python main.py --package com.example.app --skip anti_emulator --verbose
 """
 
 from __future__ import annotations
@@ -17,10 +18,15 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from rich.console import Console
+from rich.table import Table
 
+from checks.anti_emulator import AntiEmulatorCheck
+from checks.anti_frida import AntiFridaCheck
+from checks.anti_root import AntiRootCheck
+from checks.ssl_pinning import SSLPinningCheck
 from device_manager import (
     TOOL_NAME,
     TOOL_VERSION,
@@ -28,13 +34,14 @@ from device_manager import (
     DeviceManager,
     FridaSetupError,
 )
+from reporter import Reporter
 
 # Console rich global — único ponto de saída visual do CLI.
 console = Console()
 
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] %(message)s"
 
-# Checks conhecidos — usado para validar --skip.
+# Checks conhecidos — usado para validar --skip e nomear o relatório.
 KNOWN_CHECKS = ("anti_root", "anti_frida", "anti_emulator", "ssl_pinning")
 
 
@@ -140,29 +147,110 @@ def print_banner() -> None:
     """Exibe o banner textual do RASPilot no terminal."""
     console.print(
         f"[bold cyan]{TOOL_NAME}[/] [dim]v{TOOL_VERSION}[/] "
-        "— Piloto Automático de Auditoria RASP para Android",
-        style=None,
+        "— Piloto Automático de Auditoria RASP para Android"
     )
 
 
-def run_phase1(args: argparse.Namespace) -> int:
-    """Executa o pipeline da Fase 1: conexão ADB + setup do Frida server.
+def _run_step(
+    reporter: Reporter,
+    check_name: str,
+    step: Callable[[], dict],
+    skipped: bool = False,
+) -> Optional[dict]:
+    """Executa um passo do pipeline com isolamento de falhas.
+
+    Falha em um check **não aborta** o pipeline: o erro é registrado no
+    relatório como ``ERROR`` e a execução segue.
+
+    Args:
+        reporter: Instância do relatório para ``collect``.
+        check_name: Nome do check no relatório.
+        step: Callable que retorna o resultado do ``run_all()``.
+        skipped: Se True, registra o check como pulado.
+
+    Returns:
+        O resultado do check ou ``None`` se pulado/erro.
+    """
+    logger = logging.getLogger("raspilot")
+    if skipped:
+        logger.info("Check %s pulado (--skip)", check_name)
+        reporter.collect(check_name, {"skipped": True})
+        return None
+
+    with console.status(f"[cyan]Executando {check_name}...[/]"):
+        try:
+            result = step()
+        except Exception as exc:  # isolamento total entre fases
+            logger.warning("Check %s falhou: %s", check_name, exc, exc_info=True)
+            reporter.collect(check_name, {"error": str(exc)})
+            console.print(f"[yellow]![/] {check_name}: [red]ERROR[/] ({exc})")
+            return None
+
+    reporter.collect(check_name, result)
+    console.print(f"[green]✓[/] {check_name} concluído")
+    return result
+
+
+def print_summary_table(reporter: Reporter) -> None:
+    """Exibe a tabela final de resumo no terminal.
+
+    Args:
+        reporter: Relatório com os resultados coletados.
+    """
+    doc = reporter.generate_json()
+    table = Table(
+        title=f"{TOOL_NAME} — Relatório de Auditoria RASP",
+        title_style="bold cyan",
+        header_style="bold",
+    )
+    table.add_column("Verificação", style="bold")
+    table.add_column("Status", justify="center")
+    table.add_column("Resumo")
+
+    color_by_status = {
+        "OK": "green",
+        "FALHOU": "red",
+        "ERROR": "magenta",
+        "N/A": "dim",
+        "SKIP": "dim",
+    }
+    for name, summary in doc["summary"].items():
+        status = summary.get("status", "?")
+        color = color_by_status.get(status, "white")
+        key_bits = [
+            f"{k}={v}"
+            for k, v in summary.items()
+            if k not in ("status", "skipped") and v is not None
+        ]
+        table.add_row(name, f"[{color}]{status}[/{color}]", ", ".join(key_bits) or "—")
+
+    console.print()
+    console.print(table)
+
+
+def run_pipeline(args: argparse.Namespace) -> int:
+    """Executa o pipeline completo de auditoria RASP.
+
+    Fluxo: conexão ADB → info do dispositivo → frida-server →
+    anti_root → anti_emulator → spawn do app → anti_frida →
+    ssl_pinning → relatórios → tabela final → cleanup.
 
     Args:
         args: Argumentos já parseados.
 
     Returns:
-        Código de saída do processo (0 = sucesso).
+        Código de saída do processo (0 = sucesso parcial/total; o
+        pipeline sempre tenta terminar).
     """
     logger = logging.getLogger("raspilot")
 
+    # 1) Conexão ADB (USB ou Wi-Fi).
+    logger.info("Conectando ao dispositivo...")
     dm = DeviceManager(
         device_id=args.device_id,
         wifi_target=args.wifi,
         verbose=args.verbose,
     )
-
-    logger.info("Conectando ao dispositivo...")
     dm.connect_adb()
 
     info = dm.get_device_info()
@@ -170,14 +258,80 @@ def run_phase1(args: argparse.Namespace) -> int:
     for key, value in info.items():
         console.print(f"    [dim]{key}:[/] {value}")
 
-    if dm.setup_frida_server():
-        console.print("[green]✓[/] frida-server instalado, iniciado e validado")
+    # 2) Frida server.
+    dm.setup_frida_server()
+    console.print("[green]✓[/] frida-server instalado, iniciado e validado")
 
-    # Limitação da Fase 1: só valida o ambiente. Pipeline completo na Fase 6.
-    console.print(
-        "[yellow]·[/] Fase 1 concluída. "
-        "Pipeline de checks completo disponível nas fases seguintes."
+    # 3) Relatório.
+    reporter = Reporter(
+        device_info=info,
+        package_name=args.package,
+        output_dir=args.output_dir,
     )
+
+    session = None
+    pid = None
+    try:
+        # 4) Anti-Root (não requer app rodando).
+        _run_step(
+            reporter,
+            "anti_root",
+            lambda: AntiRootCheck(dm).run_all(),
+            skipped="anti_root" in args.skip,
+        )
+
+        # 5) Anti-Emulador (não requer app rodando).
+        _run_step(
+            reporter,
+            "anti_emulator",
+            lambda: AntiEmulatorCheck(dm).run_all(),
+            skipped="anti_emulator" in args.skip,
+        )
+
+        # 6) Spawn do app alvo (necessário para anti-frida e ssl).
+        if "anti_frida" not in args.skip or "ssl_pinning" not in args.skip:
+            with console.status(f"[cyan]Spawning {args.package}...[/]"):
+                session = dm.spawn_app(args.package)
+            pid = dm.get_app_pid(args.package)
+            console.print(f"[green]✓[/] App spawnado (pid={pid})")
+
+        # 7) Anti-Frida (requer session + pid).
+        if pid is not None:
+            _run_step(
+                reporter,
+                "anti_frida",
+                lambda: AntiFridaCheck(dm).run_all(session, pid),
+                skipped="anti_frida" in args.skip,
+            )
+        elif "anti_frida" not in args.skip:
+            reporter.collect("anti_frida", {"error": "app não pôde ser spawnado"})
+            console.print("[yellow]![/] anti_frida: [red]ERROR[/] (app não spawnado)")
+
+        # 8) SSL Pinning (spawn próprio interno no attempt_bypass).
+        _run_step(
+            reporter,
+            "ssl_pinning",
+            lambda: SSLPinningCheck(dm).run_all(args.package),
+            skipped="ssl_pinning" in args.skip,
+        )
+    finally:
+        # 9) Cleanup — nunca deixar resíduos no dispositivo.
+        try:
+            if session is not None:
+                session.detach()
+        except Exception:
+            logger.debug("Falha ao detach da sessão final", exc_info=True)
+        try:
+            dm.remove_frida_server()
+            dm.run_shell(f"am force-stop {args.package}", timeout=10)
+        except Exception:
+            logger.warning("Falha no cleanup final do dispositivo", exc_info=True)
+
+    # 10) Relatórios.
+    json_path, html_path = reporter.save()
+    print_summary_table(reporter)
+    console.print(f"\n[green]✓[/] Relatório JSON: [bold]{json_path}[/]")
+    console.print(f"[green]✓[/] Relatório HTML: [bold]{html_path}[/]")
     return 0
 
 
@@ -198,7 +352,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.debug("Args: %s", args)
 
     try:
-        return run_phase1(args)
+        return run_pipeline(args)
     except (DeviceConnectionError, FridaSetupError) as exc:
         console.print(f"[bold red]✗ Erro:[/] {exc}")
         logger.debug("Detalhes do erro:", exc_info=True)
