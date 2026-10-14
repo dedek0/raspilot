@@ -164,7 +164,7 @@ function hookSystemProperties() {
 
 function main() {
     report('anti_root_bypass.js carregado');
-    if (!Java.available) {
+    if (typeof Java === 'undefined' || !Java.available) {
         report('Java indisponível — nada a hookar');
         return;
     }

@@ -131,7 +131,7 @@ class TestDeviceInfo:
         """Retorna todos os campos esperados."""
         dm = DeviceManager(device_id="SER1")
         props = {
-            "ro.product.model": "SM-G991B",
+            "ro.product.model": "Pixel 7",
             "ro.build.version.release": "14",
             "ro.build.version.sdk": "34",
         }
@@ -140,7 +140,7 @@ class TestDeviceInfo:
              mock.patch.object(dm, "verify_root_access", return_value=False):
             info = dm.get_device_info()
         assert info["serial"] == "SER1"
-        assert info["model"] == "SM-G991B"
+        assert info["model"] == "Pixel 7"
         assert info["android_version"] == "14"
         assert info["sdk"] == "34"
         assert info["abi"] == "arm64-v8a"
@@ -204,14 +204,29 @@ class TestFridaHelpers:
     """Helpers do frida-server (sem download real)."""
 
     def test_frida_binary_name_matches_local_version(self):
-        """Nome do binário usa versão local do frida + ABI."""
+        """Nome do binário usa versão local do frida + arquitetura da asset."""
         dm = DeviceManager()
         import frida
 
         with mock.patch.object(dm, "_detect_abi", return_value="arm64-v8a"):
             assert dm._frida_binary_name() == (
-                f"frida-server-{frida.__version__}-android-arm64-v8a"
+                f"frida-server-{frida.__version__}-android-arm64"
             )
+
+    def test_frida_binary_name_maps_abis(self):
+        """ABIs Android são mapeadas para os nomes de asset do Frida."""
+        dm = DeviceManager()
+        import frida
+
+        version = frida.__version__
+        for abi, arch in (
+            ("armeabi-v7a", "arm"),
+            ("x86_64", "x86_64"),
+        ):
+            with mock.patch.object(dm, "_detect_abi", return_value=abi):
+                assert dm._frida_binary_name() == (
+                    f"frida-server-{version}-android-{arch}"
+                )
 
     def test_missing_frida_package_raises(self):
         """Sem pacote frida instalado o erro é instrutivo."""
@@ -227,3 +242,15 @@ class TestFridaHelpers:
             dm, "_run_adb", side_effect=DeviceConnectionError("offline")
         ):
             dm.remove_frida_server()  # não deve levantar
+
+    def test_get_app_pid_falls_back_to_last_spawn(self):
+        """Regressão: pid do spawn recente é usado quando o lookup falha.
+
+        Apps com anti-debug podem sumir da lista de processos logo após o
+        spawn — o RASPilot deve usar o PID devolvido pelo próprio spawn.
+        """
+        dm = DeviceManager(device_id="SER1")
+        dm.last_spawn_pid = 4242
+        with mock.patch.object(dm, "_require_frida", return_value=mock.MagicMock()), \
+             mock.patch.object(dm, "_frida_device", side_effect=Exception("sumiu")):
+            assert dm.get_app_pid("com.example.app") == 4242

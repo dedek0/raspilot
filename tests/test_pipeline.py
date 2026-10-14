@@ -27,10 +27,10 @@ SHELL = {
     "cat /proc/1234/task": "com.example.app\nJit thread pool\n",
     "ro.kernel.qemu": "",
     "ro.hardware": "qcom",
-    "ro.product.model": "SM-G991B",
-    "ro.product.manufacturer": "samsung",
-    "ro.build.fingerprint": "samsung/o1s",
-    "ro.product.device": "o1s",
+    "ro.product.model": "Pixel 7",
+    "ro.product.manufacturer": "Google",
+    "ro.build.fingerprint": "google/panther/panther:14",
+    "ro.product.device": "panther",
     "dumpsys sensorservice": "  - a\n  - b\n  - c\n",
     "settings get secure bluetooth_address": "a4:cf:12:00:00:01",
 }
@@ -68,7 +68,7 @@ class FakeSession:
     def enumerate_modules(self):
         return []
 
-    def create_script(self, source):
+    def create_script(self, source, **kwargs):
         if "CertificatePinner" in source or "ssl_verify_result" in source:
             return FakeScript([
                 {"type": "send", "payload": {
@@ -101,7 +101,7 @@ def test_pipeline_end_to_end(tmp_path, fast_windows, capsys):
 
     with mock.patch.object(DeviceManager, "connect_adb", return_value=True), \
          mock.patch.object(DeviceManager, "get_device_info", return_value={
-             "serial": "SER1", "model": "SM-G991B", "android_version": "14",
+             "serial": "SER1", "model": "Pixel 7", "android_version": "14",
              "sdk": "34", "abi": "arm64-v8a", "is_rooted_shell": False,
          }), \
          mock.patch.object(DeviceManager, "setup_frida_server", return_value=True), \

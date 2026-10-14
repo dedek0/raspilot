@@ -19,6 +19,20 @@ class TestSubChecks:
         res = AntiEmulatorCheck(clean_dm).check_emulator_props()
         assert res["detected"] is False
 
+    def test_google_manufacturer_is_not_emulator_alone(self, fake_dm_factory):
+        """Regressão: manufacturer=Google sozinho não marca emulador
+        (Pixels físicos também reportam esse valor)."""
+        dm = fake_dm_factory({
+            "ro.kernel.qemu": "", "ro.boot.qemu": "",
+            "ro.hardware": "qcom",
+            "ro.product.model": "Pixel 7",
+            "ro.product.manufacturer": "Google",
+            "ro.build.fingerprint": "google/panther/panther:14/UP1A:user/release-keys",
+            "ro.product.device": "panther",
+        })
+        res = AntiEmulatorCheck(dm).check_emulator_props()
+        assert res["detected"] is False
+
     def test_files_qemu(self, avd_dm):
         """/dev/qemu_pipe detectado."""
         res = AntiEmulatorCheck(avd_dm).check_emulator_files()
@@ -99,6 +113,20 @@ class TestSubChecks:
         dm = fake_dm_factory({"pm list packages": "", "ps -A": "root 1 0 noxd"})
         res = AntiEmulatorCheck(dm).check_third_party_emulators()
         assert "nox" in res["types"]
+
+    def test_knox_is_not_nox_false_positive(self, fake_dm_factory):
+        """Regressão: substrings 'knox' NÃO devem casar como emulador Nox."""
+        dm = fake_dm_factory({
+            "pm list packages": (
+                "package:com.vendor.knox.securefolder\n"
+                "package:com.vendor.knox.attestation\n"
+                "package:com.android.chrome"
+            ),
+            "ps -A": "u0 100 500 0 0 0 S com.vendor.knox.securefolder",
+        })
+        res = AntiEmulatorCheck(dm).check_third_party_emulators()
+        assert res["detected"] is False
+        assert res["types"] == []
 
     def test_third_party_waydroid(self, fake_dm_factory):
         """Waydroid detectado via package."""

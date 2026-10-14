@@ -105,6 +105,40 @@ function hookLibcStringHooks() {
 }
 
 // ----------------------------------------------------------------------
+// 1b) Native — connect() para portas Frida (bloqueia port scan local)
+// ----------------------------------------------------------------------
+function hookConnectPorts() {
+    try {
+        var connectPtr = Module.findExportByName('libc.so', 'connect');
+        if (connectPtr === null) { return; }
+        Interceptor.attach(connectPtr, {
+            onEnter: function (args) {
+                this._block = false;
+                try {
+                    var sa = args[1];
+                    var family = sa.readU16();
+                    if (family === 2) { // AF_INET
+                        var port = (sa.add(2).readU8() << 8) | sa.add(3).readU8();
+                        if (port === 27042 || port === 27043) {
+                            this._block = true;
+                            report('connect(127.0.0.1:' + port + ') bloqueado');
+                        }
+                    }
+                } catch (e) { /* best-effort */ }
+            },
+            onLeave: function (retval) {
+                if (this._block) {
+                    retval.replace(ptr(-11)); // -EAGAIN
+                }
+            }
+        });
+        report('libc.connect hookado (portas Frida)');
+    } catch (e) {
+        report('falha ao hookar connect: ' + e);
+    }
+}
+
+// ----------------------------------------------------------------------
 // 2) Java — File.exists() em paths Frida
 // ----------------------------------------------------------------------
 function hookFileExists() {
@@ -218,10 +252,11 @@ function hookThreadNames() {
 // ----------------------------------------------------------------------
 function main() {
     hookLibcStringHooks();
+    hookConnectPorts();
 
     var attachJava = function () {
         try {
-            if (Java.available) {
+            if (typeof Java !== 'undefined' && Java.available) {
                 Java.perform(function () {
                     hookFileExists();
                     hookRuntimeExec();

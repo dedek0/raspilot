@@ -12,6 +12,7 @@ Marca: RASPilot — Piloto Automático de Auditoria RASP para Android.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -34,12 +35,14 @@ EMULATOR_FILES = [
 ]
 
 # Valores de propriedades que indicam emulador.
+# Obs.: "google" NÃO entra em manufacturers — Pixels físicos também
+# reportam esse valor; AVDs são cobertas por model/fingerprint/device.
 QEMU_PROPS = {
     "ro.kernel.qemu": "1",
     "ro.boot.qemu": "1",
 }
 QEMU_HARDWARE = ("goldfish", "ranchu", "vbox86")
-EMULATOR_MANUFACTURERS = ("unknown", "genymotion", "google")
+EMULATOR_MANUFACTURERS = ("unknown", "genymotion")
 EMULATOR_MODELS = ("sdk", "emulator", "android sdk built for x86", "android sdk built for x86_64")
 
 
@@ -288,18 +291,30 @@ class AntiEmulatorCheck:
     def check_third_party_emulators(self) -> dict:
         """Detecta emuladores de terceiros (LDPlayer, BlueStacks, Nox, Waydroid).
 
-        Procura packages e processos característicos de cada um.
+        Procura packages e processos característicos de cada um usando
+        regex com boundaries — markers curtos como "nox" não devem casar
+        com substrings legítimas de outros softwares (ex: "knox").
 
         Returns:
             Dict com ``detected``, ``types`` (lista), ``evidence`` e
             ``details``.
         """
-        signatures: Dict[str, Tuple[List[str], List[str]]] = {
-            # tipo: (packages, trechos de ps/ls)
-            "ldplayer": (["com.android.flysilkworm"], ["ldplayer", "dnplayer"]),
-            "bluestacks": (["com.bluestacks.settings", "com.bluestacks.home"], ["bluestacks", "hd-"]),
-            "nox": (["com.bignox.google.installer"], ["nox", "noxd", "noxdroid"]),
-            "waydroid": (["org.lineageos.waydroid"], ["waydroid", "lxc"]),
+        # tipo: [(regex de marker, descrição), ...]
+        signatures: Dict[str, List[Tuple[str, str]]] = {
+            "ldplayer": [
+                (r"ldplayer|dnplayer|flysilkworm", "LDPlayer"),
+            ],
+            "bluestacks": [
+                (r"bluestacks|bstlauncher", "BlueStacks"),
+            ],
+            "nox": [
+                # negative lookbehind/lookahead evitam substrings como
+                # "knox"; "noxd"/"noxroid" continuam casando.
+                (r"(?<![a-zA-Z])nox(d|roid)?(?![a-zA-Z])|com\.bignox", "Nox"),
+            ],
+            "waydroid": [
+                (r"waydroid|org\.lineageos\.waydroid", "Waydroid"),
+            ],
         }
 
         pm = self.dm.run_shell("pm list packages 2>/dev/null")
@@ -308,17 +323,11 @@ class AntiEmulatorCheck:
 
         found_types: List[str] = []
         evidence: List[str] = []
-        for emu_type, (packages, process_markers) in signatures.items():
-            for pkg in packages:
-                if pkg.lower() in corpus:
+        for emu_type, patterns in signatures.items():
+            for pattern, label in patterns:
+                if re.search(pattern, corpus):
                     found_types.append(emu_type)
-                    evidence.append(f"package: {pkg}")
-                    break
-            for marker in process_markers:
-                if marker in corpus:
-                    if emu_type not in found_types:
-                        found_types.append(emu_type)
-                    evidence.append(f"processo/marker: {marker}")
+                    evidence.append(f"marker '{label}' ({pattern})")
                     break
 
         detected = bool(found_types)

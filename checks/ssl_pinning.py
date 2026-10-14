@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from rich.console import Console
 
+from script_loader import load_script_file
+
 if TYPE_CHECKING:  # evita import circular em tempo de importação
     from device_manager import DeviceManager
 
@@ -148,7 +150,8 @@ class SSLPinningCheck:
                 dest_dir, os.path.basename(remote) or f"{package_name}.apk"
             )
             try:
-                self.dm._run_adb(["pull", remote, local], timeout=120)
+                # APKs modernos podem ser grandes — timeout generoso.
+                self.dm._run_adb(["pull", remote, local], timeout=300)
                 if os.path.isfile(local):
                     local_paths.append(local)
             except Exception:
@@ -290,17 +293,6 @@ class SSLPinningCheck:
         session = None
         script = None
 
-        try:
-            with open(SSL_BYPASS_SCRIPT, "r", encoding="utf-8") as fh:
-                source = fh.read()
-        except OSError as exc:
-            return {
-                "success": False,
-                "intercepted_hosts": [],
-                "bypass_logs": [],
-                "error": f"Script ssl_bypass.js ilegível: {exc}",
-            }
-
         def on_message(message, data):  # noqa: ANN001 - assinatura frida
             if message.get("type") == "send":
                 payload = message.get("payload", {})
@@ -318,12 +310,15 @@ class SSLPinningCheck:
                     bypass_logs.append(f"[script-error] {desc}")
 
         try:
-            session = self.dm.spawn_app(package_name)
-            script = session.create_script(source)
-            script.on("message", on_message)
-            script.load()
+            # Spawn suspenso: instala os hooks ANTES do app rodar, para
+            # não perder validações de certificado da inicialização.
+            session = self.dm.spawn_app(package_name, resume=False)
+            script = load_script_file(
+                session, SSL_BYPASS_SCRIPT, on_message=on_message
+            )
+            self.dm.resume_app()
             # Janela para o app realizar tráfego/validações de certificado.
-            time.sleep(6)
+            time.sleep(8)
         except Exception as exc:
             logger.warning("Bypass SSL falhou", exc_info=True)
             return {

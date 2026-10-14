@@ -49,27 +49,42 @@ function hookTrustManager() {
     try {
         var SSLContext = Java.use('javax.net.ssl.SSLContext');
         var TrustManager = Java.use('javax.net.ssl.X509TrustManager');
-        var noop = Java.registerClass({
-            name: 'org.raspilot.NoopX509TrustManager',
-            implements: [TrustManager],
-            methods: [
-                { name: 'checkClientTrusted', argumentTypes: ['[Ljava.security.cert.X509Certificate;', 'java.lang.String'], implementation: function () {} },
-                { name: 'checkServerTrusted', argumentTypes: ['[Ljava.security.cert.X509Certificate;', 'java.lang.String'], implementation: function () {} },
-                { name: 'getAcceptedIssuers', argumentTypes: [], implementation: function () { return []; } }
-            ]
-        });
-        var noopInstance = noop.$new();
 
-        SSLContext.init.overload(
-            '[Ljavax.net.ssl.KeyManager;',
-            '[Ljavax.net.ssl.TrustManager;',
-            'java.security.SecureRandom'
-        ).implementation = function (km, tm, sr) {
-            log('SSLContext.init interceptado');
-            var list = [noopInstance];
-            this.init(km, list, sr);
-        };
-        log('X509TrustManager + SSLContext.init hookados');
+        // Forma objeto do registerClass: a bridge resolve os overloads da
+        // interface automaticamente (a forma array exige argumentTypes
+        // exatos e falha em versões novas da bridge).
+        var noopInstance = null;
+        try {
+            var TrustManagerCls = Java.registerClass({
+                name: 'org.raspilot.NoopX509TrustManager',
+                implements: [TrustManager],
+                methods: {
+                    checkClientTrusted: function (chain, authType) {},
+                    checkServerTrusted: function (chain, authType) {},
+                    getAcceptedIssuers: function () { return []; }
+                }
+            });
+            noopInstance = TrustManagerCls.$new();
+        } catch (regErr) {
+            // Classe já registrada (idempotência) — reutiliza.
+            try {
+                noopInstance = Java.use('org.raspilot.NoopX509TrustManager').$new();
+            } catch (e2) {
+                log('TrustManager noop indisponível: ' + e2);
+            }
+        }
+
+        if (noopInstance !== null) {
+            SSLContext.init.overload(
+                '[Ljavax.net.ssl.KeyManager;',
+                '[Ljavax.net.ssl.TrustManager;',
+                'java.security.SecureRandom'
+            ).implementation = function (km, tm, sr) {
+                log('SSLContext.init interceptado');
+                this.init(km, [noopInstance], sr);
+            };
+            log('X509TrustManager + SSLContext.init hookados');
+        }
     } catch (e) {
         log('TrustManager hook falhou: ' + e);
     }
@@ -316,7 +331,7 @@ function hookFlutter() {
 function main() {
     log('ssl_bypass.js carregado');
 
-    if (!Java.available) {
+    if (typeof Java === 'undefined' || !Java.available) {
         log('Java indisponível — apenas hooks nativos instalados');
         hookNativeSsl();
         hookFlutter();

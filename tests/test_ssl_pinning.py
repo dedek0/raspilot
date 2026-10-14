@@ -124,8 +124,8 @@ class TestAttemptBypass:
         def __init__(self, messages):
             self._messages = messages
 
-        def create_script(self, source):
-            # O script real deve ser lido do disco antes.
+        def create_script(self, source, **kwargs):
+            # O script real (com prelúdio da bridge) deve ser lido do disco.
             assert "ssl" in source.lower()
             return TestAttemptBypass._FakeScript(self._messages)
 

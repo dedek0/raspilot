@@ -42,7 +42,7 @@ class FakeSession:
     def enumerate_modules(self):
         return self._modules
 
-    def create_script(self, source):
+    def create_script(self, source, **kwargs):
         return FakeScript(self._messages)
 
 
@@ -149,6 +149,10 @@ class TestAppDetection:
         assert "strstr" in DETECTION_SCRIPT
         assert "Runtime.exec" in DETECTION_SCRIPT
         assert "File.exists" in DETECTION_SCRIPT
+        # Técnicas nativas comuns (sem string 'frida' no alvo):
+        assert "native_connect" in DETECTION_SCRIPT
+        assert "27042" in DETECTION_SCRIPT
+        assert "openat" in DETECTION_SCRIPT
 
 
 class TestRunAll:

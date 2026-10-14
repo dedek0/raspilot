@@ -85,6 +85,9 @@ class DeviceManager:
 
         self._abi: Optional[str] = None
         self._device_info: Optional[dict] = None
+        self._su_ok: Optional[bool] = None
+        self.last_spawn_pid: Optional[int] = None
+        self._pending_resume: Optional[tuple] = None
         self.frida_ready: bool = False
 
     # ------------------------------------------------------------------
@@ -357,6 +360,38 @@ class DeviceManager:
         logger.debug("shell id: %s -> rooted=%s", out, rooted)
         return rooted
 
+    def has_su_access(self) -> bool:
+        """Verifica se root está disponível via ``su -c`` (APatch/Magisk/SuperSU).
+
+        O shell ADB em aparelhos rooteados normalmente roda como ``shell``
+        (uid 2000), mas o ``su`` permite elevar privilégios — necessário
+        para spawna/attach de apps não-debuggable de outros usuários.
+
+        Returns:
+            True se ``su -c id`` retornar ``uid=0(root)``.
+        """
+        if self._su_ok is not None:
+            return self._su_ok
+        res = self.run_shell("su -c id", timeout=10)
+        rooted = res["ok"] and "uid=0" in res["stdout"]
+        logger.debug("su -c id: ok=%s stdout=%r -> rooted=%s", res["ok"], res["stdout"], rooted)
+        self._su_ok = rooted
+        return rooted
+
+    def _su_cmd(self, command: str) -> str:
+        """Envolve um comando shell com ``su -c`` quando root via su existe.
+
+        Args:
+            command: Comando shell a elevar.
+
+        Returns:
+            ``su -c '<command>'`` ou o comando original (sem root).
+        """
+        if self.has_su_access():
+            escaped = command.replace("'", "'\\''")
+            return f"su -c '{escaped}'"
+        return command
+
     def _detect_abi(self) -> str:
         """Detecta a ABI primária do dispositivo.
 
@@ -410,33 +445,41 @@ class DeviceManager:
     def kill_frida_server(self) -> None:
         """Mata processos frida-server existentes antes de subir um novo.
 
-        Tenta ``pkill -f frida-server`` e, como fallback, ``killall``.
+        Tenta ``pkill``/``killall`` como shell e, quando disponível,
+        via ``su -c`` (o frida-server root não morre via shell).
         Nunca propaga exceção — é uma operação de limpeza.
 
         Returns:
             None.
         """
         logger.debug("Encerrando frida-server existente (se houver)...")
-        for cmd in (
-            ["shell", "pkill", "-f", "frida-server"],
-            ["shell", "killall", "frida-server"],
-        ):
-            try:
-                self._run_adb(cmd, timeout=10)
-            except DeviceConnectionError:
-                # pkill/killall retornam rc!=0 quando não há processo — normal.
-                logger.debug("Nenhum processo para encerrar via %s", cmd[-1])
+        base_cmds = ("pkill -f frida-server", "killall frida-server")
+        for cmd in base_cmds:
+            for wrapped in (cmd, self._su_cmd(cmd)):
+                try:
+                    self.run_shell(wrapped, timeout=10)
+                except DeviceConnectionError:
+                    logger.debug("Nenhum processo para encerrar via %s", wrapped)
         time.sleep(0.5)
 
     def _frida_binary_name(self) -> str:
         """Nome do binário frida-server na release do GitHub.
 
+        Mapeia a ABI Android para o nome de arquitetura usado nas assets
+        do Frida (``arm64-v8a``→``arm64``, ``armeabi-v7a``→``arm``,
+        ``x86_64``→``x86_64``).
+
         Returns:
-            Ex: ``frida-server-16.2.1-android-arm64``.
+            Ex: ``frida-server-17.23.3-android-arm64``.
         """
         version = self._local_frida_version()
         abi = self._detect_abi()
-        return f"frida-server-{version}-android-{abi}"
+        arch = {
+            "arm64-v8a": "arm64",
+            "armeabi-v7a": "arm",
+            "x86_64": "x86_64",
+        }.get(abi, "arm64")
+        return f"frida-server-{version}-android-{arch}"
 
     def _ensure_frida_binary(self, dest_dir: str) -> str:
         """Garante que o binário frida-server compatível exista localmente.
@@ -523,10 +566,28 @@ class DeviceManager:
             except DeviceConnectionError as exc:
                 raise FridaSetupError(f"Falha ao fazer push do frida-server: {exc}") from exc
 
-        # Sobe com root quando disponível (necessário para attach em apps de outros usuários).
+        # Sobe com root quando disponível (necessário para attach/spawn de
+        # apps não-debuggable de outros usuários).
         self.kill_frida_server()
         try:
-            self._run_adb(["shell", f"nohup {remote_path} >/dev/null 2>&1 &"], timeout=15)
+            if self.verify_root_access():
+                # Shell ADB já é root — direto.
+                self.run_shell(f"{remote_path} -D", timeout=15)
+            elif self.has_su_access():
+                # Root via su (APatch/Magisk): eleva para rodar o servidor.
+                # nohup + & dentro do su: o shell do dispositivo retorna na
+                # hora e o daemon não herda os pipes do adb (evita timeout).
+                su_wrapped = self._su_cmd(
+                    f"nohup {remote_path} >/dev/null 2>&1 &"
+                )
+                self.run_shell(su_wrapped, timeout=15)
+            else:
+                # Último recurso: como shell (só serve para apps debuggable).
+                logger.warning(
+                    "Root indisponível — frida-server rodará como shell; "
+                    "spawn de apps não-debuggable pode falhar."
+                )
+                self.run_shell(f"nohup {remote_path} >/dev/null 2>&1 &", timeout=15)
         except DeviceConnectionError as exc:
             raise FridaSetupError(f"Falha ao iniciar frida-server: {exc}") from exc
 
@@ -571,12 +632,10 @@ class DeviceManager:
         logger.debug("Limpando frida-server do dispositivo...")
         try:
             self.kill_frida_server()
-            self._run_adb(["shell", "rm", "-f", "/data/local/tmp/frida-server"], timeout=10)
-            for extra in (
-                "/data/local/tmp/re.frida.server",
-                "/data/local/tmp/fs",
-            ):
-                self._run_adb(["shell", "rm", "-rf", extra], timeout=10)
+            rm_cmd = "rm -rf /data/local/tmp/frida-server /data/local/tmp/re.frida.server /data/local/tmp/fs"
+            self.run_shell(rm_cmd, timeout=10)
+            if self._su_ok:
+                self.run_shell(self._su_cmd(rm_cmd), timeout=10)
         except DeviceConnectionError:
             logger.warning("Falha ao limpar arquivos temporários", exc_info=True)
         self.frida_ready = False
@@ -624,30 +683,58 @@ class DeviceManager:
             raise FridaSetupError("Nenhum dispositivo Frida disponível.")
         return devices[0]
 
-    def spawn_app(self, package_name: str) -> "frida.core.Session":
-        """Spawna o app e retorna a sessão Frida já anexada (com resume).
+    def spawn_app(self, package_name: str, resume: bool = True) -> "frida.core.Session":
+        """Spawna o app e retorna a sessão Frida já anexada.
+
+        Com ``resume=False`` o processo fica **suspenso** após o attach —
+        permitindo instalar hooks ANTES do código do app rodar (essencial
+        para observar/burlar detecções de RASP que executam na inicialização).
+        Chame :meth:`resume_app` depois de carregar os scripts.
 
         Args:
             package_name: Package name do app alvo (ex: ``com.example.app``).
+            resume: Se True (default), retoma o processo imediatamente.
 
         Returns:
-            Sessão Frida ativa após ``resume(pid)``.
+            Sessão Frida ativa.
 
         Raises:
             FridaSetupError: se o spawn falhar.
         """
         f = self._require_frida()
         device = self._frida_device()
-        logger.info("Spawning %s...", package_name)
+        logger.info("Spawning %s... (resume=%s)", package_name, resume)
         try:
             pid = device.spawn([package_name])
             session = device.attach(pid)
-            device.resume(pid)
         except Exception as exc:  # frida raising frida.core.ExecutableNotFoundError etc.
             raise FridaSetupError(f"Falha ao spawna {package_name}: {exc}") from exc
-        time.sleep(1.0)  # aguarda a Activity subir
+        self.last_spawn_pid = pid
+        if resume:
+            device.resume(pid)
+            time.sleep(1.0)  # aguarda a Activity subir
+        else:
+            self._pending_resume = (device, pid)
         logger.info("App spawna (pid=%s), sessão anexada", pid)
         return session
+
+    def resume_app(self) -> None:
+        """Retoma um processo deixado suspenso por ``spawn_app(resume=False)``.
+
+        Idempotente: se não há retomada pendente, é um no-op.
+
+        Returns:
+            None.
+        """
+        if self._pending_resume is None:
+            return
+        device, pid = self._pending_resume
+        self._pending_resume = None
+        try:
+            device.resume(pid)
+            logger.debug("Processo %s retomado", pid)
+        except Exception:
+            logger.warning("Falha ao retomar pid %s", pid, exc_info=True)
 
     def attach_app(self, package_name: str) -> "frida.core.Session":
         """Anexa a um processo do app já em execução.
@@ -677,6 +764,11 @@ class DeviceManager:
     def get_app_pid(self, package_name: str) -> Optional[int]:
         """Retorna o PID do processo do app, se estiver em execução.
 
+        Tenta ``get_process`` pelo nome e, como fallback, varre
+        ``enumerate_processes`` casando pelo nome/package. Se o processo
+        sumir (app com anti-debug que se mata), devolve o último PID
+        registrado no ``spawn_app`` mais recente.
+
         Args:
             package_name: Package name do app alvo.
 
@@ -686,9 +778,16 @@ class DeviceManager:
         try:
             f = self._require_frida()
             device = self._frida_device()
-            return device.get_process(package_name).pid
+            try:
+                return device.get_process(package_name).pid
+            except Exception:
+                pass
+            for proc in device.enumerate_processes():
+                if proc.name == package_name or package_name in proc.name:
+                    return proc.pid
         except Exception:
-            return None
+            logger.debug("Falha ao resolver pid de %s", package_name, exc_info=True)
+        return self.last_spawn_pid
 
     def list_running_processes(self) -> List[str]:
         """Lista processos visíveis no dispositivo (equivalente a ``frida-ps -U``).

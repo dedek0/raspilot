@@ -15,6 +15,8 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, List, Optional
 
+from script_loader import load_script
+
 if TYPE_CHECKING:  # evita import circular em tempo de importação
     from device_manager import DeviceManager
 
@@ -77,6 +79,47 @@ function looksLikeFrida(str) {
     } catch (e) { /* módulo indisponível */ }
 });
 
+// Native: connect() para portas Frida (27042/27043) — anti-frida por
+// "port scan" local, técnica comum que não usa strings 'frida'.
+try {
+    var connectPtr = Module.findExportByName('libc.so', 'connect');
+    if (connectPtr !== null) {
+        Interceptor.attach(connectPtr, {
+            onEnter: function (args) {
+                try {
+                    var sa = args[1];
+                    var family = sa.readU16();
+                    if (family === 2) { // AF_INET
+                        var port = (sa.add(2).readU8() << 8) | sa.add(3).readU8();
+                        if (port === 27042 || port === 27043) {
+                            reportDetection('native_connect', 'porta ' + port);
+                        }
+                    }
+                } catch (e) { /* best-effort */ }
+            }
+        });
+    }
+} catch (e) { /* libc indisponível */ }
+
+// Native: open/openat de paths contendo 'frida'.
+['open', 'openat', 'openat64'].forEach(function (name) {
+    try {
+        var addr = Module.findExportByName('libc.so', name);
+        if (addr === null) { return; }
+        Interceptor.attach(addr, {
+            onEnter: function (args) {
+                try {
+                    var pathPtr = (name === 'open') ? args[0] : args[1];
+                    var path = pathPtr.readCString();
+                    if (looksLikeFrida(path)) {
+                        reportDetection('native_' + name, path);
+                    }
+                } catch (e) { /* best-effort */ }
+            }
+        });
+    } catch (e) { /* módulo indisponível */ }
+});
+
 function installJavaHooks() {
     try {
         var File = Java.use('java.io.File');
@@ -121,7 +164,7 @@ function installJavaHooks() {
     } catch (e) { /* Java indisponível */ }
 }
 
-if (Java.available) {
+if (typeof Java !== 'undefined' && Java.available) {
     Java.perform(installJavaHooks);
 }
 
@@ -338,16 +381,24 @@ class AntiFridaCheck:
     # ------------------------------------------------------------------
     # Detecção pelo app
     # ------------------------------------------------------------------
-    def check_frida_detection_in_app(self, session: object) -> dict:
+    def check_frida_detection_in_app(
+        self,
+        session: object,
+        on_script_loaded: Optional[object] = None,
+    ) -> dict:
         """Observa se o app alvo executa detecção de Frida em runtime.
 
         Injeta um script de observação que intercepta (sem bloquear)
         ``File.exists`` em paths Frida, ``Runtime.exec``/``ProcessBuilder``
-        com strings 'frida' e ``strstr``/``strcmp`` em libc, e coleta as
-        chamadas por alguns segundos.
+        com strings 'frida', ``strstr``/``strcmp`` em libc, ``connect``
+        nas portas Frida e ``open``/``openat`` de paths Frida, coletando
+        as chamadas por alguns segundos.
 
         Args:
             session: Sessão Frida ativa sobre o app alvo.
+            on_script_loaded: Callback chamado logo após ``script.load()`` —
+                usado pelo pipeline para ``resume`` de spawn suspenso, de
+                modo que os hooks estejam ativos antes do código do app.
 
         Returns:
             Dict com ``detection_methods_found`` (lista legível) e
@@ -355,8 +406,8 @@ class AntiFridaCheck:
         """
         found: List[str] = []
         script = None
+        resumed = False
         try:
-            script = session.create_script(DETECTION_SCRIPT)
 
             def on_message(message, data):  # noqa: ANN001 - assinatura frida
                 if message.get("type") == "send":
@@ -370,10 +421,14 @@ class AntiFridaCheck:
                 elif message.get("type") == "error":
                     logger.debug("Erro no script de detecção: %s", message.get("description"))
 
-            script.on("message", on_message)
-            script.load()
+            script = load_script(
+                session, DETECTION_SCRIPT, on_message=on_message, name="raspilot-detect"
+            )
+            if on_script_loaded is not None:
+                on_script_loaded()
+                resumed = True
             # Janela de observação: o app precisa executar seu código anti-frida.
-            time.sleep(4)
+            time.sleep(6)
         except Exception as exc:
             logger.warning("Falha ao observar detecção de Frida no app", exc_info=True)
             return {
@@ -387,7 +442,12 @@ class AntiFridaCheck:
                     script.unload()
                 except Exception:
                     logger.debug("Falha ao unload do script de detecção", exc_info=True)
-
+            if not resumed and on_script_loaded is not None:
+                # Garante que um spawn suspenso nunca fique travado.
+                try:
+                    on_script_loaded()
+                except Exception:
+                    logger.debug("Falha no resume de emergência", exc_info=True)
         vulnerable = not found  # app não detectou = falha de RASP
         result = {
             "detection_methods_found": found,
@@ -405,7 +465,12 @@ class AntiFridaCheck:
     # ------------------------------------------------------------------
     # Consolidação
     # ------------------------------------------------------------------
-    def run_all(self, session: object, pid: int) -> dict:
+    def run_all(
+        self,
+        session: object,
+        pid: int,
+        on_script_loaded: Optional[object] = None,
+    ) -> dict:
         """Consolida presença de Frida e capacidade de detecção do app.
 
         ``vulnerable=True`` significa que o app **não** detectou/bloqueou
@@ -415,6 +480,8 @@ class AntiFridaCheck:
         Args:
             session: Sessão Frida ativa sobre o app alvo.
             pid: PID do processo alvo.
+            on_script_loaded: Callback de resume pós-load do script de
+                observação (ver ``check_frida_detection_in_app``).
 
         Returns:
             Dict com ``vulnerable`` (bool), ``frida_present`` (bool),
@@ -427,7 +494,9 @@ class AntiFridaCheck:
             "frida_libraries": self.check_frida_libraries(pid, session=session),
             "frida_threads": self.check_frida_threads(pid),
         }
-        app_detection = self.check_frida_detection_in_app(session)
+        app_detection = self.check_frida_detection_in_app(
+            session, on_script_loaded=on_script_loaded
+        )
 
         frida_present = any(res.get("detected") for res in checks.values())
         vulnerable = bool(app_detection.get("vulnerable", True))

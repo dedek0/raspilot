@@ -289,18 +289,23 @@ def run_pipeline(args: argparse.Namespace) -> int:
         )
 
         # 6) Spawn do app alvo (necessário para anti-frida e ssl).
+        #    Spawn SUSPENSO: os hooks anti-frida são instalados antes do
+        #    código do app rodar (detecções de RASP costumam executar na
+        #    inicialização); o resume acontece via callback do check.
         if "anti_frida" not in args.skip or "ssl_pinning" not in args.skip:
             with console.status(f"[cyan]Spawning {args.package}...[/]"):
-                session = dm.spawn_app(args.package)
+                session = dm.spawn_app(args.package, resume=False)
             pid = dm.get_app_pid(args.package)
-            console.print(f"[green]✓[/] App spawnado (pid={pid})")
+            console.print(f"[green]✓[/] App spawnado suspenso (pid={pid})")
 
-        # 7) Anti-Frida (requer session + pid).
+        # 7) Anti-Frida (requer session + pid; resume via callback).
         if pid is not None:
             _run_step(
                 reporter,
                 "anti_frida",
-                lambda: AntiFridaCheck(dm).run_all(session, pid),
+                lambda: AntiFridaCheck(dm).run_all(
+                    session, pid, on_script_loaded=dm.resume_app
+                ),
                 skipped="anti_frida" in args.skip,
             )
         elif "anti_frida" not in args.skip:
@@ -317,6 +322,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     finally:
         # 9) Cleanup — nunca deixar resíduos no dispositivo.
         try:
+            dm.resume_app()  # idempotente: destrava spawn suspenso, se houver
             if session is not None:
                 session.detach()
         except Exception:
