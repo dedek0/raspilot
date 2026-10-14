@@ -117,7 +117,7 @@ class Reporter:
         if check_name == "anti_emulator":
             is_emulator = bool(result.get("is_emulator"))
             return (
-                "OK" if is_emulator else "FALHOU",
+                "FALHOU" if is_emulator else "OK",
                 {
                     "is_emulator": is_emulator,
                     "emulator_type": result.get("emulator_type"),

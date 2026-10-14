@@ -71,6 +71,30 @@ class TestSubChecks:
         res = AntiRootCheck(clean_dm).check_busybox()
         assert res["detected"] is False
 
+    def test_alt_root_apatch_detected(self, fake_dm_factory):
+        """Diretório do APatch em /data/adb/ap é detectado."""
+        dm = fake_dm_factory({"ls /data/adb/ap 2>/dev/null": "apd\nap\nmodules"})
+        res = AntiRootCheck(dm).check_alt_root_solutions()
+        assert res["detected"] is True
+        assert any("APatch" in e for e in res["evidence"])
+
+    def test_alt_root_kernelsu_detected(self, fake_dm_factory):
+        """Binário ksud é detectado."""
+        dm = fake_dm_factory({"which ksud 2>/dev/null": "/data/adb/ksu/bin/ksud"})
+        res = AntiRootCheck(dm).check_alt_root_solutions()
+        assert res["detected"] is True
+        assert any("ksud" in e for e in res["evidence"])
+
+    def test_alt_root_absent(self, clean_dm):
+        """Sem APatch/KernelSU o vetor é negativo."""
+        res = AntiRootCheck(clean_dm).check_alt_root_solutions()
+        assert res["detected"] is False
+
+    def test_root_apps_list_contains_apatch_kernelsu(self):
+        """APatch e KernelSU estão na lista de apps perigosos."""
+        assert "me.bmax.apatch" in ROOT_APP_PACKAGES
+        assert "me.weishu.kernelsu" in ROOT_APP_PACKAGES
+
 
 class TestRunAll:
     """Consolidação final (veredito + confiança)."""
@@ -82,7 +106,7 @@ class TestRunAll:
         assert res["confidence"] == "low"
         assert set(res["checks"]) == {
             "su_binaries", "magisk", "root_props",
-            "dangerous_apps", "rw_system", "busybox",
+            "dangerous_apps", "rw_system", "busybox", "alt_root_solutions",
         }
         assert "T" in res["timestamp"]  # ISO8601
 

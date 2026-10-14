@@ -752,8 +752,14 @@ class DeviceManager:
         device = self._frida_device()
         logger.info("Anexando a %s...", package_name)
         try:
-            pid = device.get_process(package_name).pid
+            pid = self.get_app_pid(package_name)
+            if pid is None:
+                raise FridaSetupError(
+                    f"Processo de {package_name} não encontrado (app rodando?)"
+                )
             session = device.attach(pid)
+        except FridaSetupError:
+            raise
         except Exception as exc:
             raise FridaSetupError(
                 f"Falha ao anexar em {package_name} (app rodando?): {exc}"
@@ -787,7 +793,24 @@ class DeviceManager:
                     return proc.pid
         except Exception:
             logger.debug("Falha ao resolver pid de %s", package_name, exc_info=True)
+
+        res = self.run_shell(f"pidof -s {package_name} 2>/dev/null", timeout=10)
+        if res["ok"] and res["stdout"].strip().isdigit():
+            return int(res["stdout"].strip())
+
         return self.last_spawn_pid
+
+    def is_app_alive(self, pid: int) -> bool:
+        """Verifica se um processo continua em execução no dispositivo.
+
+        Args:
+            pid: PID do processo alvo.
+
+        Returns:
+            True se ``/proc/<pid>`` ainda existe.
+        """
+        res = self.run_shell(f"[ -d /proc/{pid} ] && echo alive", timeout=5)
+        return "alive" in (res.get("stdout") or "")
 
     def list_running_processes(self) -> List[str]:
         """Lista processos visíveis no dispositivo (equivalente a ``frida-ps -U``).

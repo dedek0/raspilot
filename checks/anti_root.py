@@ -42,6 +42,17 @@ ROOT_APP_PACKAGES = [
     "com.kingo.root",
     "com.smedialink.oneclickroot",
     "com.zhiqupk.root.global",
+    "me.bmax.apatch",
+    "me.weishu.kernelsu",
+    "com.rifsxd.ksunext",
+]
+
+ALT_ROOT_SOLUTION_MARKERS = [
+    ("ls /data/adb/ap 2>/dev/null", "/data/adb/ap (APatch)"),
+    ("which apd 2>/dev/null", "which apd"),
+    ("ls /data/adb/ksu 2>/dev/null", "/data/adb/ksu (KernelSU)"),
+    ("which ksud 2>/dev/null", "which ksud"),
+    ("ls /data/adb/ksud 2>/dev/null", "/data/adb/ksud"),
 ]
 
 # Paths de busybox comuns em ROMs rooteadas.
@@ -329,6 +340,33 @@ class AntiRootCheck:
         logger.debug("check_busybox: detected=%s", detected)
         return result
 
+    def check_alt_root_solutions(self) -> dict:
+        """Detecta soluções de root modernas (APatch e KernelSU).
+
+        Procura diretórios e binários característicos de cada solução.
+
+        Returns:
+            Dict com ``detected``, ``evidence`` e ``details``.
+        """
+        evidence: List[str] = []
+        for command, label in ALT_ROOT_SOLUTION_MARKERS:
+            res = self._shell(command, timeout=10)
+            if res["ok"] and res["stdout"]:
+                evidence.append(label)
+
+        detected = bool(evidence)
+        result = {
+            "detected": detected,
+            "evidence": evidence,
+            "details": (
+                f"APatch/KernelSU detectado: {'; '.join(evidence)}"
+                if detected
+                else "Nenhuma evidência de APatch ou KernelSU"
+            ),
+        }
+        logger.debug("check_alt_root_solutions: detected=%s", detected)
+        return result
+
     # ------------------------------------------------------------------
     # Consolidação
     # ------------------------------------------------------------------
@@ -351,6 +389,7 @@ class AntiRootCheck:
             "dangerous_apps": self.check_dangerous_apps(),
             "rw_system": self.check_rw_system(),
             "busybox": self.check_busybox(),
+            "alt_root_solutions": self.check_alt_root_solutions(),
         }
 
         # Qualquer vetor positivo indica root; confiança vem da quantidade.

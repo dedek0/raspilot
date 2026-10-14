@@ -54,6 +54,17 @@ class FakeShellDM:
                 return {"ok": True, "rc": 0, "stdout": value, "stderr": ""}
         return {"ok": True, "rc": 0, "stdout": "", "stderr": ""}
 
+    def is_app_alive(self, pid: int) -> bool:
+        """Simula ``DeviceManager.is_app_alive``.
+
+        Args:
+            pid: Ignorado nos testes.
+
+        Returns:
+            Valor de ``mapping['__alive__']`` (default True).
+        """
+        return bool(self.mapping.get("__alive__", True))
+
 
 @pytest.fixture
 def fake_dm_factory():

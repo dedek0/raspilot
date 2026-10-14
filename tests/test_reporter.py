@@ -86,7 +86,7 @@ class TestGenerateJson:
                     "status": "FALHOU", "vulnerable": True, "frida_present": True,
                 },
                 "anti_emulator": {
-                    "status": "OK", "is_emulator": True,
+                    "status": "FALHOU", "is_emulator": True,
                     "emulator_type": "qemu_avd", "confidence": "high",
                 },
                 "ssl_pinning": {
@@ -110,6 +110,16 @@ class TestGenerateJson:
         rep.collect("anti_frida", {"vulnerable": False, "frida_present": True})
         summary = rep.generate_json()["summary"]
         assert summary["anti_frida"]["status"] == "OK"
+
+    def test_status_anti_emulator(self):
+        """Emulador detectado => FALHOU; dispositivo físico => OK."""
+        rep = Reporter(device_info=DEVICE, package_name="pkg")
+        rep.collect("anti_emulator", {"is_emulator": True, "emulator_type": "qemu_avd"})
+        assert rep.generate_json()["summary"]["anti_emulator"]["status"] == "FALHOU"
+
+        rep2 = Reporter(device_info=DEVICE, package_name="pkg")
+        rep2.collect("anti_emulator", {"is_emulator": False})
+        assert rep2.generate_json()["summary"]["anti_emulator"]["status"] == "OK"
 
     def test_status_error_when_check_fails(self):
         """Check com error => status ERROR."""

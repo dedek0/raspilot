@@ -112,6 +112,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Checks a pular ({', '.join(KNOWN_CHECKS)})",
     )
     parser.add_argument(
+        "--window",
+        type=int,
+        default=12,
+        metavar="SEG",
+        help="Janela de observação em segundos nos checks dinâmicos",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"{TOOL_NAME} {TOOL_VERSION}",
@@ -304,7 +311,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 reporter,
                 "anti_frida",
                 lambda: AntiFridaCheck(dm).run_all(
-                    session, pid, on_script_loaded=dm.resume_app
+                    session, pid, on_script_loaded=dm.resume_app,
+                    window=args.window,
                 ),
                 skipped="anti_frida" in args.skip,
             )
@@ -316,7 +324,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         _run_step(
             reporter,
             "ssl_pinning",
-            lambda: SSLPinningCheck(dm).run_all(args.package),
+            lambda: SSLPinningCheck(dm).run_all(args.package, window=args.window),
             skipped="ssl_pinning" in args.skip,
         )
     finally:

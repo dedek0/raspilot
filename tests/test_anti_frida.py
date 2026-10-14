@@ -153,6 +153,32 @@ class TestAppDetection:
         assert "native_connect" in DETECTION_SCRIPT
         assert "27042" in DETECTION_SCRIPT
         assert "openat" in DETECTION_SCRIPT
+        assert "faccessat" in DETECTION_SCRIPT
+        assert "'access'" in DETECTION_SCRIPT
+        assert "'stat'" in DETECTION_SCRIPT
+
+    def test_app_death_during_observation_is_not_vulnerable(self):
+        """App que se encerra na janela => reação do RASP, vulnerable=False."""
+        dm = mock.MagicMock()
+        dm.is_app_alive.return_value = False
+        check = AntiFridaCheck(dm)
+        session = FakeSession(messages=[])
+        with mock.patch("checks.anti_frida.time.sleep"):
+            res = check.check_frida_detection_in_app(session, window=3, pid=99)
+        assert res["vulnerable"] is False
+        assert res["app_alive_at_end"] is False
+        assert any("app_terminated" in m for m in res["detection_methods_found"])
+
+    def test_app_alive_reports_app_alive_at_end(self):
+        """App vivo ao fim da janela => app_alive_at_end=True."""
+        dm = mock.MagicMock()
+        dm.is_app_alive.return_value = True
+        check = AntiFridaCheck(dm)
+        session = FakeSession(messages=[])
+        with mock.patch("checks.anti_frida.time.sleep"):
+            res = check.check_frida_detection_in_app(session, window=3, pid=99)
+        assert res["app_alive_at_end"] is True
+        assert res["vulnerable"] is True
 
 
 class TestRunAll:

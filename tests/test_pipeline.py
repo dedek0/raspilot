@@ -33,6 +33,7 @@ SHELL = {
     "ro.product.device": "panther",
     "dumpsys sensorservice": "  - a\n  - b\n  - c\n",
     "settings get secure bluetooth_address": "a4:cf:12:00:00:01",
+    "&& echo alive": "alive",
 }
 
 
@@ -134,7 +135,7 @@ def test_pipeline_end_to_end(tmp_path, fast_windows, capsys):
     assert doc["summary"]["anti_root"]["status"] == "FALHOU"
     assert doc["summary"]["anti_frida"]["status"] == "FALHOU"
     assert doc["summary"]["ssl_pinning"]["status"] == "FALHOU"
-    assert doc["summary"]["anti_emulator"]["status"] == "FALHOU"
+    assert doc["summary"]["anti_emulator"]["status"] == "OK"
 
     html = htmls[0].read_text(encoding="utf-8")
     assert "RASPilot" in html

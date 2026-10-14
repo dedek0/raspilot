@@ -120,6 +120,23 @@ try {
     } catch (e) { /* módulo indisponível */ }
 });
 
+['access', 'stat', 'stat64', 'lstat', 'faccessat', 'faccessat2'].forEach(function (name) {
+    try {
+        var addr = Module.findExportByName('libc.so', name);
+        if (addr === null) { return; }
+        Interceptor.attach(addr, {
+            onEnter: function (args) {
+                try {
+                    var path = args[0].readCString();
+                    if (looksLikeFrida(path)) {
+                        reportDetection('native_' + name, path);
+                    }
+                } catch (e) { /* best-effort */ }
+            }
+        });
+    } catch (e) { /* módulo indisponível */ }
+});
+
 function installJavaHooks() {
     try {
         var File = Java.use('java.io.File');
@@ -385,28 +402,38 @@ class AntiFridaCheck:
         self,
         session: object,
         on_script_loaded: Optional[object] = None,
+        window: int = 12,
+        pid: Optional[int] = None,
     ) -> dict:
         """Observa se o app alvo executa detecção de Frida em runtime.
 
         Injeta um script de observação que intercepta (sem bloquear)
         ``File.exists`` em paths Frida, ``Runtime.exec``/``ProcessBuilder``
         com strings 'frida', ``strstr``/``strcmp`` em libc, ``connect``
-        nas portas Frida e ``open``/``openat`` de paths Frida, coletando
-        as chamadas por alguns segundos.
+        nas portas Frida, ``open``/``openat`` e ``access``/``stat`` de
+        paths Frida, coletando as chamadas pela janela de observação.
+
+        Durante a janela o processo é monitorado: se o app se encerrar
+        (reação típica de RASP ao detectar ameaça), isso é registrado
+        como evidência e o veredito passa a ser ``vulnerable=False``.
 
         Args:
             session: Sessão Frida ativa sobre o app alvo.
             on_script_loaded: Callback chamado logo após ``script.load()`` —
                 usado pelo pipeline para ``resume`` de spawn suspenso, de
                 modo que os hooks estejam ativos antes do código do app.
+            window: Janela de observação em segundos.
+            pid: PID do processo alvo (para monitorar se o app morre).
 
         Returns:
-            Dict com ``detection_methods_found`` (lista legível) e
-            ``vulnerable`` (True se o app **não** detectou o Frida).
+            Dict com ``detection_methods_found`` (lista legível),
+            ``vulnerable`` (True se o app **não** detectou o Frida) e
+            ``app_alive_at_end`` (bool).
         """
         found: List[str] = []
         script = None
         resumed = False
+        died_after: Optional[int] = None
         try:
 
             def on_message(message, data):  # noqa: ANN001 - assinatura frida
@@ -427,13 +454,20 @@ class AntiFridaCheck:
             if on_script_loaded is not None:
                 on_script_loaded()
                 resumed = True
-            # Janela de observação: o app precisa executar seu código anti-frida.
-            time.sleep(6)
+            for elapsed in range(max(1, int(window))):
+                time.sleep(1)
+                if pid is not None and not self.dm.is_app_alive(pid):
+                    died_after = elapsed + 1
+                    logger.info(
+                        "Processo %s encerrou durante a observação (~%ss)", pid, died_after
+                    )
+                    break
         except Exception as exc:
             logger.warning("Falha ao observar detecção de Frida no app", exc_info=True)
             return {
                 "detection_methods_found": [],
                 "vulnerable": True,
+                "app_alive_at_end": True,
                 "error": str(exc),
             }
         finally:
@@ -448,10 +482,14 @@ class AntiFridaCheck:
                     on_script_loaded()
                 except Exception:
                     logger.debug("Falha no resume de emergência", exc_info=True)
+        app_alive = died_after is None
+        if not app_alive:
+            found.append(f"app_terminated: processo encerrou ~{died_after}s após resume")
         vulnerable = not found  # app não detectou = falha de RASP
         result = {
             "detection_methods_found": found,
             "vulnerable": vulnerable,
+            "app_alive_at_end": app_alive,
             "details": (
                 f"App detectou Frida via: {'; '.join(found)}" if found
                 else "App não executou nenhuma detecção de Frida observada"
@@ -470,6 +508,7 @@ class AntiFridaCheck:
         session: object,
         pid: int,
         on_script_loaded: Optional[object] = None,
+        window: int = 12,
     ) -> dict:
         """Consolida presença de Frida e capacidade de detecção do app.
 
@@ -482,6 +521,7 @@ class AntiFridaCheck:
             pid: PID do processo alvo.
             on_script_loaded: Callback de resume pós-load do script de
                 observação (ver ``check_frida_detection_in_app``).
+            window: Janela de observação em segundos.
 
         Returns:
             Dict com ``vulnerable`` (bool), ``frida_present`` (bool),
@@ -495,7 +535,7 @@ class AntiFridaCheck:
             "frida_threads": self.check_frida_threads(pid),
         }
         app_detection = self.check_frida_detection_in_app(
-            session, on_script_loaded=on_script_loaded
+            session, on_script_loaded=on_script_loaded, window=window, pid=pid
         )
 
         frida_present = any(res.get("detected") for res in checks.values())

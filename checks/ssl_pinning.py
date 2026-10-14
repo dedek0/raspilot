@@ -274,24 +274,27 @@ class SSLPinningCheck:
     # ------------------------------------------------------------------
     # Bypass dinâmico
     # ------------------------------------------------------------------
-    def attempt_bypass(self, package_name: str) -> dict:
+    def attempt_bypass(self, package_name: str, window: int = 12) -> dict:
         """Tenta contornar o SSL pinning injetando o ssl_bypass.js.
 
         Espawna o app com Frida, carrega o script universal de bypass e
-        coleta logs/console por ~6s. Sucesso exige evidência real de
-        interceptação (não apenas "hook instalado").
+        coleta logs/console pela janela informada. Sucesso exige evidência
+        real de interceptação (não apenas "hook instalado").
 
         Args:
             package_name: Package name do app alvo.
+            window: Janela de observação em segundos.
 
         Returns:
             Dict com ``success`` (bool), ``intercepted_hosts`` (lista),
-            ``bypass_logs`` (lista) e ``error`` (str|None).
+            ``bypass_logs`` (lista), ``app_alive_at_end`` (bool) e
+            ``error`` (str|None).
         """
         bypass_logs: List[str] = []
         intercepted_hosts: List[str] = []
         session = None
         script = None
+        died_after: Optional[int] = None
 
         def on_message(message, data):  # noqa: ANN001 - assinatura frida
             if message.get("type") == "send":
@@ -317,14 +320,23 @@ class SSLPinningCheck:
                 session, SSL_BYPASS_SCRIPT, on_message=on_message
             )
             self.dm.resume_app()
-            # Janela para o app realizar tráfego/validações de certificado.
-            time.sleep(8)
+            pid = self.dm.last_spawn_pid
+            for elapsed in range(max(1, int(window))):
+                time.sleep(1)
+                if pid is not None and not self.dm.is_app_alive(pid):
+                    died_after = elapsed + 1
+                    logger.info(
+                        "Processo %s encerrou durante o bypass SSL (~%ss)",
+                        pid, died_after,
+                    )
+                    break
         except Exception as exc:
             logger.warning("Bypass SSL falhou", exc_info=True)
             return {
                 "success": False,
                 "intercepted_hosts": intercepted_hosts,
                 "bypass_logs": bypass_logs,
+                "app_alive_at_end": True,
                 "error": str(exc),
             }
         finally:
@@ -339,6 +351,11 @@ class SSLPinningCheck:
                 except Exception:
                     logger.debug("Falha ao detach da sessão", exc_info=True)
 
+        if died_after is not None:
+            bypass_logs.append(
+                f"app_terminated: processo encerrou ~{died_after}s após resume"
+            )
+
         # Evidência real: hosts interceptados OU logs de bypass efetivo.
         effective = [
             log for log in bypass_logs
@@ -351,6 +368,7 @@ class SSLPinningCheck:
             "intercepted_hosts": intercepted_hosts,
             "bypass_logs": bypass_logs,
             "effective_logs": effective,
+            "app_alive_at_end": died_after is None,
             "error": None,
         }
         logger.info(
@@ -361,7 +379,9 @@ class SSLPinningCheck:
     # ------------------------------------------------------------------
     # Consolidação
     # ------------------------------------------------------------------
-    def run_all(self, package_name: str, apk_path: Optional[str] = None) -> dict:
+    def run_all(
+        self, package_name: str, apk_path: Optional[str] = None, window: int = 12
+    ) -> dict:
         """Combina detecção estática e tentativa de bypass.
 
         Se ``pinning_detected=False``, ``bypass_successful`` é ``None``
@@ -370,6 +390,7 @@ class SSLPinningCheck:
         Args:
             package_name: Package name do app alvo.
             apk_path: Caminho opcional de APK local para análise.
+            window: Janela de observação do bypass em segundos.
 
         Returns:
             Dict com ``pinning_detected``, ``pinning_type``,
@@ -389,7 +410,7 @@ class SSLPinningCheck:
                 "timestamp": _now_iso(),
             }
 
-        bypass = self.attempt_bypass(package_name)
+        bypass = self.attempt_bypass(package_name, window=window)
         return {
             "pinning_detected": True,
             "pinning_type": detection.get("type", "none"),
