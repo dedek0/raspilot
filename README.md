@@ -1,5 +1,7 @@
 # ✈ RASPilot
 
+> 🇺🇸 [English version](README.en.md)
+
 **RASPilot — Piloto Automático de Auditoria RASP para Android.**
 
 Orquestra verificações Anti-Root, Anti-Frida, Anti-Emulador e SSL Pinning em
@@ -54,6 +56,9 @@ python main.py --package com.example.app \
     --output-dir ./meus_relatorios \
     --verbose
 
+# Janela de observação maior (segundos) nos checks dinâmicos
+python main.py --package com.example.app --window 20
+
 # Pular verificações
 python main.py --package com.example.app --skip anti_emulator ssl_pinning
 ```
@@ -66,6 +71,7 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--device-id` | não | Serial ADB (ex: `emulator-5554`) |
 | `--wifi IP:PORTA` | não | Endereço para `adb connect` |
 | `--output-dir` | não | Diretório dos relatórios (default `reports/`) |
+| `--window SEG` | não | Janela de observação em segundos nos checks dinâmicos (default `12`) |
 | `--verbose` | não | Logging em nível DEBUG |
 | `--skip CHECK...` | não | Checks a pular (`anti_root`, `anti_frida`, `anti_emulator`, `ssl_pinning`) |
 
@@ -81,8 +87,8 @@ Semântica de status:
 
 | Status | Significado |
 |---|---|
-| `OK` | A proteção do app funcionou (ex: emulador detectado, SSL pinning resistiu, Frida bloqueado) |
-| `FALHOU` | O bypass venceu (ex: app rooteado sem detecção, pinning contornado) |
+| `OK` | Ambiente/proteção OK (ex: dispositivo físico, SSL pinning resistiu ao bypass, app detectou e bloqueou o Frida) |
+| `FALHOU` | Ameaça presente ou bypass venceu (ex: root/emulador no ambiente, pinning contornado, app não detectou o Frida) |
 | `N/A` | Não aplicável (ex: sem SSL pinning — bypass não faz sentido) |
 | `SKIP` | Verificação pulada via `--skip` |
 | `ERROR` | A verificação não pôde executar (o pipeline continua) |
@@ -101,9 +107,11 @@ Múltiplos vetores independentes consolidados em `is_rooted` + `confidence`:
 
 - Binários `su` em 7 paths canônicos
 - Magisk (package, `/data/adb/magisk`, `/sbin/.magisk`, `which magisk`)
+- APatch e KernelSU (`me.bmax.apatch`, `me.weishu.kernelsu`, `/data/adb/ap`,
+  `/data/adb/ksu`, `apd`, `ksud`)
 - Propriedades de build (`ro.debuggable`, `ro.secure`, `service.adb.root`,
   `ro.boot.verifiedbootstate`, `ro.boot.flash.locked`)
-- Apps gerenciadores de root (Magisk, SuperSU, KingRoot...)
+- Apps gerenciadores de root (Magisk, SuperSU, KingRoot, APatch, KernelSU...)
 - `/system` montado `rw`
 - Busybox
 
@@ -116,7 +124,12 @@ Confiança: `high` (≥2 vetores), `medium` (1), `low` (0).
 - Módulos Frida carregados no processo alvo (via Frida)
 - Threads `gum-js-loop`, `gmain`, `pool-frida` (`/proc/<pid>/task`)
 - Observação de detecção de Frida **pelo app** (hooks de observação em
-  `File.exists`, `Runtime.exec`, `ProcessBuilder`, `strstr`/`strcmp`)
+  `File.exists`, `Runtime.exec`, `ProcessBuilder`, `strstr`/`strcmp`,
+  `connect` nas portas Frida e `open`/`access`/`stat`/`faccessat` em paths
+  Frida)
+- Durante a janela de observação o processo é monitorado: se o app se
+  encerrar (reação típica de RASP ao detectar ameaça), isso vira evidência
+  e o veredito passa a `vulnerable=False`
 
 `vulnerable=True` ⇒ o app **não** detectou o Frida (falha de RASP).
 O bypass correspondente vive em `scripts/anti_frida_bypass.js`.
@@ -139,7 +152,8 @@ Classifica `emulator_type` (`qemu_avd`, `genymotion`, `ldplayer`,
   TrustManager, HostnameVerifier, OkHttp 3/4, NSC, Conscrypt, Apache
   HttpClient, WebView, BoringSSL/OpenSSL e Flutter. Bypass só é considerado
   bem-sucedido com **evidência real** (host interceptado ou log de
-  `check()` contornado).
+  `check()` contornado). O processo é monitorado durante a janela — se o
+  app se encerrar, isso é registrado no resultado.
 
 ---
 
@@ -208,6 +222,7 @@ O JSON emitido pelo RASPilot já segue um schema estável
 | `frida-server não respondeu` | Versão local ≠ servidor | `pip install -U frida frida-tools` e rode de novo |
 | `Dispositivo não ficou pronto em 15s` | Offline/USB com problema | Confira cabo/`adb kill-server` |
 | App spawnado mas checks vazios | App protegido contra debugger | Use `--verbose` e inspecione `details` no JSON |
+| Verificação curta demais para apps lentos | Splash longa ou RASP tardio | Aumente com `--window 20` (ou mais) |
 
 ## Licença e uso
 
