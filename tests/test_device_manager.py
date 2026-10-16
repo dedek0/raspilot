@@ -218,6 +218,140 @@ class TestRunShell:
         rs.assert_called_once_with("id", timeout=20)
 
 
+class TestCaptureDeathCause:
+    """`capture_death_cause` distingue crash, kill e ausência de registro."""
+
+    @staticmethod
+    def _dm_with(mapping):
+        """DeviceManager com run_shell fake respondendo por substring."""
+        dm = DeviceManager()
+
+        def fake_run_shell(command, timeout=20):
+            for key, value in mapping.items():
+                if key in command:
+                    return {"ok": True, "rc": 0, "stdout": value, "stderr": ""}
+            return {"ok": True, "rc": 0, "stdout": "", "stderr": ""}
+
+        dm.run_shell = fake_run_shell
+        return dm
+
+    def test_detects_fatal_signal(self):
+        """Sinal fatal no buffer de crash vira signal=SIGSEGV."""
+        dm = self._dm_with({
+            "logcat -d -b crash": (
+                "01-01 00:00:00.000  1234  1234 F libc    : Fatal signal 11 "
+                "(SIGSEGV), code 1, fault addr 0x0 in tid 99 (com.example.app), "
+                "pid 1234 (com.example.app)\n"
+            ),
+        })
+        res = dm.capture_death_cause(pid=1234, package="com.example.app")
+        assert res["signal"] == "SIGSEGV"
+        assert any("SIGSEGV" in e for e in res["evidence"])
+
+    def test_events_kill_line(self):
+        """Linha am_kill citando o alvo é registrada (sem signal)."""
+        dm = self._dm_with({
+            "logcat -d -b events": (
+                "01-01 00:00:00.000  900  900 I am_kill : [0,1234,com.example.app,force stop]\n"
+            ),
+        })
+        res = dm.capture_death_cause(pid=1234, package="com.example.app")
+        assert res["signal"] is None
+        assert any("am_kill" in e for e in res["evidence"])
+        assert res["summary"] == "morte registrada em logcat"
+
+    def test_no_external_record(self):
+        """Sem nada no logcat: resumo aponta SIGKILL externo/exit_group."""
+        dm = self._dm_with({})
+        res = dm.capture_death_cause(pid=1234, package="com.example.app")
+        assert res["evidence"] == []
+        assert res["signal"] is None
+        assert "sem registro externo" in res["summary"]
+
+    def test_sigkill_from_zygote_line(self):
+        """Linha do Zygote 'exited due to signal 9' vira SIGKILL."""
+        dm = self._dm_with({
+            "logcat -d -t 400": (
+                "01-01 00:00:00.000  857  857 I Zygote  : Process 1234 "
+                "exited due to signal 9 (Killed)\n"
+            ),
+        })
+        res = dm.capture_death_cause(pid=1234, package="com.example.app")
+        assert res["signal"] == "SIGKILL"
+        assert "não interceptável" in res["summary"]
+
+    def test_stale_crash_lines_are_excluded_with_pid(self):
+        """Com pid, linha fatal de crash antigo (sem o pid) é ignorada."""
+        dm = self._dm_with({
+            "logcat -d -b crash": (
+                "01-01 00:00:00.000  9999  9999 F libc : Fatal signal 6 "
+                "(SIGABRT) in tid 9999 (outro.app), pid 9999 (outro.app)\n"
+            ),
+        })
+        res = dm.capture_death_cause(pid=1234, package="com.example.app")
+        assert res["signal"] is None
+        assert res["evidence"] == []
+
+    def test_crash_pid_match_requires_word(self):
+        """Pid aparecendo só dentro de um endereço não conta como match."""
+        dm = self._dm_with({
+            "logcat -d -b crash": (
+                "01-01 00:00:00.000  9  9 F libc : Fatal signal 6 (SIGABRT), "
+                "fault addr 0x000000018544 in tid 9999 (outro.app), pid 9999\n"
+            ),
+        })
+        res = dm.capture_death_cause(pid=8544, package="com.example.app")
+        assert res["evidence"] == []
+        assert res["signal"] is None
+
+
+class TestFridaStealth:
+    """Stealth do frida-server (porta não-padrão + nome opaco)."""
+
+    def test_remote_path_is_opaque(self):
+        """O path remoto não contém 'frida' (evita scan por nome)."""
+        from device_manager import FRIDA_REMOTE_PATH
+
+        assert "frida" not in FRIDA_REMOTE_PATH
+
+    def test_port_is_not_default(self):
+        """A porta do servidor não é 27042/27043 (evita port-scan)."""
+        from device_manager import FRIDA_PORT
+
+        assert FRIDA_PORT not in (27042, 27043)
+
+    def test_kill_covers_stealth_binary(self):
+        """kill_frida_server encerra também o binário stealth."""
+        dm = DeviceManager()
+        seen = []
+
+        def fake_shell(command, timeout=20):
+            seen.append(command)
+            return {"ok": True, "rc": 0, "stdout": "", "stderr": ""}
+
+        with mock.patch.object(dm, "run_shell", side_effect=fake_shell), \
+             mock.patch.object(dm, "has_su_access", return_value=False), \
+             mock.patch("device_manager.time.sleep"):
+            dm.kill_frida_server()
+        assert any(".lloader" in c for c in seen)
+
+    def test_patch_renames_memfd_strings(self, tmp_path):
+        """O patch renomeia as strings do memfd do agente (mesmo tamanho)."""
+        src = tmp_path / "srv.bin"
+        src.write_bytes(
+            b"\x7fELFpad" + b"frida-agent-64.so" + b"x" + b"frida-agent-32.so"
+        )
+        dst = tmp_path / "out.bin"
+        count = DeviceManager._patch_frida_binary(str(src), str(dst))
+        data = dst.read_bytes()
+        assert count == 2
+        assert b"frida-agent" not in data
+        assert b"libloader64_v8.so" in data
+        assert b"libloader32_v7.so" in data
+        # Tamanhos preservados (patch binário seguro).
+        assert len(data) == src.stat().st_size
+
+
 class TestFridaHelpers:
     """Helpers do frida-server (sem download real)."""
 

@@ -126,8 +126,10 @@ class TestAttemptBypass:
 
         def create_script(self, source, **kwargs):
             # O script real (com prelúdio da bridge) deve ser lido do disco.
-            assert "ssl" in source.lower()
-            return TestAttemptBypass._FakeScript(self._messages)
+            # O kill_trace.js recebe mensagens próprias (lista vazia aqui).
+            if "ssl" in source.lower():
+                return TestAttemptBypass._FakeScript(self._messages)
+            return TestAttemptBypass._FakeScript([])
 
         def detach(self):
             pass
@@ -163,6 +165,49 @@ class TestAttemptBypass:
         res = SSLPinningCheck(dm).attempt_bypass("com.app")
         assert res["success"] is False
         assert "spawn falhou" in res["error"]
+
+    def test_app_kill_reported_not_evidence(self):
+        """Mensagens do kill_trace entram como diagnóstico, não evidência."""
+        dm = mock.MagicMock()
+        dm.spawn_app.return_value = self._FakeSession([
+            {"type": "send", "payload": {"type": "app-kill",
+                                          "message": "System.exit(1) <- com.x.Security.kill"}},
+        ])
+        with mock.patch("checks.ssl_pinning.time.sleep"):
+            res = SSLPinningCheck(dm).attempt_bypass("com.app")
+        assert any(log.startswith("app-kill:") for log in res["bypass_logs"])
+        assert res["success"] is False
+
+    def test_app_death_captured(self):
+        """Morte durante o bypass registra a causa externa no resultado."""
+        dm = mock.MagicMock()
+        dm.spawn_app.return_value = self._FakeSession([])
+        dm.last_spawn_pid = 42
+        dm.is_app_alive.return_value = False
+        dm.capture_death_cause.return_value = {
+            "evidence": [], "signal": None,
+            "summary": "sem registro externo (SIGKILL externo ou exit_group direto)",
+        }
+        with mock.patch("checks.ssl_pinning.time.sleep"):
+            res = SSLPinningCheck(dm).attempt_bypass("com.app", window=3)
+        assert res["app_alive_at_end"] is False
+        assert res["death_cause"]["signal"] is None
+        assert any(log.startswith("death_cause:") for log in res["bypass_logs"])
+        assert res["success"] is False
+
+    def test_kill_trace_script_exists(self):
+        """O kill_trace.js existe e cobre os vetores de morte essenciais."""
+        from checks.ssl_pinning import KILL_TRACE_SCRIPT
+
+        assert os.path.isfile(KILL_TRACE_SCRIPT)
+        with open(KILL_TRACE_SCRIPT, encoding="utf-8") as fh:
+            source = fh.read()
+        for marker in (
+            "System.exit", "Runtime.exit", "Runtime.halt", "killProcess",
+            "tgkill", "killpg", "abort", "syscall", "app-kill", "backtrace",
+            "raspilotFindExport", "raspilotPerformJava",
+        ):
+            assert marker in source, f"vetor ausente: {marker}"
 
     def test_script_file_exists(self):
         """O arquivo ssl_bypass.js existe e cobre as camadas essenciais."""

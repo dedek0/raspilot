@@ -15,9 +15,8 @@
  *     frameworks.
  *   - open/openat/fopen/access/stat de paths de frameworks retornam
  *     ENOENT/NULL.
- *   - /proc/self/maps é lido normalmente, mas as linhas de libs de
- *     hooking (frida, xposed, lsposed...) são filtradas em read()/fgets().
- *   - TracerPid de /proc/self/status é zerado (anti-ptrace).
+ *   - O filtro de /proc (maps, TracerPid, /proc/net/tcp e comm de
+ *     threads) vive em scripts/proc_filter.js, carregado junto.
  *
  * O script é idempotente e cada bloco é isolado em try/catch para
  * funcionar em múltiplas versões do Android/ART.
@@ -43,10 +42,6 @@ var HOOK_PATHS = [
     're.frida.server'
 ];
 
-// fd/FILE* abertos de /proc/.../maps e /proc/.../status (para filtrar).
-var fdKind = {};
-var fpKind = {};
-
 // Envia log para o host (visível em bypass_logs do relatório).
 function report(msg) {
     try {
@@ -66,26 +61,12 @@ function matchesHookFramework(str) {
     return false;
 }
 
-function isMapsPath(path) {
-    try {
-        var p = '' + path;
-        return p.indexOf('/proc/') === 0 && p.indexOf('maps') !== -1;
-    } catch (e) { return false; }
-}
-
-function isStatusPath(path) {
-    try {
-        var p = '' + path;
-        return p.indexOf('/proc/') === 0 && p.indexOf('status') !== -1;
-    } catch (e) { return false; }
-}
-
-// 'block' (path de framework → ENOENT) | 'maps' | 'status' | null.
+// 'block' (path de framework → ENOENT) | null.
+// O filtro de /proc (maps/status/net/comm) vive em proc_filter.js.
 function classifyPath(path) {
-    var p = '' + path;
-    if (isMapsPath(p)) { return 'maps'; }
-    if (isStatusPath(p)) { return 'status'; }
-    if (matchesHookFramework(p)) { return 'block'; }
+    try {
+        if (matchesHookFramework('' + path)) { return 'block'; }
+    } catch (e) { /* best-effort */ }
     return null;
 }
 
@@ -98,61 +79,6 @@ function setErrno(value) {
             getErrno().writeS32(value);
         }
     } catch (e) { /* best-effort */ }
-}
-
-function strToBytes(s) {
-    var bytes = new Uint8Array(s.length);
-    for (var i = 0; i < s.length; i++) {
-        bytes[i] = s.charCodeAt(i) & 0xff;
-    }
-    return bytes;
-}
-
-// ----------------------------------------------------------------------
-// Filtros de conteúdo de /proc
-// ----------------------------------------------------------------------
-function filterMaps(text) {
-    var lines = text.split('\n');
-    var kept = [];
-    var removed = 0;
-    for (var i = 0; i < lines.length; i++) {
-        if (lines[i].indexOf('/') !== -1 && matchesHookFramework(lines[i])) {
-            removed++;
-            continue;
-        }
-        kept.push(lines[i]);
-    }
-    return {
-        text: kept.join('\n'),
-        changed: removed > 0,
-        count: removed,
-        label: 'linhas de libs de hook removidas'
-    };
-}
-
-function filterStatus(text) {
-    var replaced = 0;
-    var out = text.replace(/TracerPid:[ \t]*(\d+)/g, function (match, pid) {
-        if (pid !== '0') {
-            replaced++;
-            return 'TracerPid:\t0';
-        }
-        return match;
-    });
-    return {
-        text: out,
-        changed: replaced > 0,
-        count: replaced,
-        label: 'TracerPid zerado'
-    };
-}
-
-function filterProc(kind, text) {
-    return kind === 'maps' ? filterMaps(text) : filterStatus(text);
-}
-
-function kindLabel(kind) {
-    return kind === 'maps' ? '/proc/self/maps' : '/proc/self/status';
 }
 
 // ----------------------------------------------------------------------
@@ -463,14 +389,11 @@ function hookOpenFamily() {
             Interceptor.attach(addr, {
                 onEnter: function (args) {
                     this._block = false;
-                    this._kind = null;
                     this._path = '';
                     try {
                         var path = args[pathIndex].readCString();
-                        var kind = classifyPath(path);
                         this._path = path;
-                        if (kind === 'block') { this._block = true; }
-                        else if (kind !== null) { this._kind = kind; }
+                        if (classifyPath(path) === 'block') { this._block = true; }
                     } catch (e) { /* best-effort */ }
                 },
                 onLeave: function (retval) {
@@ -478,11 +401,6 @@ function hookOpenFamily() {
                         setErrno(2); // ENOENT
                         retval.replace(ptr(-1));
                         report('neutralizado: ' + name + '(' + this._path + ') -> ENOENT');
-                        return;
-                    }
-                    if (this._kind !== null) {
-                        var fd = retval.toInt32();
-                        if (fd >= 0) { fdKind[fd] = this._kind; }
                     }
                 }
             });
@@ -501,14 +419,11 @@ function hookFopenFamily() {
             Interceptor.attach(addr, {
                 onEnter: function (args) {
                     this._block = false;
-                    this._kind = null;
                     this._path = '';
                     try {
                         var path = args[0].readCString();
-                        var kind = classifyPath(path);
                         this._path = path;
-                        if (kind === 'block') { this._block = true; }
-                        else if (kind !== null) { this._kind = kind; }
+                        if (classifyPath(path) === 'block') { this._block = true; }
                     } catch (e) { /* best-effort */ }
                 },
                 onLeave: function (retval) {
@@ -516,11 +431,6 @@ function hookFopenFamily() {
                         setErrno(2); // ENOENT
                         retval.replace(ptr(0)); // NULL
                         report('neutralizado: ' + name + '(' + this._path + ') -> ENOENT');
-                        return;
-                    }
-                    if (this._kind !== null) {
-                        var fp = retval;
-                        if (!fp.isNull()) { fpKind[fp.toString()] = this._kind; }
                     }
                 }
             });
@@ -567,105 +477,6 @@ function hookAccessStatFamily() {
 // ----------------------------------------------------------------------
 // 7) Native — filtro de conteúdo de /proc (maps e TracerPid)
 // ----------------------------------------------------------------------
-function hookProcReads() {
-    try {
-        var readAddr = raspilotFindExport('libc.so', 'read');
-        if (readAddr !== null) {
-            Interceptor.attach(readAddr, {
-                onEnter: function (args) {
-                    this._fd = args[0].toInt32();
-                    this._buf = args[1];
-                    this._kind = fdKind[this._fd] || null;
-                },
-                onLeave: function (retval) {
-                    if (this._kind === null) { return; }
-                    var n = retval.toInt32();
-                    if (n <= 0) { return; }
-                    try {
-                        var orig = this._buf.readUtf8String(n);
-                        if (orig === null || orig.length === 0) { return; }
-                        var res = filterProc(this._kind, orig);
-                        if (!res.changed) { return; }
-                        var text = res.text;
-                        if (text.length < n) {
-                            this._buf.writeUtf8String(text);
-                            retval.replace(ptr(text.length));
-                        } else if (text.length === n) {
-                            this._buf.writeByteArray(strToBytes(text));
-                        } else {
-                            return; // não cabe no buffer — mantém original
-                        }
-                        report('neutralizado: ' + kindLabel(this._kind) + ' em read() → ' +
-                               res.count + ' ' + res.label);
-                    } catch (e) { /* best-effort */ }
-                }
-            });
-            report('libc.read hookado (filtro de /proc)');
-        }
-    } catch (e) {
-        report('falha ao hookar read: ' + e);
-    }
-
-    try {
-        var fgetsAddr = raspilotFindExport('libc.so', 'fgets');
-        if (fgetsAddr !== null) {
-            Interceptor.attach(fgetsAddr, {
-                onEnter: function (args) {
-                    this._buf = args[0];
-                    this._fp = args[2].toString();
-                    this._kind = fpKind[this._fp] || null;
-                },
-                onLeave: function (retval) {
-                    if (this._kind === null || retval.isNull()) { return; }
-                    try {
-                        var orig = this._buf.readCString();
-                        if (orig === null || orig.length === 0) { return; }
-                        var res = filterProc(this._kind, orig);
-                        if (!res.changed) { return; }
-                        var text = res.text;
-                        if (text.length >= orig.length) { return; }
-                        this._buf.writeUtf8String(text);
-                        report('neutralizado: ' + kindLabel(this._kind) + ' em fgets() → ' +
-                               res.count + ' ' + res.label);
-                    } catch (e) { /* best-effort */ }
-                }
-            });
-            report('libc.fgets hookado (filtro de /proc)');
-        }
-    } catch (e) {
-        report('falha ao hookar fgets: ' + e);
-    }
-
-    // Evita fds obsoletos (reuso de fd after close).
-    try {
-        var closeAddr = raspilotFindExport('libc.so', 'close');
-        if (closeAddr !== null) {
-            Interceptor.attach(closeAddr, {
-                onEnter: function (args) {
-                    try {
-                        var fd = args[0].toInt32();
-                        if (fdKind[fd] !== undefined) { delete fdKind[fd]; }
-                    } catch (e) { /* best-effort */ }
-                }
-            });
-        }
-    } catch (e) { /* best-effort */ }
-
-    try {
-        var fcloseAddr = raspilotFindExport('libc.so', 'fclose');
-        if (fcloseAddr !== null) {
-            Interceptor.attach(fcloseAddr, {
-                onEnter: function (args) {
-                    try {
-                        var key = args[0].toString();
-                        if (fpKind[key] !== undefined) { delete fpKind[key]; }
-                    } catch (e) { /* best-effort */ }
-                }
-            });
-        }
-    } catch (e) { /* best-effort */ }
-}
-
 // ----------------------------------------------------------------------
 // Bootstrap — idempotente
 // ----------------------------------------------------------------------
@@ -674,7 +485,6 @@ function main() {
     hookOpenFamily();
     hookFopenFamily();
     hookAccessStatFamily();
-    hookProcReads();
 
     var attachJava = function () {
         var ok = raspilotPerformJava(function () {

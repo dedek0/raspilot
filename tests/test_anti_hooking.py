@@ -9,6 +9,8 @@ from unittest import mock
 from checks.anti_hooking import (
     HOOK_BYPASS_SCRIPT,
     HOOK_DETECTION_SCRIPT,
+    KILL_TRACE_SCRIPT,
+    PROC_FILTER_SCRIPT,
     STATIC_SIGNATURES,
     AntiHookingCheck,
 )
@@ -334,6 +336,18 @@ class TestAppDetection:
         assert res["weak_signals"]
         assert any("maps_scan" in s for s in res["detection_methods_found"])
 
+    def test_net_and_comm_scan_are_weak_signals(self):
+        """Port-scan via /proc/net/tcp e leitura de comm são fracos."""
+        check = AntiHookingCheck(mock.MagicMock())
+        session = FakeSession(detection_messages=[
+            _det("net_scan", "/proc/net/tcp via open"),
+            _det("comm_scan", "/proc/self/task/1/comm via open"),
+        ])
+        with mock.patch("checks.anti_hooking.time.sleep"):
+            res = check.check_hook_detection_in_app(session)
+        assert res["detected"] is False
+        assert len(res["weak_signals"]) == 2
+
     def test_strong_and_weak_coexist(self):
         """Sinal fraco + forte => detected=True e ambos reportados."""
         check = AntiHookingCheck(mock.MagicMock())
@@ -371,15 +385,48 @@ class TestAppDetection:
         assert res["detection_methods_found"] == []
 
     def test_app_death_is_strong_signal(self):
-        """Morte na janela => reação do RASP, detected=True."""
+        """Morte na janela => reação do RASP + causa externa capturada."""
         dm = mock.MagicMock()
         dm.is_app_alive.return_value = False
+        dm.capture_death_cause.return_value = {
+            "evidence": ["crash: Fatal signal 9 (SIGKILL)"],
+            "signal": None,
+            "summary": "morte registrada em logcat",
+        }
         check = AntiHookingCheck(dm)
         with mock.patch("checks.anti_hooking.time.sleep"):
-            res = check.check_hook_detection_in_app(FakeSession(), window=3, pid=99)
+            res = check.check_hook_detection_in_app(
+                FakeSession(), window=3, pid=99, package_name="com.app"
+            )
         assert res["detected"] is True
         assert res["app_alive_at_end"] is False
         assert any("app_terminated" in s for s in res["strong_signals"])
+        assert any("app_kill_external" in s for s in res["strong_signals"])
+        assert res["death_cause"]["summary"] == "morte registrada em logcat"
+        dm.capture_death_cause.assert_called_once_with(pid=99, package="com.app")
+
+    def test_app_kill_trace_is_strong_signal(self):
+        """Mensagem do kill_trace (quem matou) vira sinal forte."""
+        check = AntiHookingCheck(mock.MagicMock())
+        session = FakeSession(detection_messages=[
+            {"type": "send", "payload": {"type": "app-kill",
+                                          "message": "System.exit(1) <- com.x.Security.kill"}},
+        ])
+        with mock.patch("checks.anti_hooking.time.sleep"):
+            res = check.check_hook_detection_in_app(session)
+        assert res["detected"] is True
+        assert any("app_kill" in s for s in res["strong_signals"])
+
+    def test_kill_trace_script_exists(self):
+        """O kill_trace.js existe e cobre os vetores de morte essenciais."""
+        assert os.path.isfile(KILL_TRACE_SCRIPT)
+        with open(KILL_TRACE_SCRIPT, encoding="utf-8") as fh:
+            source = fh.read()
+        for marker in (
+            "System.exit", "Runtime.exit", "killProcess", "tgkill",
+            "abort", "syscall", "app-kill", "backtrace",
+        ):
+            assert marker in source, f"vetor ausente: {marker}"
 
     def test_script_exists_with_essential_hooks(self):
         """O script de observação cobre as checagens anti-hook essenciais."""
@@ -458,11 +505,24 @@ class TestAttemptBypass:
             "File.list", "File.listFiles", "Runtime.exec", "ProcessBuilder",
             "getStackTrace", "strstr", "strcmp", "memcmp",
             "openat", "fopen", "access", "faccessat",
-            "TracerPid", "fgets", "raspilot-hooking-bypass",
+            "raspilot-hooking-bypass",
             # Compatibilidade Frida 16/17 (validada em dispositivo real):
             "raspilotFindExport", "raspilotPerformJava",
         ):
             assert marker in source, f"técnica ausente: {marker}"
+        assert "Module.findExportByName" not in source
+
+    def test_proc_filter_script_exists(self):
+        """O proc_filter.js cobre maps, TracerPid, portas Frida e comm."""
+        assert os.path.isfile(PROC_FILTER_SCRIPT)
+        with open(PROC_FILTER_SCRIPT, encoding="utf-8") as fh:
+            source = fh.read()
+        for marker in (
+            "TracerPid", "fgets", "/net/tcp", "69A2", "69A3", "comm",
+            "maps", "raspilotFindExport", "raspilot-hooking-bypass",
+            "pthread_setname_np",
+        ):
+            assert marker in source, f"filtro ausente: {marker}"
         assert "Module.findExportByName" not in source
 
 

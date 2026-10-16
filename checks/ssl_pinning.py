@@ -33,6 +33,18 @@ SSL_BYPASS_SCRIPT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "ssl_bypass.js"
 )
 
+# Script de rastreio de morte do processo (quem chama exit/kill e com
+# que pilha) — observado junto com o bypass.
+KILL_TRACE_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "kill_trace.js"
+)
+
+# Filtro de /proc (maps, TracerPid, /proc/net/tcp, comm de threads) —
+# esconde os artefatos do Frida durante o bypass.
+PROC_FILTER_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "proc_filter.js"
+)
+
 # Assinaturas estáticas: (tipo, [(needle_bytes, descrição), ...]).
 # Ordem define a prioridade na classificação do tipo.
 STATIC_SIGNATURES: List[Tuple[str, List[Tuple[bytes, str]]]] = [
@@ -224,6 +236,8 @@ class SSLPinningCheck:
         intercepted_hosts: List[str] = []
         session = None
         script = None
+        proc_script = None
+        kill_script = None
         died_after: Optional[int] = None
 
         def on_message(message, data):  # noqa: ANN001 - assinatura frida
@@ -233,6 +247,12 @@ class SSLPinningCheck:
                     host = payload.get("host", "")
                     if host and host not in intercepted_hosts:
                         intercepted_hosts.append(host)
+                    return
+                if payload.get("type") == "app-kill":
+                    # Quem matou o processo (kill_trace.js) — diagnóstico.
+                    msg = "app-kill: " + payload.get("message", "")
+                    if msg and msg not in bypass_logs:
+                        bypass_logs.append(msg)
                     return
                 msg = payload.get("message", "")
                 if msg and msg not in bypass_logs:
@@ -249,6 +269,15 @@ class SSLPinningCheck:
             script = load_script_file(
                 session, SSL_BYPASS_SCRIPT, on_message=on_message
             )
+            try:
+                proc_script = load_script_file(
+                    session, PROC_FILTER_SCRIPT, on_message=on_message
+                )
+                kill_script = load_script_file(
+                    session, KILL_TRACE_SCRIPT, on_message=on_message
+                )
+            except Exception:
+                logger.warning("scripts auxiliares indisponíveis", exc_info=True)
             self.dm.resume_app()
             pid = self.dm.last_spawn_pid
             for elapsed in range(max(1, int(window))):
@@ -266,11 +295,15 @@ class SSLPinningCheck:
                 "success": False,
                 "intercepted_hosts": intercepted_hosts,
                 "bypass_logs": bypass_logs,
+                "effective_logs": [],
                 "app_alive_at_end": True,
+                "death_cause": None,
                 "error": str(exc),
             }
         finally:
             safe_unload(script)
+            safe_unload(proc_script)
+            safe_unload(kill_script)
             if session is not None:
                 try:
                     session.detach()
@@ -281,7 +314,20 @@ class SSLPinningCheck:
             bypass_logs.append(
                 f"app_terminated: processo encerrou ~{died_after}s após resume"
             )
+            try:
+                death_cause = self.dm.capture_death_cause(
+                    pid=pid, package=package_name
+                )
+                bypass_logs.append(
+                    "death_cause: " + str(death_cause.get("summary", "?"))
+                )
+            except Exception:
+                logger.debug("Falha ao capturar causa da morte", exc_info=True)
+                death_cause = None
+        else:
+            death_cause = None
 
+        alive = died_after is None
         # Evidência real: hosts interceptados OU logs de bypass efetivo.
         effective = [
             log for log in bypass_logs
@@ -294,7 +340,8 @@ class SSLPinningCheck:
             "intercepted_hosts": intercepted_hosts,
             "bypass_logs": bypass_logs,
             "effective_logs": effective,
-            "app_alive_at_end": died_after is None,
+            "app_alive_at_end": alive,
+            "death_cause": death_cause,
             "error": None,
         }
         logger.info(

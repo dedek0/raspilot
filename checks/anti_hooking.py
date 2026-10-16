@@ -50,6 +50,18 @@ HOOK_BYPASS_SCRIPT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "anti_hooking_bypass.js"
 )
 
+# Script de rastreio de morte do processo (quem chama exit/kill e com
+# que pilha) — observado junto com o script anti-hook.
+KILL_TRACE_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "kill_trace.js"
+)
+
+# Filtro de /proc (maps, TracerPid, /proc/net/tcp, comm de threads) —
+# carregado junto com o bypass para esconder os artefatos do Frida.
+PROC_FILTER_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "proc_filter.js"
+)
+
 # Substrings que identificam frameworks de hooking nos packages instalados.
 HOOK_PACKAGE_KEYWORDS = (
     "xposed",
@@ -135,9 +147,15 @@ STATIC_SIGNATURES: List[Tuple[str, List[Tuple[bytes, str]]]] = [
 STATIC_PRIORITY = ["xposed", "lsposed", "edxposed", "substrate", "inline_hook", "frida"]
 
 # Métodos de observação considerados sinais FRACOS: leitura de
-# /proc/.../maps e /proc/.../status também tem uso legítimo (profiling,
-# crash handlers), então sozinhos não comprovam proteção anti-hook.
-WEAK_DETECTION_METHODS = ("maps_scan", "status_scan")
+# /proc/.../maps, /proc/.../status, /proc/net/tcp (port-scan) e
+# .../comm (nomes de threads) também tem uso legítimo (profiling,
+# crash handlers, rede), então sozinhos não comprovam proteção anti-hook.
+WEAK_DETECTION_METHODS = (
+    "maps_scan",
+    "status_scan",
+    "net_scan",
+    "comm_scan",
+)
 
 # Trechos de log do anti_hooking_bypass.js que comprovam que uma checagem
 # anti-hook foi neutralizada em runtime (diferente de mero "hook instalado").
@@ -170,14 +188,17 @@ function matchesHookFramework(str) {
     return false;
 }
 
-// /proc/<pid>/maps e /proc/<pid>/status: varredura de libs injetadas e
-// leitura de TracerPid. Retorna o nome do método fraco ou null.
+// /proc/<pid>/maps, /proc/<pid>/status, /proc/net/tcp (port-scan das
+// portas Frida) e .../comm (nomes de threads). Retorna o nome do método
+// fraco ou null.
 function procProbe(path) {
     try {
         var p = '' + path;
         if (p.indexOf('/proc/') !== 0) { return null; }
         if (p.indexOf('maps') !== -1) { return 'maps_scan'; }
         if (p.indexOf('status') !== -1) { return 'status_scan'; }
+        if (p.indexOf('/net/tcp') !== -1) { return 'net_scan'; }
+        if (p.indexOf('/comm') !== -1) { return 'comm_scan'; }
     } catch (e) { /* best-effort */ }
     return null;
 }
@@ -733,6 +754,7 @@ class AntiHookingCheck:
         on_script_loaded: Optional[object] = None,
         window: int = 12,
         pid: Optional[int] = None,
+        package_name: Optional[str] = None,
     ) -> dict:
         """Observa se o app alvo executa checagens anti-hook em runtime.
 
@@ -756,15 +778,19 @@ class AntiHookingCheck:
                 — usado para ``resume`` de spawn suspenso.
             window: Janela de observação em segundos.
             pid: PID do processo alvo (para monitorar se o app morre).
+            package_name: Package name (melhora o filtro da causa da
+                morte via logcat quando o processo encerra).
 
         Returns:
             Dict com ``detected`` (bool), ``detection_methods_found``,
-            ``strong_signals``, ``weak_signals`` e ``app_alive_at_end``.
+            ``strong_signals``, ``weak_signals``, ``app_alive_at_end`` e
+            ``death_cause`` (dict|None — evidências externas da morte).
         """
         found: List[str] = []
         strong: List[str] = []
         weak: List[str] = []
         script = None
+        kill_script = None
         resumed = False
         died_after: Optional[int] = None
 
@@ -788,6 +814,10 @@ class AntiHookingCheck:
                         payload.get("message"),
                     )
                     return
+                if payload.get("type") == "app-kill":
+                    # Quem matou o processo (kill_trace.js) — sinal forte.
+                    add_signal("app_kill", payload.get("message", ""))
+                    return
                 if payload.get("type") != "hook-detection":
                     return
                 add_signal(payload.get("method", "?"), payload.get("detail", ""))
@@ -799,6 +829,13 @@ class AntiHookingCheck:
                 session, HOOK_DETECTION_SCRIPT, on_message=on_message,
                 name="raspilot-hook-detect",
             )
+            try:
+                kill_script = load_script_file(
+                    session, KILL_TRACE_SCRIPT, on_message=on_message,
+                    name="raspilot-kill-trace",
+                )
+            except Exception:
+                logger.warning("kill_trace.js indisponível", exc_info=True)
             if on_script_loaded is not None:
                 on_script_loaded()
                 resumed = True
@@ -818,10 +855,12 @@ class AntiHookingCheck:
                 "strong_signals": [],
                 "weak_signals": [],
                 "app_alive_at_end": True,
+                "death_cause": None,
                 "error": str(exc),
             }
         finally:
             safe_unload(script)
+            safe_unload(kill_script)
             if not resumed and on_script_loaded is not None:
                 # Garante que um spawn suspenso nunca fique travado.
                 try:
@@ -829,12 +868,20 @@ class AntiHookingCheck:
                 except Exception:
                     logger.debug("Falha no resume de emergência", exc_info=True)
 
+        death_cause: Optional[dict] = None
         app_alive = died_after is None
         if not app_alive:
             add_signal(
                 "app_terminated",
                 f"processo encerrou ~{died_after}s após resume (reação do RASP)",
             )
+            try:
+                death_cause = self.dm.capture_death_cause(
+                    pid=pid, package=package_name
+                )
+                add_signal("app_kill_external", death_cause.get("summary", "?"))
+            except Exception:
+                logger.debug("Falha ao capturar causa da morte", exc_info=True)
 
         detected = bool(strong)
         result = {
@@ -843,6 +890,7 @@ class AntiHookingCheck:
             "strong_signals": strong,
             "weak_signals": weak,
             "app_alive_at_end": app_alive,
+            "death_cause": death_cause,
             "details": (
                 f"App executou checagens anti-hook: {'; '.join(strong)}"
                 if strong
@@ -886,11 +934,18 @@ class AntiHookingCheck:
         bypass_logs: List[str] = []
         session = None
         script = None
+        proc_script = None
+        kill_script = None
         died_after: Optional[int] = None
 
         def on_message(message, data):  # noqa: ANN001 - assinatura frida
             if message.get("type") == "send":
                 payload = message.get("payload", {})
+                if payload.get("type") == "app-kill":
+                    msg = "app-kill: " + payload.get("message", "")
+                    if msg and msg not in bypass_logs:
+                        bypass_logs.append(msg)
+                    return
                 if payload.get("type") != "raspilot-hooking-bypass":
                     return
                 msg = payload.get("message", "")
@@ -907,6 +962,12 @@ class AntiHookingCheck:
             session = self.dm.spawn_app(package_name, resume=False)
             script = load_script_file(
                 session, HOOK_BYPASS_SCRIPT, on_message=on_message
+            )
+            proc_script = load_script_file(
+                session, PROC_FILTER_SCRIPT, on_message=on_message
+            )
+            kill_script = load_script_file(
+                session, KILL_TRACE_SCRIPT, on_message=on_message
             )
             self.dm.resume_app()
             pid = self.dm.last_spawn_pid or self.dm.get_app_pid(package_name)
@@ -926,10 +987,13 @@ class AntiHookingCheck:
                 "bypass_logs": bypass_logs,
                 "effective_logs": [],
                 "app_alive_at_end": True,
+                "death_cause": None,
                 "error": str(exc),
             }
         finally:
             safe_unload(script)
+            safe_unload(proc_script)
+            safe_unload(kill_script)
             if session is not None:
                 try:
                     session.detach()
@@ -940,6 +1004,18 @@ class AntiHookingCheck:
             bypass_logs.append(
                 f"app_terminated: processo encerrou ~{died_after}s após resume"
             )
+            try:
+                death_cause = self.dm.capture_death_cause(
+                    pid=pid, package=package_name
+                )
+                bypass_logs.append(
+                    "death_cause: " + str(death_cause.get("summary", "?"))
+                )
+            except Exception:
+                logger.debug("Falha ao capturar causa da morte", exc_info=True)
+                death_cause = None
+        else:
+            death_cause = None
 
         # Evidência real: logs que comprovam checagem neutralizada.
         effective = [
@@ -954,6 +1030,7 @@ class AntiHookingCheck:
             "bypass_logs": bypass_logs,
             "effective_logs": effective,
             "app_alive_at_end": alive,
+            "death_cause": death_cause,
             "error": None,
         }
         logger.info(
@@ -1026,6 +1103,7 @@ class AntiHookingCheck:
                     on_script_loaded=self.dm.resume_app,
                     window=window,
                     pid=pid,
+                    package_name=package_name,
                 )
             finally:
                 # App está vivo (ou morreu) — enumera libs de hooking do

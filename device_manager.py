@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 try:
     import frida
@@ -34,6 +35,25 @@ DEFAULT_ADB_TIMEOUT = 20
 
 # Timeout para o dispositivo ficar em estado 'device' após `adb connect`.
 CONNECT_TIMEOUT = 15
+
+# Stealth do frida-server: porta não-padrão + nome de binário opaco.
+# Apps com anti-frida varrem /proc/net/tcp pelas portas 27042/27043
+# (:69A2/:69A3) e o `ps`/paths pelo nome 'frida-server' — evitar esses
+# dois artefatos óbvios remove o gatilho mais barato de auto-destruição
+# (o port-scan via /proc/net/tcp foi confirmado no dex de um alvo real).
+# A porta pode ser sobrescrita com RASPILOT_FRIDA_PORT.
+FRIDA_PORT = int(os.environ.get("RASPILOT_FRIDA_PORT", "27999"))
+FRIDA_REMOTE_PATH = "/data/local/tmp/.lloader"
+
+# Rename das strings do memfd do agente no binário do servidor (mesmo
+# tamanho ⇒ patch binário seguro). O agente injetado aparece em
+# /proc/self/maps como ``/memfd:frida-agent-64.so (deleted)`` — o
+# vetor de detecção anti-frida mais comum (leitura direta do maps,
+# inclusive via syscall raw, fora do alcance de hooks de libc).
+MEMFD_RENAMES: Tuple[bytes, bytes] = (
+    (b"frida-agent-64.so", b"libloader64_v8.so"),
+    (b"frida-agent-32.so", b"libloader32_v7.so"),
+)
 
 
 class DeviceConnectionError(Exception):
@@ -475,7 +495,12 @@ class DeviceManager:
             None.
         """
         logger.debug("Encerrando frida-server existente (se houver)...")
-        base_cmds = ("pkill -f frida-server", "killall frida-server")
+        base_cmds = (
+            "pkill -f frida-server",
+            "killall frida-server",
+            f"pkill -f {FRIDA_REMOTE_PATH}",
+            "pkill -f .lloader",  # binário stealth do RASPilot
+        )
         for cmd in base_cmds:
             for wrapped in (cmd, self._su_cmd(cmd)):
                 try:
@@ -561,46 +586,84 @@ class DeviceManager:
         logger.info("Binário frida-server preparado: %s", cached)
         return cached
 
-    def setup_frida_server(self) -> bool:
-        """Sobe o frida-server no dispositivo (pipeline completo).
+    @staticmethod
+    def _patch_frida_binary(src: str, dst: str) -> int:
+        """Copia o binário do frida-server renomeando strings do memfd.
 
-        Passos: detecta ABI, garante binário compatível, faz push para
-        ``/data/local/tmp/``, aplica ``chmod +x``, mata instâncias antigas,
-        inicia em background com ``nohup`` e valida via ``frida-ps -U``.
+        Aplica :data:`MEMFD_RENAMES` (trocas de mesmo tamanho, seguras
+        binariamente) para que o agente injetado apareça em
+        ``/proc/self/maps`` com nome opaco em vez de ``frida-agent``.
+
+        Args:
+            src: Binário original (cache local).
+            dst: Caminho de saída do binário patcheado.
 
         Returns:
-            True se o frida-server está respondendo (``frida-ps -U`` ok).
+            Número de strings substituídas.
+        """
+        with open(src, "rb") as fh:
+            data = fh.read()
+        replacements = 0
+        for old, new in MEMFD_RENAMES:
+            count = data.count(old)
+            if count:
+                data = data.replace(old, new)
+                replacements += count
+        with open(dst, "wb") as fh:
+            fh.write(data)
+        os.chmod(dst, 0o755)
+        logger.debug(
+            "Binário patcheado: %d string(s) de memfd renomeada(s)", replacements
+        )
+        return replacements
+
+    def setup_frida_server(self) -> bool:
+        """Sobe o frida-server no dispositivo (pipeline completo, stealth).
+
+        Passos: detecta ABI, garante binário compatível, faz push para
+        ``/data/local/tmp/.lloader`` (nome opaco), aplica ``chmod +x``,
+        mata instâncias antigas, inicia em background escutando em
+        ``127.0.0.1:<FRIDA_PORT>`` (porta não-padrão), encaminha a porta
+        via ``adb forward`` e valida via ``frida-ps -H``.
+
+        Returns:
+            True se o frida-server está respondendo.
 
         Raises:
             FridaSetupError: em qualquer etapa do pipeline.
         """
-        logger.info("Configurando frida-server no dispositivo...")
+        logger.info("Configurando frida-server stealth (porta %s)...", FRIDA_PORT)
         abi = self._detect_abi()
         logger.debug("ABI: %s", abi)
 
         with tempfile.TemporaryDirectory(prefix="raspilot_frida_") as tmp:
             local_bin = self._ensure_frida_binary(tmp)
-            remote_path = "/data/local/tmp/frida-server"
+            # Patch de stealth: renomeia o memfd do agente no binário.
+            patched_bin = os.path.join(tmp, "server.bin")
+            self._patch_frida_binary(local_bin, patched_bin)
+            remote_path = FRIDA_REMOTE_PATH
 
             try:
-                self._run_adb(["push", local_bin, remote_path], timeout=120)
+                self._run_adb(["push", patched_bin, remote_path], timeout=120)
                 self._run_adb(["shell", "chmod", "755", remote_path])
             except DeviceConnectionError as exc:
                 raise FridaSetupError(f"Falha ao fazer push do frida-server: {exc}") from exc
 
         # Sobe com root quando disponível (necessário para attach/spawn de
-        # apps não-debuggable de outros usuários).
+        # apps não-debuggable de outros usuários). Escuta em loopback na
+        # porta não-padrão — acessível via adb forward.
+        listen = f"-l 127.0.0.1:{FRIDA_PORT}"
         self.kill_frida_server()
         try:
             if self.verify_root_access():
-                # Shell ADB já é root — direto.
-                self.run_shell(f"{remote_path} -D", timeout=15)
+                # Shell ADB já é root — direto (daemoniza).
+                self.run_shell(f"{remote_path} -D {listen}", timeout=15)
             elif self.has_su_access():
                 # Root via su (APatch/Magisk): eleva para rodar o servidor.
                 # nohup + & dentro do su: o shell do dispositivo retorna na
                 # hora e o daemon não herda os pipes do adb (evita timeout).
                 su_wrapped = self._su_cmd(
-                    f"nohup {remote_path} >/dev/null 2>&1 &"
+                    f"nohup {remote_path} {listen} >/dev/null 2>&1 &"
                 )
                 self.run_shell(su_wrapped, timeout=15)
             else:
@@ -609,34 +672,47 @@ class DeviceManager:
                     "Root indisponível — frida-server rodará como shell; "
                     "spawn de apps não-debuggable pode falhar."
                 )
-                self.run_shell(f"nohup {remote_path} >/dev/null 2>&1 &", timeout=15)
+                self.run_shell(
+                    f"nohup {remote_path} {listen} >/dev/null 2>&1 &", timeout=15
+                )
         except DeviceConnectionError as exc:
             raise FridaSetupError(f"Falha ao iniciar frida-server: {exc}") from exc
+
+        # Tunel do host para a porta do servidor (stealth: só loopback).
+        try:
+            self._run_adb(
+                ["forward", f"tcp:{FRIDA_PORT}", f"tcp:{FRIDA_PORT}"], timeout=15
+            )
+        except DeviceConnectionError as exc:
+            raise FridaSetupError(f"Falha no adb forward: {exc}") from exc
 
         # Aguarda o servidor responder no host.
         if not self._wait_frida_ready(timeout=15):
             raise FridaSetupError(
-                "frida-server não respondeu via `frida-ps -U` em 15s. "
-                "Verifique se a versão do frida local corresponde à do servidor."
+                f"frida-server não respondeu via `frida-ps -H` em 15s "
+                f"(porta {FRIDA_PORT}). Verifique se a versão do frida "
+                "local corresponde à do servidor."
             )
 
         self.frida_ready = True
-        logger.info("frida-server ativo e validado via frida-ps -U")
+        logger.info("frida-server ativo e validado (porta %s)", FRIDA_PORT)
         return True
 
     def _wait_frida_ready(self, timeout: int = 15) -> bool:
-        """Aguarda o frida-server ficar acessível pelo host.
+        """Aguarda o frida-server ficar acessível pelo host (via forward).
 
         Args:
             timeout: Tempo máximo em segundos.
 
         Returns:
-            True se ``frida-ps -U`` retornar com sucesso dentro do timeout.
+            True se ``frida-ps -H`` retornar com sucesso dentro do timeout.
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                self._run(["frida-ps", "-U"], timeout=10)
+                self._run(
+                    ["frida-ps", "-H", f"127.0.0.1:{FRIDA_PORT}"], timeout=10
+                )
                 return True
             except DeviceConnectionError:
                 logger.debug("frida-ps ainda não responde, tentando novamente...")
@@ -646,7 +722,8 @@ class DeviceManager:
     def remove_frida_server(self) -> None:
         """Remove o binário temporário do dispositivo (cleanup final).
 
-        Executa ``rm -f /data/local/tmp/frida-server`` e encerra o processo.
+        Executa ``rm`` do binário stealth e dos nomes legados, encerra o
+        processo e remove o ``adb forward``.
 
         Returns:
             None.
@@ -654,12 +731,21 @@ class DeviceManager:
         logger.debug("Limpando frida-server do dispositivo...")
         try:
             self.kill_frida_server()
-            rm_cmd = "rm -rf /data/local/tmp/frida-server /data/local/tmp/re.frida.server /data/local/tmp/fs"
+            rm_cmd = (
+                f"rm -rf {FRIDA_REMOTE_PATH} /data/local/tmp/frida-server "
+                "/data/local/tmp/re.frida.server /data/local/tmp/fs"
+            )
             self.run_shell(rm_cmd, timeout=10)
             if self._su_ok:
                 self.run_shell(self._su_cmd(rm_cmd), timeout=10)
         except DeviceConnectionError:
             logger.warning("Falha ao limpar arquivos temporários", exc_info=True)
+        try:
+            self._run_adb(
+                ["forward", "--remove", f"tcp:{FRIDA_PORT}"], timeout=10
+            )
+        except Exception:
+            logger.debug("adb forward já removido ou inexistente", exc_info=True)
         self.frida_ready = False
 
     # ------------------------------------------------------------------
@@ -683,13 +769,22 @@ class DeviceManager:
     def _frida_device(self):
         """Retorna o objeto ``frida.core.Device`` alvo.
 
+        Prioriza o servidor stealth do RASPilot (``add_remote_device``
+        via ``adb forward`` na :data:`FRIDA_PORT`); como fallback, o
+        dispositivo USB/remoto enumerado (ex: servidor iniciado à mão).
+
         Returns:
-            Dispositivo Frida correspondente a ``self.device_id``.
+            Dispositivo Frida correspondente.
 
         Raises:
-            FridaSetupError: se o dispositivo não for encontrado.
+            FridaSetupError: se nenhum dispositivo for encontrado.
         """
         f = self._require_frida()
+        manager = f.get_device_manager()
+        try:
+            return manager.add_remote_device(f"127.0.0.1:{FRIDA_PORT}")
+        except Exception as exc:
+            logger.debug("add_remote_device falhou (%s); tentando enumeração", exc)
         serial = self.device_id
         if serial:
             try:
@@ -697,7 +792,6 @@ class DeviceManager:
             except Exception as exc:
                 raise FridaSetupError(f"Dispositivo Frida {serial} não encontrado: {exc}") from exc
         # Sem serial explícito: primeiro dispositivo USB/remoto disponível.
-        manager = f.get_device_manager()
         devices = [
             d for d in manager.enumerate_devices() if d.type in ("usb", "remote", "local")
         ]
@@ -833,6 +927,100 @@ class DeviceManager:
         """
         res = self.run_shell(f"[ -d /proc/{pid} ] && echo alive", timeout=5)
         return "alive" in (res.get("stdout") or "")
+
+    def capture_death_cause(
+        self, pid: Optional[int] = None, package: Optional[str] = None
+    ) -> dict:
+        """Captura evidências externas de como um processo morreu.
+
+        Lê os buffers de logcat (crash, events e main) em busca de sinais
+        fatais (SIGSEGV/SIGABRT), kills do ActivityManager e menções ao
+        processo — para distinguir crash nativo, kill externo (SIGKILL) e
+        saída limpa quando um RASP se auto-destrói.
+
+        Args:
+            pid: PID do processo que morreu (melhora o filtro).
+            package: Package name do alvo (melhora o filtro).
+
+        Returns:
+            Dict com ``evidence`` (linhas), ``signal`` (ex: ``'SIGSEGV'``,
+            ou ``None``) e ``summary`` (str legível).
+        """
+        needles: List[str] = []
+        if pid is not None:
+            needles.append(str(pid))
+        if package:
+            needles.append(package)
+
+        crash_pid_re = (
+            re.compile(rf"\bpid:? {re.escape(str(pid))}\b")
+            if pid is not None
+            else None
+        )
+
+        evidence: List[str] = []
+        # crash: com pid conhecido, exige o pid como palavra na linha
+        # (evita atribuir crash antigo cujo endereço/pid contenha o nº
+        # por acaso); sem pid, aceita linhas fatais genéricas.
+        # events/main: só linhas que citam o alvo (evita ruído).
+        for cmd, tag, generic_ok in (
+            ("logcat -d -b crash -t 300 2>/dev/null", "crash", pid is None),
+            ("logcat -d -b events -t 500 2>/dev/null", "events", False),
+            ("logcat -d -t 400 2>/dev/null", "main", False),
+        ):
+            res = self.run_shell(cmd, timeout=15)
+            if not res["ok"]:
+                continue
+            for line in res["stdout"].splitlines():
+                if tag == "crash" and crash_pid_re is not None:
+                    matched = bool(crash_pid_re.search(line))
+                else:
+                    matched = any(n in line for n in needles)
+                if matched:
+                    evidence.append(f"{tag}: {line.strip()}")
+                    continue
+                if not generic_ok:
+                    continue
+                low = line.lower()
+                if any(
+                    k in low
+                    for k in (
+                        "fatal signal", "sigsegv", "sigabrt", "sigbus",
+                        "native crash", "tombstone",
+                    )
+                ):
+                    evidence.append(f"{tag}: {line.strip()}")
+
+        signal: Optional[str] = None
+        signal_nr: Optional[int] = None
+        for line in evidence:
+            m = re.search(r"Fatal signal \d+ \((SIG[A-Z]+)\)", line)
+            if m:
+                signal = m.group(1)
+                break
+            m = re.search(r"exited due to signal (\d+)", line)
+            if m and signal is None:
+                # Morte por sinal fora do processo (ex: 9 = SIGKILL).
+                signal_nr = int(m.group(1))
+        if signal is None and signal_nr is not None:
+            signal = {9: "SIGKILL", 6: "SIGABRT", 11: "SIGSEGV"}.get(
+                signal_nr, f"signal {signal_nr}"
+            )
+
+        if signal == "SIGKILL":
+            summary = "SIGKILL (morte por sinal — não interceptável in-process)"
+        elif signal:
+            summary = f"sinal fatal {signal}"
+        elif evidence:
+            summary = "morte registrada em logcat"
+        else:
+            summary = "sem registro externo (SIGKILL externo ou exit_group direto)"
+
+        logger.debug(
+            "capture_death_cause: pid=%s signal=%s linhas=%d",
+            pid, signal, len(evidence),
+        )
+        return {"evidence": evidence[-40:], "signal": signal, "summary": summary}
 
     def list_running_processes(self) -> List[str]:
         """Lista processos visíveis no dispositivo (equivalente a ``frida-ps -U``).
