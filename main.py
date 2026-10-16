@@ -3,8 +3,8 @@
 
 CLI principal do RASPilot. Orquestra a conexão com o dispositivo, o
 ciclo de vida do Frida server e a execução do pipeline de verificações
-RASP (Anti-Root, Anti-Frida, Anti-Emulador e SSL Pinning), gerando
-relatórios JSON e HTML estruturados.
+RASP (Anti-Root, Anti-Frida, Anti-Emulador, Anti-Hooking e SSL
+Pinning), gerando relatórios JSON e HTML estruturados.
 
 Uso básico::
 
@@ -25,6 +25,7 @@ from rich.table import Table
 
 from checks.anti_emulator import AntiEmulatorCheck
 from checks.anti_frida import AntiFridaCheck
+from checks.anti_hooking import AntiHookingCheck
 from checks.anti_root import AntiRootCheck
 from checks.ssl_pinning import SSLPinningCheck
 from device_manager import (
@@ -42,7 +43,7 @@ console = Console()
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] %(message)s"
 
 # Checks conhecidos — usado para validar --skip e nomear o relatório.
-KNOWN_CHECKS = ("anti_root", "anti_frida", "anti_emulator", "ssl_pinning")
+KNOWN_CHECKS = ("anti_root", "anti_frida", "anti_emulator", "anti_hooking", "ssl_pinning")
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -73,8 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="raspilot",
         description=(
             "RASPilot — Piloto Automático de Auditoria RASP para Android. "
-            "Verifica Anti-Root, Anti-Frida, Anti-Emulador e SSL Pinning "
-            "em apps Android e gera relatórios JSON/HTML."
+            "Verifica Anti-Root, Anti-Frida, Anti-Emulador, Anti-Hooking e "
+            "SSL Pinning em apps Android e gera relatórios JSON/HTML."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -240,7 +241,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
     Fluxo: conexão ADB → info do dispositivo → frida-server →
     anti_root → anti_emulator → spawn do app → anti_frida →
-    ssl_pinning → relatórios → tabela final → cleanup.
+    anti_hooking → ssl_pinning → relatórios → tabela final → cleanup.
 
     Args:
         args: Argumentos já parseados.
@@ -320,7 +321,16 @@ def run_pipeline(args: argparse.Namespace) -> int:
             reporter.collect("anti_frida", {"error": "app não pôde ser spawnado"})
             console.print("[yellow]![/] anti_frida: [red]ERROR[/] (app não spawnado)")
 
-        # 8) SSL Pinning (spawn próprio interno no attempt_bypass).
+        # 8) Anti-Hooking (spawn próprio interno: observação + bypass,
+        #    como o ssl_pinning — não compartilha a sessão do anti_frida).
+        _run_step(
+            reporter,
+            "anti_hooking",
+            lambda: AntiHookingCheck(dm).run_all(args.package, window=args.window),
+            skipped="anti_hooking" in args.skip,
+        )
+
+        # 9) SSL Pinning (spawn próprio interno no attempt_bypass).
         _run_step(
             reporter,
             "ssl_pinning",
@@ -328,7 +338,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             skipped="ssl_pinning" in args.skip,
         )
     finally:
-        # 9) Cleanup — nunca deixar resíduos no dispositivo.
+        # 10) Cleanup — nunca deixar resíduos no dispositivo.
         try:
             dm.resume_app()  # idempotente: destrava spawn suspenso, se houver
             if session is not None:
@@ -341,7 +351,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         except Exception:
             logger.warning("Falha no cleanup final do dispositivo", exc_info=True)
 
-    # 10) Relatórios.
+    # 11) Relatórios.
     json_path, html_path = reporter.save()
     print_summary_table(reporter)
     console.print(f"\n[green]✓[/] Relatório JSON: [bold]{json_path}[/]")

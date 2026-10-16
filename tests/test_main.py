@@ -49,9 +49,10 @@ class TestParseArgs:
         assert exc.value.code == 2
 
     def test_known_checks_constant(self):
-        """A lista de checks conhecidos cobre os 4 verificações."""
+        """A lista de checks conhecidos cobre as 5 verificações."""
         assert set(mainmod.KNOWN_CHECKS) == {
-            "anti_root", "anti_frida", "anti_emulator", "ssl_pinning",
+            "anti_root", "anti_frida", "anti_emulator",
+            "anti_hooking", "ssl_pinning",
         }
 
 

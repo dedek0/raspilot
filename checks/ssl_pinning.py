@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from rich.console import Console
 
+from checks.apk_utils import pull_apk, scan_apk
 from script_loader import load_script_file, safe_unload
 
 if TYPE_CHECKING:  # evita import circular em tempo de importação
@@ -65,20 +66,21 @@ STATIC_SIGNATURES: List[Tuple[str, List[Tuple[bytes, str]]]] = [
     ]),
 ]
 
-# Trechos de log do ssl_bypass.js que comprovam interceptação real
-# (diferente de mero "hook instalado").
+# Trechos de log do ssl_bypass.js que comprovam interceptação REAL em
+# runtime (diferente de mero "hook instalado"). O script separa os dois
+# formatos: instalação usa "... hookado"/"... indisponível"; evidência
+# usa "bypass (host)"/"interceptado"/"-> ..." — só esta lista conta para
+# o veredito. "bypass (" inclui o parêntese de propósito: o nome do
+# próprio script ("ssl_bypass.js carregado") nunca pode casar.
 EVIDENCE_MARKERS = (
     "bypass (",
     "interceptado",
     "-> proceed()",
     "-> X509_V_OK",
-    "-> NONE/ok",
     "-> SSL_VERIFY_NONE",
     "-> 0 (ok)",
     "-> true",
     "ignorado",
-    "neutralizado",
-    "SSLContext.init interceptado",
 )
 
 
@@ -89,26 +91,6 @@ def _now_iso() -> str:
         Ex: ``'2026-10-14T18:00:00+00:00'``.
     """
     return datetime.now(timezone.utc).isoformat()
-
-
-def _contains(bytes_list: List[bytes], needle: bytes) -> bool:
-    """Procura um needle (ASCII ou UTF-16LE) em uma lista de blobs.
-
-    O AndroidManifest.binário pode armazenar strings em UTF-16LE
-    (API < 30) ou UTF-8 — por isso a dupla busca.
-
-    Args:
-        bytes_list: Blobs de bytes a inspecionar.
-        needle: Padrão ASCII a localizar.
-
-    Returns:
-        True se encontrado em qualquer codificação.
-    """
-    utf16 = needle.decode("ascii", errors="ignore").encode("utf-16le")
-    for blob in bytes_list:
-        if needle in blob or (utf16 and utf16 in blob):
-            return True
-    return False
 
 
 class SSLPinningCheck:
@@ -128,6 +110,9 @@ class SSLPinningCheck:
     def _pull_apk(self, package_name: str, dest_dir: str) -> List[str]:
         """Baixa o(s) APK(s) do app para o host.
 
+        Delega a :func:`checks.apk_utils.pull_apk` (compartilhado com o
+        Anti-Hooking) — mantido como método para permitir mock nos testes.
+
         Args:
             package_name: Package name do app alvo.
             dest_dir: Diretório local de destino.
@@ -135,34 +120,13 @@ class SSLPinningCheck:
         Returns:
             Lista de caminhos locais dos APKs baixados (vazia se falhar).
         """
-        res = self.dm.run_shell(f"pm path {package_name}", timeout=15)
-        if not res["ok"] or not res["stdout"]:
-            logger.warning("pm path falhou para %s: %s", package_name, res["stderr"])
-            return []
-
-        local_paths: List[str] = []
-        for line in res["stdout"].splitlines():
-            line = line.strip()
-            if not line.startswith("package:"):
-                continue
-            remote = line[len("package:"):]
-            local = os.path.join(
-                dest_dir, os.path.basename(remote) or f"{package_name}.apk"
-            )
-            try:
-                # APKs modernos podem ser grandes — timeout generoso.
-                self.dm._run_adb(["pull", remote, local], timeout=300)
-                if os.path.isfile(local):
-                    local_paths.append(local)
-            except Exception:
-                logger.warning("Falha ao baixar %s", remote, exc_info=True)
-        return local_paths
+        return pull_apk(self.dm, package_name, dest_dir)
 
     def _scan_apk(self, apk_path: str) -> Dict[str, List[str]]:
         """Inspeciona o APK por assinaturas de SSL pinning.
 
-        Procura as assinaturas em ``AndroidManifest.xml`` (binário),
-        ``classes*.dex``, ``lib/**/*.so`` e entradas de assets.
+        Delega a :func:`checks.apk_utils.scan_apk` com
+        :data:`STATIC_SIGNATURES`.
 
         Args:
             apk_path: Caminho local do APK.
@@ -173,55 +137,7 @@ class SSLPinningCheck:
         Raises:
             zipfile.BadZipFile: se o arquivo não for um APK válido.
         """
-        found: Dict[str, List[str]] = {}
-        try:
-            zf = zipfile.ZipFile(apk_path)
-        except (zipfile.BadZipFile, OSError) as exc:
-            raise zipfile.BadZipFile(f"{apk_path}: {exc}") from exc
-
-        # Assinaturas ainda não encontradas — o scan para cedo quando
-        # todas casam e processa um blob por vez (sem acumular centenas
-        # de MB do APK em memória).
-        pending = [
-            (sig_type, needle, description)
-            for sig_type, needles in STATIC_SIGNATURES
-            for needle, description in needles
-        ]
-        interesting: List[str] = []
-
-        def _scan_blob(blob: bytes) -> None:
-            nonlocal pending
-            remaining = []
-            for sig_type, needle, description in pending:
-                if _contains([blob], needle):
-                    found.setdefault(sig_type, []).append(description)
-                else:
-                    remaining.append((sig_type, needle, description))
-            pending = remaining
-
-        with zf:
-            for info in zf.infolist():
-                if not pending:
-                    break
-                name = info.filename
-                if (
-                    name == "AndroidManifest.xml"
-                    or name.endswith(".dex")
-                    or name.startswith("lib/") and name.endswith(".so")
-                    or name.startswith("assets/flutter_assets")
-                    or name.startswith("res/xml/")
-                ):
-                    interesting.append(name)
-                    try:
-                        _scan_blob(zf.read(name)[: 8 * 1024 * 1024])
-                    except (OSError, RuntimeError, zipfile.BadZipFile):
-                        logger.debug("Não foi possível ler %s do APK", name)
-
-            # Nomes das entradas também são evidência (ex: lib/libflutter.so).
-            if pending and interesting:
-                _scan_blob("\n".join(interesting).encode("utf-8", errors="ignore"))
-
-        return found
+        return scan_apk(apk_path, STATIC_SIGNATURES)
 
     def detect_pinning(
         self, package_name: str, apk_path: Optional[str] = None

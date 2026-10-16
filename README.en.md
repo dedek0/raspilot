@@ -4,9 +4,9 @@
 
 **RASPilot — Automatic RASP Auditing Pilot for Android.**
 
-Orchestrates Anti-Root, Anti-Frida, Anti-Emulator and SSL Pinning checks
-against Android apps, producing structured reports ready for LLM consumption
-via MCP.
+Orchestrates Anti-Root, Anti-Frida, Anti-Emulator, Anti-Hooking and SSL
+Pinning checks against Android apps, producing structured reports ready for
+LLM consumption via MCP.
 
 RASPilot connects to an Android device (USB or Wi-Fi ADB), automatically
 installs and validates the `frida-server`, runs a RASP verification pipeline
@@ -73,7 +73,7 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--output-dir` | no | Reports directory (default `reports/`) |
 | `--window SECS` | no | Observation window in seconds for dynamic checks (default `15`) |
 | `--verbose` | no | DEBUG-level logging |
-| `--skip CHECK...` | no | Checks to skip (`anti_root`, `anti_frida`, `anti_emulator`, `ssl_pinning`) |
+| `--skip CHECK...` | no | Checks to skip (`anti_root`, `anti_frida`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
 
 ### Output
 
@@ -87,8 +87,8 @@ Status semantics:
 
 | Status | Meaning |
 |---|---|
-| `OK` | Environment/protection OK (e.g. physical device, SSL pinning resisted the bypass, app detected and blocked Frida) |
-| `FALHOU` | Threat present or bypass won (e.g. root/emulator in the environment, pinning circumvented, app failed to detect Frida) |
+| `OK` | Environment/protection OK (e.g. physical device, SSL pinning resisted the bypass, app detected and blocked Frida/hooking) |
+| `FALHOU` | Threat present or bypass won (e.g. root/emulator in the environment, pinning circumvented, app failed to detect Frida or anti-hook checks) |
 | `N/A` | Not applicable (e.g. no SSL pinning — bypass does not apply) |
 | `SKIP` | Check skipped via `--skip` |
 | `ERROR` | Check could not run (pipeline continues) |
@@ -142,7 +142,45 @@ for Genymotion/LDPlayer/BlueStacks/Nox/Waydroid. Classifies
 `emulator_type` (`qemu_avd`, `genymotion`, `ldplayer`, `bluestacks`,
 `nox`, `waydroid`) with confidence.
 
-### 4. SSL Pinning (`checks/ssl_pinning.py`)
+### 4. Anti-Hooking (`checks/anti_hooking.py`)
+
+Checks whether the app detects hooking frameworks (Xposed, LSPosed,
+EdXposed, Substrate and inline hooks: SandHook, YAHFA, LSPlant, Whale,
+Dobby) and whether that protection resists a real bypass. Four independent
+phases consolidated into `protection_detected` + `bypass_successful`:
+
+- **Device vectors**: installed packages (`xposed`, `lsposed`, `riru`,
+  `substrate`...), modules under `/data/adb` (`/data/adb/modules`,
+  `/data/adb/lspd`) and hook libraries mapped into the process (Frida
+  session with `/proc/<pid>/maps` fallback). Frida libraries are excluded —
+  detecting them is the Anti-Frida check's job.
+- **Static detection**: pulls the APK and scans for the signatures RASP
+  SDKs use to probe hooks (Xposed classes, LSPosed/lspd/LSPlant, EdXposed,
+  Substrate, SandHook/YAHFA/Whale/Dobby and Frida strings).
+- **Dynamic observation**: suspended spawn with a script that records
+  (without blocking) `Class.forName`/`ClassLoader.loadClass` of framework
+  classes, `File.exists` and `open`/`fopen`/`access`/`stat` on framework
+  paths and `/proc/*/maps`/`status`, `Runtime.exec`/`ProcessBuilder`,
+  native string searches (`strstr`/`strcmp`/`memcmp`) and stack traces
+  containing framework frames. Reading `maps`/`status` alone is a **weak**
+  signal (it also has legitimate uses); app death during the window is a
+  **strong** signal.
+- **Bypass** (`scripts/anti_hooking_bypass.js`): a fresh spawn with hooks
+  that make `Class.forName` of Xposed classes return `null`, hide
+  framework paths/entries (`File.exists`/`File.list`/`File.listFiles`),
+  block `Runtime.exec`, strip Xposed frames from stack traces, hide
+  strings in `strstr`/`strcmp`/`memcmp`, return `ENOENT` from
+  `open`/`access`/`stat` on framework paths, **filter hook library lines
+  out of `/proc/self/maps`** (read/fgets) and zero `TracerPid`. The bypass
+  only counts as a win with **real evidence** of a neutralized check
+  **and** the app staying alive (death = the RASP reacted through another
+  vector).
+
+`protection_detected=False` ⇒ the app has no observable anti-hook checks
+(RASP failure). `bypass_successful=True` ⇒ the protection exists, but the
+bypass won.
+
+### 5. SSL Pinning (`checks/ssl_pinning.py`)
 
 - **Static detection**: pulls the APK (`pm path` + `adb pull`) and scans
   for OkHttp `CertificatePinner`, TrustKit, NetworkSecurityConfig, Flutter
@@ -167,10 +205,13 @@ raspilot/
 │   ├── anti_root.py            # Multi-vector root detection
 │   ├── anti_frida.py           # Frida presence/detection
 │   ├── anti_emulator.py        # Emulator classification
+│   ├── anti_hooking.py         # Anti-hooking detection + bypass
+│   ├── apk_utils.py            # Shared APK analysis helpers
 │   └── ssl_pinning.py          # SSL pinning detection + bypass
 ├── scripts/
 │   ├── ssl_bypass.js           # Universal SSL pinning bypass (Frida)
 │   ├── anti_frida_bypass.js    # Frida detection bypass (Frida)
+│   ├── anti_hooking_bypass.js  # Hooking detection bypass (Frida)
 │   └── anti_root_bypass.js     # Root detection bypass (Frida)
 ├── templates/report.html.j2    # HTML report template
 ├── reports/                    # Report output
@@ -186,9 +227,9 @@ pytest -v
 
 The suite covers: ADB output parsing (mocked `subprocess.run`), `run_all`
 consolidation of each check with mocked data, JSON report generation against
-a schema snapshot, pinning detection on synthetic APKs and the full
-end-to-end pipeline (with a mocked `DeviceManager`). No physical device is
-required to run the tests.
+a schema snapshot, pinning and anti-hooking detection on synthetic APKs and
+the full end-to-end pipeline (with a mocked `DeviceManager`). No physical
+device is required to run the tests.
 
 ---
 
@@ -204,6 +245,7 @@ be wrapped as MCP tools with `FastMCP`:
 | `raspilot_check_anti_root(device_id) -> dict` | `AntiRootCheck(dm).run_all()` |
 | `raspilot_check_anti_frida(device_id) -> dict` | `AntiFridaCheck(dm).run_all(session, pid)` |
 | `raspilot_check_anti_emulator(device_id) -> dict` | `AntiEmulatorCheck(dm).run_all()` |
+| `raspilot_check_anti_hooking(device_id, package_name) -> dict` | `AntiHookingCheck(dm).run_all(package)` |
 | `raspilot_bypass_ssl_pinning(device_id, package_name) -> dict` | `SSLPinningCheck(dm).run_all(package)` |
 | `raspilot_get_report() -> dict` | `Reporter.generate_json()` |
 

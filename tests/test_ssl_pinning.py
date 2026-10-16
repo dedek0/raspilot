@@ -176,6 +176,37 @@ class TestAttemptBypass:
         ):
             assert marker in source, f"camada ausente: {marker}"
 
+    def test_install_logs_never_match_evidence_markers(self):
+        """Nenhum log de instalação ('hookado') contém marcador de evidência."""
+        from checks.ssl_pinning import EVIDENCE_MARKERS
+
+        with open(SSL_BYPASS_SCRIPT, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        for line in lines:
+            if "log(" in line and "hookado" in line:
+                for marker in EVIDENCE_MARKERS:
+                    assert marker not in line, f"instalação vira evidência: {line}"
+
+    def test_load_message_is_not_evidence(self):
+        """O log de carga do script nunca casa com marcador de evidência.
+
+        Regressão: o marcador 'bypass' (sem parêntese) casava com o nome
+        do próprio arquivo ('ssl_bypass.js carregado') e contaminava o
+        veredito.
+        """
+        from checks.ssl_pinning import EVIDENCE_MARKERS
+
+        assert not any(m in "ssl_bypass.js carregado" for m in EVIDENCE_MARKERS)
+
+    def test_okhttp_retry_sni_and_classloader(self):
+        """O bypass tem retry/classloaders para OkHttp e SNI no caminho nativo."""
+        with open(SSL_BYPASS_SCRIPT, encoding="utf-8") as fh:
+            source = fh.read()
+        assert "enumerateClassLoaders" in source
+        assert "ClassFactory" in source
+        assert "scheduleOkHttpRetries" in source
+        assert "SSL_get_servername" in source
+
     def test_anti_frida_script_exists(self):
         """O anti_frida_bypass.js existe e cobre os hooks essenciais."""
         path = SSL_BYPASS_SCRIPT.replace("ssl_bypass.js", "anti_frida_bypass.js")

@@ -213,6 +213,23 @@ class TestAppDetection:
         assert "faccessat" in DETECTION_SCRIPT
         assert "'access'" in DETECTION_SCRIPT
         assert "'stat'" in DETECTION_SCRIPT
+        # Compatibilidade Frida 16/17 (validada em dispositivo real):
+        assert "raspilotFindExport" in DETECTION_SCRIPT
+        assert "raspilotPerformJava" in DETECTION_SCRIPT
+        assert "Module.findExportByName" not in DETECTION_SCRIPT
+
+    def test_hook_install_errors_not_counted(self):
+        """Erros de instalação do próprio script não viram detecção."""
+        check = AntiFridaCheck(mock.MagicMock())
+        session = FakeSession(messages=[{
+            "type": "send",
+            "payload": {"type": "frida-detection-error",
+                        "message": "instalação de strstr falhou"},
+        }])
+        with mock.patch("checks.anti_frida.time.sleep"):
+            res = check.check_frida_detection_in_app(session)
+        assert res["vulnerable"] is True
+        assert res["detection_methods_found"] == []
 
     def test_app_death_during_observation_is_not_vulnerable(self):
         """App que se encerra na janela => reação do RASP, vulnerable=False."""

@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, List, Optional
 
-from script_loader import load_script, safe_unload
+from script_loader import enumerate_module_names, load_script, safe_unload
 
 if TYPE_CHECKING:  # evita import circular em tempo de importação
     from device_manager import DeviceManager
@@ -47,6 +47,12 @@ function reportDetection(method, detail) {
     send({ type: 'frida-detection', method: method, detail: detail });
 }
 
+// Falha de instalação de um hook de observação (diagnóstico — não conta
+// como detecção pelo app).
+function reportHookError(msg) {
+    send({ type: 'frida-detection-error', message: msg });
+}
+
 function looksLikeFrida(str) {
     try {
         if (str === null || str === undefined) { return false; }
@@ -57,7 +63,7 @@ function looksLikeFrida(str) {
 // Native: strstr/strcmp em libc buscando 'frida' (técnica clássica).
 ['strstr', 'strcmp'].forEach(function (name) {
     try {
-        var addr = Module.findExportByName('libc.so', name);
+        var addr = raspilotFindExport('libc.so', name);
         if (addr === null) { return; }
         Interceptor.attach(addr, {
             onEnter: function (args) {
@@ -76,13 +82,13 @@ function looksLikeFrida(str) {
                 } catch (e) { /* best-effort */ }
             }
         });
-    } catch (e) { /* módulo indisponível */ }
+    } catch (e) { reportHookError('instalação de ' + name + ' falhou: ' + e); }
 });
 
 // Native: connect() para portas Frida (27042/27043) — anti-frida por
 // "port scan" local, técnica comum que não usa strings 'frida'.
 try {
-    var connectPtr = Module.findExportByName('libc.so', 'connect');
+    var connectPtr = raspilotFindExport('libc.so', 'connect');
     if (connectPtr !== null) {
         Interceptor.attach(connectPtr, {
             onEnter: function (args) {
@@ -99,12 +105,12 @@ try {
             }
         });
     }
-} catch (e) { /* libc indisponível */ }
+} catch (e) { reportHookError('instalação de connect falhou: ' + e); }
 
 // Native: open/openat de paths contendo 'frida'.
 ['open', 'openat', 'openat64'].forEach(function (name) {
     try {
-        var addr = Module.findExportByName('libc.so', name);
+        var addr = raspilotFindExport('libc.so', name);
         if (addr === null) { return; }
         Interceptor.attach(addr, {
             onEnter: function (args) {
@@ -117,12 +123,12 @@ try {
                 } catch (e) { /* best-effort */ }
             }
         });
-    } catch (e) { /* módulo indisponível */ }
+    } catch (e) { reportHookError('instalação de ' + name + ' falhou: ' + e); }
 });
 
 ['access', 'stat', 'stat64', 'lstat', 'faccessat', 'faccessat2'].forEach(function (name) {
     try {
-        var addr = Module.findExportByName('libc.so', name);
+        var addr = raspilotFindExport('libc.so', name);
         if (addr === null) { return; }
         Interceptor.attach(addr, {
             onEnter: function (args) {
@@ -134,7 +140,7 @@ try {
                 } catch (e) { /* best-effort */ }
             }
         });
-    } catch (e) { /* módulo indisponível */ }
+    } catch (e) { reportHookError('instalação de ' + name + ' falhou: ' + e); }
 });
 
 function installJavaHooks() {
@@ -181,33 +187,15 @@ function installJavaHooks() {
     } catch (e) { /* Java indisponível */ }
 }
 
-if (typeof Java !== 'undefined' && Java.available) {
+if (typeof raspilotPerformJava === 'function') {
+    raspilotPerformJava(installJavaHooks);
+} else if (typeof Java !== 'undefined' && Java.available) {
     Java.perform(installJavaHooks);
 }
 
 // Relata o snapshot final para o host quando solicitado.
 rpc.exports = {
     getdetections: function () { return detections; }
-};
-"""
-
-
-# Script mínimo de enumeração de módulos. A API host do Frida 17+ NÃO
-# expõe `Session.enumerate_modules` — módulos só são visíveis de dentro
-# do processo, via `Process.enumerateModules()`. Expomos a lista por RPC.
-MODULE_ENUM_SCRIPT = """
-'use strict';
-
-rpc.exports = {
-    listmodules: function () {
-        var names = [];
-        try {
-            Process.enumerateModules().forEach(function (m) {
-                if (m && m.name) { names.push(m.name); }
-            });
-        } catch (e) { /* best-effort */ }
-        return names;
-    }
 };
 """
 
@@ -322,9 +310,10 @@ class AntiFridaCheck:
     def _enumerate_module_names(sess: object) -> List[str]:
         """Lista os nomes dos módulos carregados no processo da sessão.
 
-        Usa ``session.enumerate_modules()`` quando existir (compat com
-        sessões fake/legadas) e, no Frida 17+ (onde esse método não
-        existe), injeta :data:`MODULE_ENUM_SCRIPT` e lê a lista via RPC.
+        Delega a :func:`script_loader.enumerate_module_names` (compartilhado
+        com o Anti-Hooking): ``session.enumerate_modules()`` quando existir
+        e, no Frida 17+ (onde esse método não existe), injeta o script de
+        enumeração e lê a lista via RPC.
 
         Args:
             sess: Sessão Frida ativa.
@@ -335,17 +324,7 @@ class AntiFridaCheck:
         Raises:
             Exception: erros do Frida propagam ao chamador.
         """
-        legacy = getattr(sess, "enumerate_modules", None)
-        if callable(legacy):
-            return [mod.name for mod in legacy()]
-
-        script = sess.create_script(MODULE_ENUM_SCRIPT)
-        script.load()
-        try:
-            names = script.exports.listmodules()
-        finally:
-            safe_unload(script)
-        return list(names or [])
+        return enumerate_module_names(sess)
 
     def check_frida_libraries(
         self, pid: int, session: Optional[object] = None
@@ -488,6 +467,14 @@ class AntiFridaCheck:
             def on_message(message, data):  # noqa: ANN001 - assinatura frida
                 if message.get("type") == "send":
                     payload = message.get("payload", {})
+                    if payload.get("type") == "frida-detection-error":
+                        # Diagnóstico do próprio script (hook não instalou) —
+                        # não é uma detecção pelo app.
+                        logger.warning(
+                            "Hook de observação frida não instalou: %s",
+                            payload.get("message"),
+                        )
+                        return
                     method = payload.get("method", "?")
                     detail = payload.get("detail", "")
                     entry = f"{method}: {detail}"

@@ -52,6 +52,16 @@ RESULTS = {
         "bypass_details": {"success": True, "intercepted_hosts": ["api.x.com"]},
         "timestamp": "2026-10-14T12:00:03+00:00",
     },
+    "anti_hooking": {
+        "protection_detected": True,
+        "bypass_successful": True,
+        "hook_frameworks_present": True,
+        "checks": {"hook_framework_packages": {"detected": False}},
+        "static_detection": {"static_detected": True, "primary": "xposed"},
+        "app_detection": {"detected": True, "strong_signals": ["Class.forName: XposedBridge"]},
+        "bypass_details": {"success": True, "effective_logs": ["neutralizado: Class.forName -> null"]},
+        "timestamp": "2026-10-14T12:00:04+00:00",
+    },
 }
 
 
@@ -92,6 +102,10 @@ class TestGenerateJson:
                 "ssl_pinning": {
                     "status": "FALHOU", "pinning_detected": True,
                     "pinning_type": "okhttp", "bypass_successful": True,
+                },
+                "anti_hooking": {
+                    "status": "FALHOU", "protection_detected": True,
+                    "bypass_successful": True, "hook_frameworks_present": True,
                 },
             },
             "details": RESULTS,
@@ -141,6 +155,41 @@ class TestGenerateJson:
             "bypass_successful": None,
         })
         assert rep.generate_json()["summary"]["ssl_pinning"]["status"] == "N/A"
+
+    def test_status_anti_hooking(self):
+        """Regras do anti_hooking: sem proteção/bypassou => FALHOU; resistiu => OK."""
+        rep = Reporter(device_info=DEVICE, package_name="pkg")
+        rep.collect("anti_hooking", {
+            "protection_detected": False, "bypass_successful": None,
+        })
+        assert rep.generate_json()["summary"]["anti_hooking"]["status"] == "FALHOU"
+
+        rep2 = Reporter(device_info=DEVICE, package_name="pkg")
+        rep2.collect("anti_hooking", {
+            "protection_detected": True, "bypass_successful": False,
+        })
+        assert rep2.generate_json()["summary"]["anti_hooking"]["status"] == "OK"
+
+        rep3 = Reporter(device_info=DEVICE, package_name="pkg")
+        rep3.collect("anti_hooking", {
+            "protection_detected": True, "bypass_successful": True,
+        })
+        assert rep3.generate_json()["summary"]["anti_hooking"]["status"] == "FALHOU"
+
+        rep4 = Reporter(device_info=DEVICE, package_name="pkg")
+        rep4.collect("anti_hooking", {
+            "protection_detected": True, "bypass_successful": None,
+        })
+        assert rep4.generate_json()["summary"]["anti_hooking"]["status"] == "N/A"
+
+    def test_status_anti_hooking_error(self):
+        """Anti-hooking com error no topo => ERROR (bypass/observação falhou)."""
+        rep = Reporter(device_info=DEVICE, package_name="pkg")
+        rep.collect("anti_hooking", {
+            "protection_detected": True, "bypass_successful": None,
+            "error": "bypass: spawn falhou",
+        })
+        assert rep.generate_json()["summary"]["anti_hooking"]["status"] == "ERROR"
 
 
 class TestGenerateHtml:

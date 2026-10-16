@@ -163,16 +163,15 @@ function hookSystemProperties() {
 
 function main() {
     report('anti_root_bypass.js carregado');
-    if (typeof Java === 'undefined' || !Java.available) {
-        report('Java indisponível — nada a hookar');
-        return;
-    }
-    Java.perform(function () {
+    var ok = raspilotPerformJava(function () {
         hookRootBeer();
         hookFileApis();
         hookExec();
         hookSystemProperties();
     });
+    if (!ok) {
+        report('Java indisponível — nada a hookar');
+    }
 }
 
 setImmediate(main);

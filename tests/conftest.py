@@ -13,6 +13,7 @@ import pytest
 
 from checks.anti_emulator import AntiEmulatorCheck
 from checks.anti_frida import AntiFridaCheck
+from checks.anti_hooking import AntiHookingCheck
 from checks.anti_root import AntiRootCheck
 from checks.ssl_pinning import SSLPinningCheck
 
@@ -156,6 +157,12 @@ def anti_frida(clean_dm):
 def anti_emulator(clean_dm):
     """AntiEmulatorCheck sobre dispositivo limpo."""
     return AntiEmulatorCheck(clean_dm)
+
+
+@pytest.fixture
+def anti_hooking(clean_dm):
+    """AntiHookingCheck sobre dispositivo limpo."""
+    return AntiHookingCheck(clean_dm)
 
 
 @pytest.fixture

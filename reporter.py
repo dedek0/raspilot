@@ -64,7 +64,7 @@ class Reporter:
 
         Args:
             check_name: Nome do check ('anti_root', 'anti_frida',
-                'anti_emulator', 'ssl_pinning').
+                'anti_emulator', 'anti_hooking', 'ssl_pinning').
             result: Dict retornado pelo ``run_all()`` do check.
         """
         self._results[check_name] = result or {}
@@ -124,6 +124,25 @@ class Reporter:
                     "confidence": result.get("confidence"),
                 },
             )
+
+        if check_name == "anti_hooking":
+            # Sem proteção anti-hook o RASP falha (mesma lógica do
+            # anti_frida: app que não detecta a ameaça = FALHOU).
+            protected = bool(result.get("protection_detected"))
+            bypass = result.get("bypass_successful")
+            if not protected:
+                status = "FALHOU"
+            elif bypass is True:
+                status = "FALHOU"  # proteção existe, mas o bypass venceu
+            elif bypass is False:
+                status = "OK"  # proteção resistiu ao bypass
+            else:
+                status = "N/A"  # bypass não avaliado (caso residual)
+            return status, {
+                "protection_detected": protected,
+                "bypass_successful": bypass,
+                "hook_frameworks_present": bool(result.get("hook_frameworks_present")),
+            }
 
         if check_name == "ssl_pinning":
             bypass = result.get("bypass_successful")

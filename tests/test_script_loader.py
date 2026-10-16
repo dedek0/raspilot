@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import glob
+import os
 from unittest import mock
 
 import script_loader
@@ -27,11 +29,22 @@ class TestJavaBridge:
         assert prepared.endswith(source)
         assert "var Java = bridge;" in prepared
 
-    def test_prepare_without_bridge_returns_raw(self):
-        """Sem a bridge (instalação antiga), o script fica cru."""
+    def test_prepare_script_includes_compat_helpers(self):
+        """O prelúdio sempre inclui os helpers de compat Frida 16/17."""
+        prepared = script_loader.prepare_script("send(1);")
+        assert "function raspilotFindExport" in prepared
+        assert "function raspilotPerformJava" in prepared
+        assert "performNow" in prepared
+        assert "findGlobalExportByName" in prepared
+
+    def test_prepare_without_bridge_keeps_compat(self):
+        """Sem a bridge (instalação antiga), o script mantém o compat."""
         with mock.patch.object(script_loader, "_BRIDGES_DIR", None):
             source = "send('x');"
-            assert script_loader.prepare_script(source) == source
+            prepared = script_loader.prepare_script(source)
+            assert prepared.endswith(source)
+            assert "var Java = bridge;" not in prepared
+            assert "function raspilotFindExport" in prepared
 
     def test_load_script_uses_prepared_source(self):
         """load_script cria o script com o código preparado e carrega."""
@@ -62,6 +75,36 @@ class TestJavaBridge:
         script_loader.load_script_file(fake_session, str(js))
         prepared = fake_session.create_script.call_args[0][0]
         assert prepared.endswith("send('file');")
+
+
+class TestFrida17Compat:
+    """Scripts do repositório usam as APIs compatíveis com Frida 17+."""
+
+    SCRIPTS_DIR = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"
+    )
+
+    def test_no_legacy_module_find_export(self):
+        """Nenhum script usa o Module.findExportByName estático (removido)."""
+        paths = glob.glob(os.path.join(self.SCRIPTS_DIR, "*.js"))
+        assert paths, "nenhum script .js encontrado"
+        for path in paths:
+            with open(path, encoding="utf-8") as fh:
+                source = fh.read()
+            assert "Module.findExportByName" not in source, (
+                f"{os.path.basename(path)} usa a API removida do Frida 17"
+            )
+
+    def test_bypass_scripts_use_compat_helpers(self):
+        """Os bypasses usam raspilotFindExport/raspilotPerformJava."""
+        for name in ("anti_hooking_bypass.js", "anti_frida_bypass.js",
+                     "anti_root_bypass.js", "ssl_bypass.js"):
+            with open(os.path.join(self.SCRIPTS_DIR, name), encoding="utf-8") as fh:
+                source = fh.read()
+            assert "raspilotPerformJava" in source, f"{name} sem raspilotPerformJava"
+            if name != "anti_root_bypass.js":
+                # anti_root_bypass.js é 100% Java (sem hooks nativos).
+                assert "raspilotFindExport" in source, f"{name} sem raspilotFindExport"
 
 
 class TestSafeUnload:

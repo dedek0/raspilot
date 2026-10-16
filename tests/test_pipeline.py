@@ -12,6 +12,7 @@ from unittest import mock
 import pytest
 
 import checks.anti_frida as anti_frida_mod
+import checks.anti_hooking as anti_hooking_mod
 import checks.ssl_pinning as ssl_pinning_mod
 import main as mainmod
 from device_manager import DeviceManager
@@ -88,6 +89,7 @@ class FakeSession:
 def fast_windows():
     """Encurta as janelas de observação (sleeps) dos checks."""
     with mock.patch.object(anti_frida_mod.time, "sleep"), \
+         mock.patch.object(anti_hooking_mod.time, "sleep"), \
          mock.patch.object(ssl_pinning_mod.time, "sleep"):
         yield
 
@@ -131,11 +133,12 @@ def test_pipeline_end_to_end(tmp_path, fast_windows, capsys):
     doc = json.loads(jsons[0].read_text(encoding="utf-8"))
     assert doc["metadata"]["tool_name"] == "RASPilot"
     assert doc["metadata"]["package"] == "com.example.app"
-    # Cenário mockado: root=True, frida vulnerável, pinning bypassado.
+    # Cenário mockado: root=True, frida vulnerável, sem anti-hook, pinning bypassado.
     assert doc["summary"]["anti_root"]["status"] == "FALHOU"
     assert doc["summary"]["anti_frida"]["status"] == "FALHOU"
     assert doc["summary"]["ssl_pinning"]["status"] == "FALHOU"
     assert doc["summary"]["anti_emulator"]["status"] == "OK"
+    assert doc["summary"]["anti_hooking"]["status"] == "FALHOU"
 
     html = htmls[0].read_text(encoding="utf-8")
     assert "RASPilot" in html
@@ -164,12 +167,13 @@ def test_pipeline_skip_marks_skip(tmp_path, fast_windows):
         rc = mainmod.main([
             "--package", "com.example.app",
             "--output-dir", str(tmp_path),
-            "--skip", "anti_root", "anti_emulator",
+            "--skip", "anti_root", "anti_emulator", "anti_hooking",
         ])
     assert rc == 0
     doc = json.loads(list(tmp_path.glob("*.json"))[0].read_text(encoding="utf-8"))
     assert doc["summary"]["anti_root"]["status"] == "SKIP"
     assert doc["summary"]["anti_emulator"]["status"] == "SKIP"
+    assert doc["summary"]["anti_hooking"]["status"] == "SKIP"
     assert doc["summary"]["anti_frida"]["status"] == "FALHOU"
     assert doc["summary"]["ssl_pinning"]["status"] == "N/A"
 

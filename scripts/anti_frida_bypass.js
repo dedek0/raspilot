@@ -51,7 +51,7 @@ function hookLibcStringHooks() {
     var names = ['strstr', 'strcmp', 'memcmp'];
     names.forEach(function (name) {
         try {
-            var addr = Module.findExportByName('libc.so', name);
+            var addr = raspilotFindExport('libc.so', name);
             if (addr === null) { return; }
             Interceptor.attach(addr, {
                 onEnter: function (args) {
@@ -108,7 +108,7 @@ function hookLibcStringHooks() {
 // ----------------------------------------------------------------------
 function hookConnectPorts() {
     try {
-        var connectPtr = Module.findExportByName('libc.so', 'connect');
+        var connectPtr = raspilotFindExport('libc.so', 'connect');
         if (connectPtr === null) { return; }
         Interceptor.attach(connectPtr, {
             onEnter: function (args) {
@@ -226,7 +226,7 @@ function hookThreadNames() {
     }
 
     try {
-        var pthread = Module.findExportByName('libc.so', 'pthread_setname_np');
+        var pthread = raspilotFindExport('libc.so', 'pthread_setname_np');
         if (pthread !== null) {
             Interceptor.attach(pthread, {
                 onEnter: function (args) {
@@ -254,18 +254,13 @@ function main() {
     hookConnectPorts();
 
     var attachJava = function () {
-        try {
-            if (typeof Java !== 'undefined' && Java.available) {
-                Java.perform(function () {
-                    hookFileExists();
-                    hookRuntimeExec();
-                    hookThreadNames();
-                });
-            } else {
-                report('Java indisponível — hooks Java pulados');
-            }
-        } catch (e) {
-            report('falha ao instalar hooks Java: ' + e);
+        var ok = raspilotPerformJava(function () {
+            hookFileExists();
+            hookRuntimeExec();
+            hookThreadNames();
+        });
+        if (!ok) {
+            report('Java indisponível — hooks Java pulados');
         }
     };
     attachJava();

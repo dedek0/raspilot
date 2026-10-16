@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 logger = logging.getLogger("raspilot.script_loader")
 
@@ -30,6 +30,79 @@ try:
     _BRIDGES_DIR = Path(frida_tools.__file__).parent / "bridges"
 except ImportError:  # pragma: no cover - frida-tools é dependência obrigatória
     _BRIDGES_DIR = None  # type: ignore[assignment]
+
+# Script mínimo de enumeração de módulos. A API host do Frida 17+ NÃO
+# expõe ``Session.enumerate_modules`` — módulos só são visíveis de dentro
+# do processo, via ``Process.enumerateModules()``. Expomos a lista por RPC.
+MODULE_ENUM_SCRIPT = """
+'use strict';
+
+rpc.exports = {
+    listmodules: function () {
+        var names = [];
+        try {
+            Process.enumerateModules().forEach(function (m) {
+                if (m && m.name) { names.push(m.name); }
+            });
+        } catch (e) { /* best-effort */ }
+        return names;
+    }
+};
+"""
+
+# Prelúdio de compatibilidade entre versões do Frida, sempre prependido
+# (junto com a bridge Java) aos scripts do RASPilot:
+#
+# - Frida 17 removeu o ``Module.findExportByName`` estático → usamos os
+#   métodos de instância (``Process.getModuleByName``) e o global
+#   ``Module.findGlobalExportByName``, com fallback para a API antiga.
+# - Em spawn suspenso (Frida 17 + QuickJS) ``Java.perform`` pode
+#   enfileirar o callback sem nunca executá-lo → preferimos
+#   ``Java.performNow``, que roda imediatamente.
+COMPAT_PRELUDE = """
+'use strict';
+
+function raspilotFindExport(moduleName, exportName) {
+    try {
+        if (typeof Process !== 'undefined' && typeof Process.getModuleByName === 'function') {
+            var mod = Process.getModuleByName(moduleName);
+            if (mod !== null && typeof mod.findExportByName === 'function') {
+                var addr = mod.findExportByName(exportName);
+                if (addr !== null) { return addr; }
+            }
+        }
+    } catch (e) { /* módulo não carregado */ }
+    try {
+        if (typeof Module !== 'undefined' && typeof Module.findGlobalExportByName === 'function') {
+            var globalAddr = Module.findGlobalExportByName(exportName);
+            if (globalAddr !== null) { return globalAddr; }
+        }
+    } catch (e) { /* best-effort */ }
+    try {
+        if (typeof Module !== 'undefined' && typeof Module.findExportByName === 'function') {
+            return Module.findExportByName(moduleName, exportName); // Frida <= 16
+        }
+    } catch (e) { /* best-effort */ }
+    return null;
+}
+
+function raspilotPerformJava(fn) {
+    try {
+        if (typeof Java === 'undefined' || !Java.available) { return false; }
+        if (typeof Java.performNow === 'function') {
+            Java.performNow(fn);
+            return true;
+        }
+        Java.perform(fn);
+        return true;
+    } catch (e) {
+        try {
+            send({ type: 'raspilot-script-error', message: 'hooks Java: ' + e });
+        } catch (e2) { /* host indisponível */ }
+        return false;
+    }
+}
+"""
 
 
 def java_bridge_available() -> bool:
@@ -63,17 +136,18 @@ def java_bridge_prelude() -> str:
 def prepare_script(source: str) -> str:
     """Prepara o código-fonte de um script Frida para injeção.
 
+    Concatena (1) a bridge Java do frida-tools quando disponível,
+    (2) o prelúdio de compatibilidade Frida 16/17 e (3) o código do
+    check/bypass.
+
     Args:
-        source: Código JS do check/bypass (usa o global ``Java``).
+        source: Código JS do check/bypass (usa os globals ``Java`` e
+            ``raspilotFindExport``/``raspilotPerformJava``).
 
     Returns:
-        Código com o prelúdio da bridge prependado (ou o original).
+        Código preparado para ``session.create_script``.
     """
-    prelude = java_bridge_prelude()
-    if not prelude:
-        logger.debug("Bridge Java indisponível — usando script cru")
-        return source
-    return prelude + source
+    return java_bridge_prelude() + COMPAT_PRELUDE + source
 
 
 def load_script(
@@ -151,3 +225,33 @@ def safe_unload(script: Optional[object]) -> None:
         script.unload()
     except Exception as exc:  # noqa: BLE001 - script destruído é esperado
         logger.debug("Unload ignorado (%s: %s)", type(exc).__name__, exc)
+
+
+def enumerate_module_names(session: object) -> List[str]:
+    """Lista os nomes dos módulos carregados no processo da sessão.
+
+    Usa ``session.enumerate_modules()`` quando existir (compat com
+    sessões fake/legadas) e, no Frida 17+ (onde esse método não existe),
+    injeta :data:`MODULE_ENUM_SCRIPT` e lê a lista via RPC.
+
+    Args:
+        session: Sessão Frida ativa.
+
+    Returns:
+        Lista com os nomes dos módulos (possivelmente vazia).
+
+    Raises:
+        Exception: erros do Frida propagam ao chamador (que os converte
+            em resultado estruturado).
+    """
+    legacy = getattr(session, "enumerate_modules", None)
+    if callable(legacy):
+        return [mod.name for mod in legacy()]
+
+    script = session.create_script(MODULE_ENUM_SCRIPT)
+    script.load()
+    try:
+        names = script.exports.listmodules()
+    finally:
+        safe_unload(script)
+    return list(names or [])
