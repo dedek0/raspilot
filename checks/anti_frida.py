@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, List, Optional
 
-from script_loader import load_script
+from script_loader import load_script, safe_unload
 
 if TYPE_CHECKING:  # evita import circular em tempo de importação
     from device_manager import DeviceManager
@@ -192,6 +192,26 @@ rpc.exports = {
 """
 
 
+# Script mínimo de enumeração de módulos. A API host do Frida 17+ NÃO
+# expõe `Session.enumerate_modules` — módulos só são visíveis de dentro
+# do processo, via `Process.enumerateModules()`. Expomos a lista por RPC.
+MODULE_ENUM_SCRIPT = """
+'use strict';
+
+rpc.exports = {
+    listmodules: function () {
+        var names = [];
+        try {
+            Process.enumerateModules().forEach(function (m) {
+                if (m && m.name) { names.push(m.name); }
+            });
+        } catch (e) { /* best-effort */ }
+        return names;
+    }
+};
+"""
+
+
 def _now_iso() -> str:
     """Retorna o timestamp atual em ISO8601 (UTC).
 
@@ -298,6 +318,35 @@ class AntiFridaCheck:
         logger.debug("check_frida_ports: detected=%s", detected)
         return result
 
+    @staticmethod
+    def _enumerate_module_names(sess: object) -> List[str]:
+        """Lista os nomes dos módulos carregados no processo da sessão.
+
+        Usa ``session.enumerate_modules()`` quando existir (compat com
+        sessões fake/legadas) e, no Frida 17+ (onde esse método não
+        existe), injeta :data:`MODULE_ENUM_SCRIPT` e lê a lista via RPC.
+
+        Args:
+            sess: Sessão Frida ativa.
+
+        Returns:
+            Lista com os nomes dos módulos (possivelmente vazia).
+
+        Raises:
+            Exception: erros do Frida propagam ao chamador.
+        """
+        legacy = getattr(sess, "enumerate_modules", None)
+        if callable(legacy):
+            return [mod.name for mod in legacy()]
+
+        script = sess.create_script(MODULE_ENUM_SCRIPT)
+        script.load()
+        try:
+            names = script.exports.listmodules()
+        finally:
+            safe_unload(script)
+        return list(names or [])
+
     def check_frida_libraries(
         self, pid: int, session: Optional[object] = None
     ) -> dict:
@@ -310,7 +359,8 @@ class AntiFridaCheck:
 
         Returns:
             Dict com ``detected``, ``evidence`` (nomes de módulos) e
-            ``details``. Em erro de attach: ``detected=False`` + ``error``.
+            ``details``. Em erro de attach/enumeração: ``detected=False``
+            + ``error``.
         """
         sess = session
         attached_here = False
@@ -330,10 +380,9 @@ class AntiFridaCheck:
 
         evidence: List[str] = []
         try:
-            for mod in sess.enumerate_modules():
-                name = mod.name.lower()
-                if any(k in name for k in FRIDA_KEYWORDS):
-                    evidence.append(mod.name)
+            for name in self._enumerate_module_names(sess):
+                if any(k in name.lower() for k in FRIDA_KEYWORDS):
+                    evidence.append(name)
         except Exception as exc:
             return {
                 "detected": False,
@@ -471,11 +520,7 @@ class AntiFridaCheck:
                 "error": str(exc),
             }
         finally:
-            if script is not None:
-                try:
-                    script.unload()
-                except Exception:
-                    logger.debug("Falha ao unload do script de detecção", exc_info=True)
+            safe_unload(script)
             if not resumed and on_script_loaded is not None:
                 # Garante que um spawn suspenso nunca fique travado.
                 try:
@@ -544,6 +589,10 @@ class AntiFridaCheck:
         result = {
             "vulnerable": vulnerable,
             "frida_present": frida_present,
+            # O RASPilot sobe o frida-server por definição: presença de
+            # Frida aqui é esperada (injetada pela ferramenta), não uma
+            # descoberta sobre o ambiente.
+            "frida_injected_by_tool": frida_present,
             "frida_pid": pid,
             "checks": checks,
             "app_detection": app_detection,

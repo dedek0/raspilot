@@ -114,7 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--window",
         type=int,
-        default=12,
+        default=15,
         metavar="SEG",
         help="Janela de observação em segundos nos checks dinâmicos",
     )

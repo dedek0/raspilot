@@ -137,7 +137,8 @@ class TestDeviceInfo:
         }
         with mock.patch.object(dm, "_getprop", side_effect=lambda p: props.get(p, "")), \
              mock.patch.object(dm, "_detect_abi", return_value="arm64-v8a"), \
-             mock.patch.object(dm, "verify_root_access", return_value=False):
+             mock.patch.object(dm, "verify_root_access", return_value=False), \
+             mock.patch.object(dm, "has_su_access", return_value=True):
             info = dm.get_device_info()
         assert info["serial"] == "SER1"
         assert info["model"] == "Pixel 7"
@@ -145,6 +146,7 @@ class TestDeviceInfo:
         assert info["sdk"] == "34"
         assert info["abi"] == "arm64-v8a"
         assert info["is_rooted_shell"] is False
+        assert info["root_via_su"] is True
 
     def test_verify_root_access_true(self):
         """shell id com uid=0(root) indica root."""
@@ -198,6 +200,22 @@ class TestRunShell:
         with mock.patch("device_manager.subprocess.run", side_effect=fake_run):
             dm.run_shell("id")
         assert seen["cmd"][:4] == ["adb", "-s", "SER1", "shell"]
+
+    def test_run_shell_root_wraps_with_su_when_available(self):
+        """Com root via su, o comando é elevado em `su -c`."""
+        dm = DeviceManager()
+        with mock.patch.object(dm, "has_su_access", return_value=True), \
+             mock.patch.object(dm, "run_shell", return_value={"ok": True}) as rs:
+            dm.run_shell_root("ls /data/adb/ap")
+        assert rs.call_args[0][0].startswith("su -c '")
+
+    def test_run_shell_root_plain_without_su(self):
+        """Sem su, o comando roda como shell comum (sem elevação)."""
+        dm = DeviceManager()
+        with mock.patch.object(dm, "has_su_access", return_value=False), \
+             mock.patch.object(dm, "run_shell", return_value={"ok": True}) as rs:
+            dm.run_shell_root("id")
+        rs.assert_called_once_with("id", timeout=20)
 
 
 class TestFridaHelpers:

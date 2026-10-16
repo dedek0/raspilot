@@ -71,7 +71,7 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--device-id` | não | Serial ADB (ex: `emulator-5554`) |
 | `--wifi IP:PORTA` | não | Endereço para `adb connect` |
 | `--output-dir` | não | Diretório dos relatórios (default `reports/`) |
-| `--window SEG` | não | Janela de observação em segundos nos checks dinâmicos (default `12`) |
+| `--window SEG` | não | Janela de observação em segundos nos checks dinâmicos (default `15`) |
 | `--verbose` | não | Logging em nível DEBUG |
 | `--skip CHECK...` | não | Checks a pular (`anti_root`, `anti_frida`, `anti_emulator`, `ssl_pinning`) |
 

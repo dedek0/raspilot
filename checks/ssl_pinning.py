@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from rich.console import Console
 
-from script_loader import load_script_file
+from script_loader import load_script_file, safe_unload
 
 if TYPE_CHECKING:  # evita import circular em tempo de importação
     from device_manager import DeviceManager
@@ -179,11 +179,30 @@ class SSLPinningCheck:
         except (zipfile.BadZipFile, OSError) as exc:
             raise zipfile.BadZipFile(f"{apk_path}: {exc}") from exc
 
+        # Assinaturas ainda não encontradas — o scan para cedo quando
+        # todas casam e processa um blob por vez (sem acumular centenas
+        # de MB do APK em memória).
+        pending = [
+            (sig_type, needle, description)
+            for sig_type, needles in STATIC_SIGNATURES
+            for needle, description in needles
+        ]
+        interesting: List[str] = []
+
+        def _scan_blob(blob: bytes) -> None:
+            nonlocal pending
+            remaining = []
+            for sig_type, needle, description in pending:
+                if _contains([blob], needle):
+                    found.setdefault(sig_type, []).append(description)
+                else:
+                    remaining.append((sig_type, needle, description))
+            pending = remaining
+
         with zf:
-            # Coleta blobs relevantes (limita tamanho para performance).
-            blobs: List[bytes] = []
-            interesting: List[str] = []
             for info in zf.infolist():
+                if not pending:
+                    break
                 name = info.filename
                 if (
                     name == "AndroidManifest.xml"
@@ -194,18 +213,13 @@ class SSLPinningCheck:
                 ):
                     interesting.append(name)
                     try:
-                        blobs.append(zf.read(name)[: 8 * 1024 * 1024])
+                        _scan_blob(zf.read(name)[: 8 * 1024 * 1024])
                     except (OSError, RuntimeError, zipfile.BadZipFile):
                         logger.debug("Não foi possível ler %s do APK", name)
 
             # Nomes das entradas também são evidência (ex: lib/libflutter.so).
-            if interesting:
-                blobs.append("\n".join(interesting).encode("utf-8", errors="ignore"))
-
-            for sig_type, needles in STATIC_SIGNATURES:
-                for needle, description in needles:
-                    if _contains(blobs, needle):
-                        found.setdefault(sig_type, []).append(description)
+            if pending and interesting:
+                _scan_blob("\n".join(interesting).encode("utf-8", errors="ignore"))
 
         return found
 
@@ -340,11 +354,7 @@ class SSLPinningCheck:
                 "error": str(exc),
             }
         finally:
-            if script is not None:
-                try:
-                    script.unload()
-                except Exception:
-                    logger.debug("Falha ao unload do ssl_bypass", exc_info=True)
+            safe_unload(script)
             if session is not None:
                 try:
                     session.detach()

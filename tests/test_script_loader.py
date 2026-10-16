@@ -62,3 +62,23 @@ class TestJavaBridge:
         script_loader.load_script_file(fake_session, str(js))
         prepared = fake_session.create_script.call_args[0][0]
         assert prepared.endswith("send('file');")
+
+
+class TestSafeUnload:
+    """``safe_unload`` tolera scripts destruídos (processo alvo morreu)."""
+
+    def test_calls_unload(self):
+        """Script saudável é descarregado normalmente."""
+        script = mock.MagicMock()
+        script_loader.safe_unload(script)
+        script.unload.assert_called_once()
+
+    def test_ignores_destroyed_script(self):
+        """`script is destroyed` não propaga exceção nem stacktrace."""
+        script = mock.MagicMock()
+        script.unload.side_effect = RuntimeError("script is destroyed")
+        script_loader.safe_unload(script)  # não deve levantar
+
+    def test_handles_none(self):
+        """``None`` é um no-op."""
+        script_loader.safe_unload(None)

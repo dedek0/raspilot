@@ -207,6 +207,25 @@ class DeviceManager:
                 "stderr": f"timeout após {timeout}s",
             }
 
+    def run_shell_root(self, command: str, timeout: int = DEFAULT_ADB_TIMEOUT) -> dict:
+        """Executa um comando shell elevando privilégios quando possível.
+
+        Muitos paths relevantes para auditoria (``/data/adb/ap``,
+        ``/data/adb/magisk``, etc.) são ``drwx------ root`` e invisíveis
+        ao usuário ``shell`` (uid 2000). Este helper reusa
+        :meth:`_su_cmd`, que envolve o comando em ``su -c`` quando há root
+        via ``su`` (APatch/Magisk/KernelSU) e devolve o comando original
+        caso contrário.
+
+        Args:
+            command: Comando shell completo.
+            timeout: Timeout em segundos.
+
+        Returns:
+            Mesmo contrato de :meth:`run_shell`.
+        """
+        return self.run_shell(self._su_cmd(command), timeout=timeout)
+
     # ------------------------------------------------------------------
     # Conexão ADB
     # ------------------------------------------------------------------
@@ -298,7 +317,8 @@ class DeviceManager:
 
         Returns:
             Dict com chaves: ``serial``, ``model``, ``android_version``,
-            ``sdk``, ``abi``, ``is_rooted_shell``.
+            ``sdk``, ``abi``, ``is_rooted_shell`` (shell ADB é uid 0) e
+            ``root_via_su`` (root disponível via ``su``).
 
         Raises:
             DeviceConnectionError: se algum comando essencial falhar.
@@ -312,6 +332,7 @@ class DeviceManager:
         sdk = self._getprop("ro.build.version.sdk") or "unknown"
         abi = self._detect_abi()
         is_rooted = self.verify_root_access()
+        root_via_su = self.has_su_access()
 
         info = {
             "serial": serial,
@@ -320,6 +341,7 @@ class DeviceManager:
             "sdk": sdk,
             "abi": abi,
             "is_rooted_shell": is_rooted,
+            "root_via_su": root_via_su,
         }
         self._device_info = info
         logger.info(

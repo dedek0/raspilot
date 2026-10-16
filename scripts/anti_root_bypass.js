@@ -33,7 +33,6 @@ var SUSPICIOUS_PROPS = {
 function report(msg) {
     try {
         send({ type: 'raspilot-bypass', message: msg });
-        console.log('[RASPilot Root] ' + msg);
     } catch (e) { /* host indisponível */ }
 }
 

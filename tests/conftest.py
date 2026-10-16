@@ -54,6 +54,10 @@ class FakeShellDM:
                 return {"ok": True, "rc": 0, "stdout": value, "stderr": ""}
         return {"ok": True, "rc": 0, "stdout": "", "stderr": ""}
 
+    def run_shell_root(self, command: str, timeout: int = 20) -> dict:
+        """Simula ``DeviceManager.run_shell_root`` (sem su real nos testes)."""
+        return self.run_shell(command, timeout=timeout)
+
     def is_app_alive(self, pid: int) -> bool:
         """Simula ``DeviceManager.is_app_alive``.
 

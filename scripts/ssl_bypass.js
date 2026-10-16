@@ -16,7 +16,7 @@
  *
  * Cada bloco é isolado em try/catch e o script é idempotente, para
  * funcionar em múltiplas versões de Android, libs e frameworks.
- * Mensagens de console são capturadas pelo RASPilot para evidência.
+ * Mensagens são enviadas ao host via send() e viram evidência (bypass_logs).
  *
  * Marca: RASPilot — Piloto Automático de Auditoria RASP para Android.
  */
@@ -29,7 +29,6 @@ var interceptedHosts = [];
 function log(msg) {
     try {
         send({ type: 'ssl-bypass', message: msg });
-        console.log('[RASPilot SSL] ' + msg);
     } catch (e) { /* host indisponível */ }
 }
 

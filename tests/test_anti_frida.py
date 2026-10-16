@@ -46,6 +46,43 @@ class FakeSession:
         return FakeScript(self._messages)
 
 
+class FakeScriptExports:
+    """Script Frida fake que expõe ``exports.listmodules()`` (RPC)."""
+
+    def __init__(self, names):
+        self._names = names
+        self.unloaded = False
+
+    class _Exports:
+        def __init__(self, names):
+            self._names = names
+
+        def listmodules(self):
+            return self._names
+
+    @property
+    def exports(self):
+        return FakeScriptExports._Exports(self._names)
+
+    def load(self):
+        pass
+
+    def unload(self):
+        self.unloaded = True
+
+
+class FakeSessionNoEnum:
+    """Sessão Frida 17 fake, sem ``enumerate_modules`` no host."""
+
+    def __init__(self, names):
+        self._names = names
+        self.created = None
+
+    def create_script(self, source, **kwargs):
+        self.created = FakeScriptExports(self._names)
+        return self.created
+
+
 class TestDeviceVectors:
     """Vetores de dispositivo (processos, portas, threads)."""
 
@@ -118,6 +155,26 @@ class TestDeviceVectors:
         session = FakeSession(modules=[FakeModule("libc.so"), FakeModule("libtarget.so")])
         res = check.check_frida_libraries(1, session=session)
         assert res["detected"] is False
+
+    def test_frida_libraries_via_rpc_without_host_enum(self):
+        """Frida 17 (sem Session.enumerate_modules) enumera via RPC no script."""
+        check = AntiFridaCheck(mock.MagicMock())
+        session = FakeSessionNoEnum(["libc.so", "libfrida-gadget.so"])
+        res = check.check_frida_libraries(1, session=session)
+        assert res["detected"] is True
+        assert "libfrida-gadget.so" in res["evidence"]
+        assert session.created.unloaded is True
+
+    def test_frida_libraries_rpc_error_is_captured(self):
+        """Erro de load/enumeração via RPC vira error estruturado."""
+        class _BadSession:
+            def create_script(self, source, **kwargs):
+                raise RuntimeError("load falhou")
+
+        check = AntiFridaCheck(mock.MagicMock())
+        res = check.check_frida_libraries(1, session=_BadSession())
+        assert res["detected"] is False
+        assert "load falhou" in res["error"]
 
 
 class TestAppDetection:
@@ -197,6 +254,7 @@ class TestRunAll:
             res = check.run_all(session, pid=1234)
         assert res["vulnerable"] is True
         assert res["frida_present"] is True
+        assert res["frida_injected_by_tool"] is True
         assert res["frida_pid"] == 1234
 
     def test_not_vulnerable_with_app_detection(self, fake_dm_factory):

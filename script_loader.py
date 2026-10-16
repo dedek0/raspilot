@@ -129,3 +129,25 @@ def load_script_file(
     with open(path, "r", encoding="utf-8") as fh:
         source = fh.read()
     return load_script(session, source, on_message=on_message, name=os.path.basename(path))
+
+
+def safe_unload(script: Optional[object]) -> None:
+    """Descarrega um script Frida tolerando scripts já destruídos.
+
+    Quando o processo alvo se encerra (reação típica de RASP), o Frida
+    destrói o script e um ``script.unload()`` subsequente levanta
+    ``frida.InvalidOperationError``. Esse é um caso **esperado** no
+    RASPilot, então não deve virar ruído/traceback no log.
+
+    Args:
+        script: Objeto ``frida.core.Script`` (ou ``None``).
+
+    Returns:
+        None.
+    """
+    if script is None:
+        return
+    try:
+        script.unload()
+    except Exception as exc:  # noqa: BLE001 - script destruído é esperado
+        logger.debug("Unload ignorado (%s: %s)", type(exc).__name__, exc)

@@ -33,7 +33,6 @@ var FRIDA_THREADS = ['gum-js-loop', 'gmain', 'pool-frida', 'frida'];
 function report(msg) {
     try {
         send({ type: 'raspilot-bypass', message: msg });
-        console.log('[RASPilot] ' + msg);
     } catch (e) { /* host indisponível — ignora */ }
 }
 

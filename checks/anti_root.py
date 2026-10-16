@@ -104,6 +104,27 @@ class AntiRootCheck:
         """
         return self.dm.run_shell(command, timeout=timeout)
 
+    def _shell_root(self, command: str, timeout: int = 20) -> dict:
+        """Executa um comando shell elevando para root quando ``su`` existe.
+
+        Diretórios como ``/data/adb/ap`` (APatch), ``/data/adb/magisk`` e
+        ``/sbin/.magisk`` são ``drwx------ root`` e negam leitura ao
+        usuário ``shell`` — sem elevação esses vetores dão falso-negativo
+        mesmo em dispositivos rooteados.
+
+        Args:
+            command: Comando shell do dispositivo.
+            timeout: Timeout em segundos.
+
+        Returns:
+            Dict ``{'ok', 'rc', 'stdout', 'stderr'}``.
+        """
+        runner = getattr(self.dm, "run_shell_root", None)
+        if callable(runner):
+            return runner(command, timeout=timeout)
+        # Fake/legado sem suporte: cai no shell comum.
+        return self.dm.run_shell(command, timeout=timeout)
+
     def _getprop(self, prop: str) -> str:
         """Lê uma propriedade Android.
 
@@ -168,12 +189,12 @@ class AntiRootCheck:
                     evidence.append(f"package: {pkg}")
 
         # 2) Diretório de dados do Magisk (requer root para listar).
-        res = self._shell("ls /data/adb/magisk 2>/dev/null")
+        res = self._shell_root("ls /data/adb/magisk 2>/dev/null")
         if res["ok"] and res["stdout"]:
             evidence.append("/data/adb/magisk (dir)")
 
         # 3) Overlay em /sbin/.magisk.
-        res = self._shell("ls /sbin/.magisk 2>/dev/null")
+        res = self._shell_root("ls /sbin/.magisk 2>/dev/null")
         if res["ok"] and res["stdout"]:
             evidence.append("/sbin/.magisk")
 
@@ -344,13 +365,16 @@ class AntiRootCheck:
         """Detecta soluções de root modernas (APatch e KernelSU).
 
         Procura diretórios e binários característicos de cada solução.
+        As probes são elevadas via ``su`` quando disponível, pois
+        ``/data/adb/ap`` e ``/data/adb/ksu`` são acessíveis apenas por
+        root.
 
         Returns:
             Dict com ``detected``, ``evidence`` e ``details``.
         """
         evidence: List[str] = []
         for command, label in ALT_ROOT_SOLUTION_MARKERS:
-            res = self._shell(command, timeout=10)
+            res = self._shell_root(command, timeout=10)
             if res["ok"] and res["stdout"]:
                 evidence.append(label)
 
