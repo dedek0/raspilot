@@ -1,2 +1,3 @@
 # RASPilot — dependências de desenvolvimento/testes
 pytest>=7.0.0
+pytest-timeout>=2.1.0

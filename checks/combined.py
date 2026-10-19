@@ -38,12 +38,21 @@ from script_loader import (
     safe_unload,
     wait_for_java_ready,
 )
-from verdict_hook import load_verdict_hook
+from verdict_hook import (
+    VERDICT_HOOK_SCRIPT,
+    build_replacements as build_verdict_replacements,
+)
 
 if TYPE_CHECKING:  # evita import circular em tempo de importação
     from device_manager import DeviceManager
 
 logger = logging.getLogger("raspilot.checks.combined")
+
+# Intervalo entre as consultas feitas durante a janela de observacao.
+# Exposto como constante para que os testes nao dependam de esperar
+# tempo real.
+OBSERVATION_POLL_INTERVAL = 1.0
+
 
 # Categorias de logcat aceitas como evidência de detecção em cada check.
 # "root" e "emulator" não são evidência de Frida nem de hooking: são
@@ -64,7 +73,11 @@ def _iife(source: str) -> str:
     return "(function(){\n" + source + "\n})();\n"
 
 
-def _replacements(dm: "DeviceManager", java_only: bool) -> Dict[str, str]:
+def _replacements(
+    dm: "DeviceManager",
+    java_only: bool,
+    package_name: str = "",
+) -> Dict[str, str]:
     """Placeholders comuns aos dois scripts."""
     value = getattr(dm, "frida_port", None)
     port = int(value) if isinstance(value, int) else 27999
@@ -72,6 +85,7 @@ def _replacements(dm: "DeviceManager", java_only: bool) -> Dict[str, str]:
         "__RASPILOT_FRIDA_PORT__": str(port),
         "__RASPILOT_FRIDA_PORT_HEX__": f"{port:04X}",
         "__RASPILOT_JAVA_ONLY__": "true" if java_only else "false",
+        "__RASPILOT_PACKAGE_NAME__": package_name or "",
     }
 
 
@@ -478,7 +492,9 @@ def run_combined_observation(
             stealth_loaded = load_stealth(
                 session,
                 on_message=on_message,
-                replacements=_replacements(dm, java_only=False),
+                replacements=_replacements(
+                    dm, java_only=False, package_name=package_name
+                ),
                 include_proc_filter=True,
             )
         else:
@@ -491,12 +507,16 @@ def run_combined_observation(
             stealth_loaded = load_stealth(
                 session,
                 on_message=on_message,
-                replacements=_replacements(dm, java_only=False),
+                replacements=_replacements(
+                    dm, java_only=False, package_name=package_name
+                ),
                 include_proc_filter=mode != "detect",
                 load_native_frida=mode != "detect",
             )
 
-        native_source = _replacements(dm, java_only=False)
+        native_source = _replacements(
+                    dm, java_only=False, package_name=package_name
+                )
         native_script = load_script(
             session,
             _iife(DETECTION_SCRIPT) + _iife(HOOK_DETECTION_SCRIPT),
@@ -511,13 +531,24 @@ def run_combined_observation(
             resumed = True
 
         if not no_java:
+            # O class loader do app só existe depois que a aplicação é
+            # criada. Carregar a bridge antes disso faz a ponte esperar
+            # ativamente — e a espera prende a thread de JavaScript do
+            # agente, o que estoura o limite de carga do script.
+            if not dm.wait_for_app_ready(package_name, pid=pid):
+                logger.warning(
+                    "App não ficou em foco a tempo; a camada Java pode "
+                    "demorar a subir"
+                )
             try:
                 java_script = load_script(
                     session,
                     _iife(DETECTION_SCRIPT) + _iife(HOOK_DETECTION_SCRIPT),
                     on_message=on_message,
                     name="raspilot-combined-java",
-                    replacements=_replacements(dm, java_only=True),
+                    replacements=_replacements(
+                    dm, java_only=True, package_name=package_name
+                ),
                     with_java_bridge=True,
                     load_timeout=java_timeout,
                 )
@@ -539,7 +570,7 @@ def run_combined_observation(
                     logger.warning("Camada Java não ficou pronta a tempo")
 
         for elapsed in range(max(1, int(window))):
-            time.sleep(1)
+            time.sleep(OBSERVATION_POLL_INTERVAL)
             if pid is not None and not dm.is_app_alive(pid):
                 died_after = elapsed + 1
                 break
@@ -669,7 +700,6 @@ def run_combined_bypass(
     native_ssl = None
     proc_script = None
     java_hook = None
-    verdict_script = None
     died_after: Optional[int] = None
     pid: Optional[int] = None
     logcat_mark = get_logcat_mark(dm)
@@ -755,7 +785,9 @@ def run_combined_bypass(
             stealth_loaded = load_stealth(
                 session,
                 on_message=on_message,
-                replacements=_replacements(dm, java_only=False),
+                replacements=_replacements(
+                    dm, java_only=False, package_name=package_name
+                ),
                 include_proc_filter=True,
             )
         else:
@@ -765,48 +797,70 @@ def run_combined_bypass(
             stealth_loaded = load_stealth(
                 session,
                 on_message=on_message,
-                replacements=_replacements(dm, java_only=False),
+                replacements=_replacements(
+                    dm, java_only=False, package_name=package_name
+                ),
                 include_proc_filter=True,
             )
         native_hook = load_script_file(
             session, HOOK_BYPASS_SCRIPT, on_message=on_message,
-            replacements=_replacements(dm, java_only=False),
+            replacements=_replacements(
+                    dm, java_only=False, package_name=package_name
+                ),
             with_java_bridge=False, load_timeout=5.0,
         )
         native_ssl = load_script_file(
             session, SSL_BYPASS_SCRIPT, on_message=on_message,
-            replacements=_replacements(dm, java_only=False),
+            replacements=_replacements(
+                    dm, java_only=False, package_name=package_name
+                ),
             with_java_bridge=False, load_timeout=5.0,
         )
         proc_loaded = any(path == PROC_FILTER_SCRIPT for path, _ in stealth_loaded)
         if not proc_loaded:
             proc_script = load_script_file(
                 session, PROC_FILTER_SCRIPT, on_message=on_message,
-                replacements=_replacements(dm, java_only=False),
+                replacements=_replacements(
+                    dm, java_only=False, package_name=package_name
+                ),
                 with_java_bridge=False, load_timeout=3.0,
             )
         dm.resume_app()
         pid = dm.last_spawn_pid or dm.get_app_pid(package_name)
 
         if not no_java:
+            # Ver nota na observação: sem o app em foco, a ponte espera
+            # pelo class loader e prende a thread do agente.
+            if not dm.wait_for_app_ready(package_name, pid=pid):
+                logger.warning(
+                    "App não ficou em foco a tempo; a camada Java pode "
+                    "demorar a subir"
+                )
             # Todos os scripts Java são carregados em UM único script: a
             # bridge Java é compilada uma vez por sessão em vez de uma
             # vez por script, o que reduz o tempo de carga e evita
             # que a camada Java seja descartada por timeout.
+            #
+            # O hook de veredito entra no mesmo bundle: ele neutraliza a
+            # comunicação de violação dos SDKs de RASP — as primitivas
+            # são enganadas, mas o SDK ainda reporta a ameaça ao app.
             try:
                 java_hook = load_java_bundle_files(
                     session,
-                    [HOOK_BYPASS_SCRIPT, SSL_BYPASS_SCRIPT, KILL_TRACE_SCRIPT],
+                    [
+                        HOOK_BYPASS_SCRIPT,
+                        SSL_BYPASS_SCRIPT,
+                        KILL_TRACE_SCRIPT,
+                        VERDICT_HOOK_SCRIPT,
+                    ],
                     on_message=on_message,
                     name="raspilot-combined-bypass-java",
-                    replacements=_replacements(dm, java_only=True),
-                    load_timeout=java_timeout,
-                )
-                # Neutraliza a comunicação de violação dos SDKs de RASP:
-                # as primitivas são enganadas, mas o SDK ainda reporta
-                # a ameaça ao app.
-                verdict_script = load_verdict_hook(
-                    session, on_message=on_message,
+                    replacements={
+                        **_replacements(
+                    dm, java_only=True, package_name=package_name
+                ),
+                        **build_verdict_replacements(),
+                    },
                     load_timeout=java_timeout,
                 )
             except Exception as exc:
@@ -823,7 +877,7 @@ def run_combined_bypass(
                     logger.warning("Camada Java do bypass não ficou pronta a tempo")
 
         for elapsed in range(max(1, int(window))):
-            time.sleep(1)
+            time.sleep(OBSERVATION_POLL_INTERVAL)
             if pid is not None and not dm.is_app_alive(pid):
                 died_after = elapsed + 1
                 break
@@ -833,8 +887,7 @@ def run_combined_bypass(
         for target in (hook_logs, ssl_logs):
             target.append(f"[script-error] {exc}")
     finally:
-        for script in (native_hook, native_ssl, proc_script, java_hook,
-                       verdict_script):
+        for script in (native_hook, native_ssl, proc_script, java_hook):
             safe_unload(script)
         unload_stealth(stealth_loaded)
         if session is not None:

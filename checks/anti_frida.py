@@ -37,6 +37,12 @@ if TYPE_CHECKING:  # evita import circular em tempo de importação
 
 logger = logging.getLogger("raspilot.checks.anti_frida")
 
+# Intervalo entre as consultas feitas durante a janela de observacao.
+# Exposto como constante para que os testes nao dependam de esperar
+# tempo real.
+OBSERVATION_POLL_INTERVAL = 1.0
+
+
 # Portas padrão do frida-server (27042 principal, 27043 session).
 FRIDA_PORTS = (27042, 27043)
 
@@ -290,6 +296,7 @@ class AntiFridaCheck:
             "__RASPILOT_FRIDA_PORT__": str(self._frida_port()),
             "__RASPILOT_FRIDA_PORT_HEX__": f"{self._frida_port():04X}",
             "__RASPILOT_JAVA_ONLY__": "true" if java_only else "false",
+            "__RASPILOT_PACKAGE_NAME__": getattr(self.dm, "last_spawn_package", None) or "",
         }
 
     def _baseline(self) -> Optional[dict]:
@@ -640,7 +647,7 @@ class AntiFridaCheck:
                 except Exception:
                     logger.debug("kill_trace.js indisponível no anti-frida", exc_info=True)
             for elapsed in range(max(1, int(window))):
-                time.sleep(1)
+                time.sleep(OBSERVATION_POLL_INTERVAL)
                 if pid is not None and not self.dm.is_app_alive(pid):
                     died_after = elapsed + 1
                     logger.info(

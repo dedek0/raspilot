@@ -107,7 +107,8 @@ class TestConnectAdb:
         dm = DeviceManager()
         with mock.patch.object(dm, "_run", return_value="ok"), \
              mock.patch.object(dm, "_list_devices", return_value=[]), \
-             mock.patch("device_manager.time.sleep"):  # não espera de verdade
+             mock.patch("device_manager.CONNECT_TIMEOUT", 0.01), \
+             mock.patch("device_manager.CONNECT_RETRY_INTERVAL", 0.0):  # não espera de verdade
             with pytest.raises(DeviceConnectionError, match="não ficou pronto"):
                 dm.connect_adb()
 
@@ -330,8 +331,7 @@ class TestFridaStealth:
             return {"ok": True, "rc": 0, "stdout": "", "stderr": ""}
 
         with mock.patch.object(dm, "run_shell", side_effect=fake_shell), \
-             mock.patch.object(dm, "has_su_access", return_value=False), \
-             mock.patch("device_manager.time.sleep"):
+             mock.patch.object(dm, "has_su_access", return_value=False):
             dm.kill_frida_server()
         assert any(".lloader" in c for c in seen)
 
@@ -445,7 +445,7 @@ class TestBaseline:
         dm = DeviceManager()
         with mock.patch.object(dm, "run_shell", return_value={
             "ok": True, "rc": 0, "stdout": "", "stderr": ""
-        }), mock.patch("device_manager.time.sleep"):
+        }), mock.patch("device_manager.BASELINE_POLL_INTERVAL", 0.0):
             res = dm.run_app_baseline("com.app", window=2)
         assert res["available"] is False
         assert "reason" in res
@@ -463,7 +463,7 @@ class TestBaseline:
 
         with mock.patch.object(dm, "run_shell", side_effect=fake_shell), \
              mock.patch.object(dm, "is_app_alive", return_value=True), \
-             mock.patch("device_manager.time.sleep"):
+             mock.patch("device_manager.BASELINE_POLL_INTERVAL", 0.0):
             res = dm.run_app_baseline("com.app", window=2)
         assert res["available"] is True
         assert res["pid"] == 1234
@@ -484,11 +484,49 @@ class TestBaseline:
              mock.patch.object(dm, "capture_death_cause", return_value={
                  "evidence": [], "signal": "SIGSEGV", "summary": "SIGSEGV"
              }), \
-             mock.patch("device_manager.time.sleep"):
+             mock.patch("device_manager.BASELINE_POLL_INTERVAL", 0.0):
             res = dm.run_app_baseline("com.app", window=2)
         assert res["alive_at_end"] is False
         assert res["died_after"] == 1
         assert res["death_cause"]["signal"] == "SIGSEGV"
+
+
+class TestAppReady:
+    """Espera pelo app ficar em foco antes de carregar a camada Java."""
+
+    def test_returns_true_when_the_app_has_focus(self):
+        """App em foco: a espera termina na primeira consulta."""
+        dm = DeviceManager()
+        with mock.patch.object(dm, "run_shell", return_value={
+            "ok": True, "rc": 0,
+            "stdout": "mCurrentFocus=Window{1 u0 com.example.app/.Main}",
+            "stderr": "",
+        }):
+            assert dm.wait_for_app_ready("com.example.app") is True
+
+    def test_gives_up_when_the_process_is_gone(self):
+        """App morto não chega a ficar em foco: a espera encerra."""
+        dm = DeviceManager()
+        calls = []
+
+        def fake_shell(command, timeout=20):
+            calls.append(command)
+            return {"ok": True, "rc": 0, "stdout": "", "stderr": ""}
+
+        with mock.patch.object(dm, "run_shell", side_effect=fake_shell), \
+             mock.patch.object(dm, "is_app_alive", return_value=False):
+            assert dm.wait_for_app_ready("com.example.app", pid=42) is False
+        assert len(calls) == 1, "não deve insistir com o app já morto"
+
+    def test_respects_the_timeout(self):
+        """Sem foco e com o app vivo, a espera respeita o prazo."""
+        dm = DeviceManager()
+        with mock.patch.object(dm, "run_shell", return_value={
+            "ok": True, "rc": 0, "stdout": "", "stderr": ""
+        }), \
+             mock.patch.object(dm, "is_app_alive", return_value=True), \
+             mock.patch("device_manager.APP_READY_POLL", 0.0):
+            assert dm.wait_for_app_ready("com.example.app", timeout=0.05) is False
 
 
 class TestPidAndDeviceSelection:

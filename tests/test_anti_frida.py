@@ -184,7 +184,7 @@ class TestAppDetection:
         """App que não chama nada relacionado a frida => vulnerable=True."""
         check = AntiFridaCheck(mock.MagicMock())
         session = FakeSession(messages=[])
-        with mock.patch("checks.anti_frida.time.sleep"):
+        with mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_frida_detection_in_app(session)
         assert res["vulnerable"] is True
         assert res["detection_methods_found"] == []
@@ -196,7 +196,7 @@ class TestAppDetection:
             "type": "send",
             "payload": {"method": "Runtime.exec", "detail": "ls /data/local/tmp/frida-server"},
         }])
-        with mock.patch("checks.anti_frida.time.sleep"):
+        with mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_frida_detection_in_app(session)
         assert res["vulnerable"] is False
         assert any("Runtime.exec" in m for m in res["detection_methods_found"])
@@ -226,7 +226,7 @@ class TestAppDetection:
             "payload": {"type": "frida-detection-error",
                         "message": "instalação de strstr falhou"},
         }])
-        with mock.patch("checks.anti_frida.time.sleep"):
+        with mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_frida_detection_in_app(session)
         assert res["vulnerable"] is True
         assert res["detection_methods_found"] == []
@@ -237,7 +237,7 @@ class TestAppDetection:
         dm.is_app_alive.return_value = False
         check = AntiFridaCheck(dm)
         session = FakeSession(messages=[])
-        with mock.patch("checks.anti_frida.time.sleep"):
+        with mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_frida_detection_in_app(session, window=3, pid=99)
         assert res["vulnerable"] is False
         assert res["app_alive_at_end"] is False
@@ -249,7 +249,7 @@ class TestAppDetection:
         dm.is_app_alive.return_value = True
         check = AntiFridaCheck(dm)
         session = FakeSession(messages=[])
-        with mock.patch("checks.anti_frida.time.sleep"):
+        with mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_frida_detection_in_app(session, window=3, pid=99)
         assert res["app_alive_at_end"] is True
         assert res["vulnerable"] is True
@@ -267,7 +267,7 @@ class TestRunAll:
         })
         check = AntiFridaCheck(dm)
         session = FakeSession(messages=[])
-        with mock.patch("checks.anti_frida.time.sleep"):
+        with mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.run_all(session, pid=1234)
         assert res["vulnerable"] is True
         assert res["frida_present"] is True
@@ -286,7 +286,7 @@ class TestRunAll:
             "type": "send",
             "payload": {"method": "File.exists", "detail": "/data/local/tmp/frida-server"},
         }])
-        with mock.patch("checks.anti_frida.time.sleep"):
+        with mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.run_all(session, pid=1234)
         assert res["vulnerable"] is False
         assert res["app_detection"]["detection_methods_found"]
@@ -302,7 +302,7 @@ class TestObservationReliability:
                 raise RuntimeError("script load falhou")
 
         check = AntiFridaCheck(mock.MagicMock())
-        with mock.patch("checks.anti_frida.time.sleep"):
+        with mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_frida_detection_in_app(_BadSession())
         assert res["vulnerable"] is None
         assert res["observation_status"] == "error"
@@ -317,7 +317,7 @@ class TestObservationReliability:
         ]
         check = AntiFridaCheck(dm)
         session = FakeSession(messages=[])
-        with mock.patch("checks.anti_frida.time.sleep"):
+        with mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_frida_detection_in_app(
                 session, window=2, pid=1234, package_name="com.app", logcat_mark=0
             )
@@ -336,7 +336,7 @@ class TestObservationReliability:
         ]
         dm.baseline = {"available": True, "alive_at_end": True}
         check = AntiFridaCheck(dm)
-        with mock.patch("checks.anti_frida.time.sleep"):
+        with mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_frida_detection_in_app(
                 FakeSession(messages=[]), window=2, pid=1234,
                 package_name="com.app", logcat_mark=0,
@@ -357,7 +357,7 @@ class TestObservationReliability:
         ]
         dm.baseline = {"available": True, "alive_at_end": False}
         check = AntiFridaCheck(dm)
-        with mock.patch("checks.anti_frida.time.sleep"):
+        with mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_frida_detection_in_app(
                 FakeSession(messages=[]), window=2, pid=1234,
                 package_name="com.app", logcat_mark=0,

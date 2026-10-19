@@ -42,7 +42,7 @@ class TestNoJava:
         dm.is_app_alive.return_value = True
         dm.logcat_since.return_value = []
         session = _Session()
-        with mock.patch("checks.anti_frida.time.sleep"):
+        with mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
             res = AntiFridaCheck(dm, no_java=True).check_frida_detection_in_app(
                 session, window=1, pid=1, package_name="com.example.app"
             )

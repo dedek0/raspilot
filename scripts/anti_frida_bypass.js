@@ -39,6 +39,11 @@ var FRIDA_MARKERS = [
 
 var FRIDA_THREADS = ['gum-js-loop', 'gmain', 'pool-frida', 'frida'];
 
+// Limite de caracteres inspecionados por chamada nos ganchos de string.
+// Buffers maiores não são verificados: a chance de um marcador estar
+// neles é desprezível, e o custo de ler tudo não é.
+var MAX_SCAN_CHARS = 256;
+
 // Porta stealth configurada no host (substituída antes da injeção).
 // O typeof mantém o script válido mesmo se o placeholder não for trocado.
 var RASPILOT_FRIDA_PORT = (typeof __RASPILOT_FRIDA_PORT__ !== 'undefined')
@@ -74,10 +79,87 @@ function looksLikeFrida(str) {
 }
 
 // ----------------------------------------------------------------------
-// 1) Native — libc.so: strstr / strcmp / memcmp
+// Verificação de marcadores — sem alocação no caminho quente
 // ----------------------------------------------------------------------
+//
+// Os ganchos de string são Cheap por natureza: só strstr é hookado,
+// porque strcmp e memcmp são chamados dezenas de milhares de vezes por
+// segundo pelo runtime do app e pelo motor JavaScript do agente. A
+// verificação precisa ser barata: qualquer alocação por chamada — ler a
+// string inteira, copiá-la em minúsculas — consome o tempo do agente e
+// o impede de responder, e o sintoma é uma sessão que trava sem erro.
+//
+// A comparação é feita sobre os caracteres, sem montar string e sem
+// chamar funções nativas de dentro do gancho: chamar uma NativeFunction
+// dentro do gancho reentra no motor do agente e derruba a sessão.
+//
+// Os marcadores reduzidos a um needle cada cobrem a lista completa.
+var MARKER_NEEDLES = ['frida', 'gum-js', 'linjector', 'libloader'];
+
+var MARKER_BYTES = [];
+
+function initMarkerTables() {
+    MARKER_BYTES = [];
+    for (var m = 0; m < MARKER_NEEDLES.length; m++) {
+        var needle = MARKER_NEEDLES[m];
+        var bytes = [];
+        for (var i = 0; i < needle.length; i++) {
+            bytes.push(needle.charCodeAt(i));
+        }
+        MARKER_BYTES.push(bytes);
+    }
+}
+
+// Procura um marcador numa string, sem alocar uma cópia em minúsculas.
+function containsMarkerInString(str) {
+    var len = str.length;
+    if (len > MAX_SCAN_CHARS) { len = MAX_SCAN_CHARS; }
+    for (var k = 0; k < MARKER_BYTES.length; k++) {
+        var marker = MARKER_BYTES[k];
+        var limit = len - marker.length;
+        for (var i = 0; i <= limit; i++) {
+            var match = true;
+            for (var j = 0; j < marker.length; j++) {
+                var c = str.charCodeAt(i + j);
+                if (c >= 65 && c <= 90) { c += 32; } // A-Z -> a-z
+                if (c !== marker[j]) { match = false; break; }
+            }
+            if (match) { return true; }
+        }
+    }
+    return false;
+}
+
+// Lê a string terminada em NUL apontada e procura um marcador.
+//
+// A leitura para no terminador: ler um tamanho fixo a partir do ponteiro
+// pode passar do fim da página mapeada e derrubar o processo.
+function containsMarkerAt(ptr) {
+    if (ptr === null || ptr === undefined) { return false; }
+    try {
+        var str = ptr.readCString();
+        if (str === null || str.length === 0) { return false; }
+        return containsMarkerInString(str);
+    } catch (e) {
+        return false;
+    }
+}
+
+// ----------------------------------------------------------------------
+// 1) Native — libc.so: strstr
+// ----------------------------------------------------------------------
+//
+// Apenas strstr é hookado. strcmp e memcmp são chamados dezenas de
+// milhares de vezes por segundo pelo runtime do app e pelo motor
+// JavaScript do próprio agente: um gancho nesses pontos consome o
+// tempo do agente de instrumentação, que deixa de responder — o
+// sintoma é uma sessão que trava sem erro.
+//
+// A comparação de nomes exatos continua coberta em outro nível: o nome
+// do agente é ofuscado no memfd, no /proc e no nome das threads, e a
+// camada Java esconde a presença dos frameworks de hooking.
 function hookLibcStringHooks() {
-    var names = ['strstr', 'strcmp', 'memcmp'];
+    var names = ['strstr'];
     names.forEach(function (name) {
         try {
             var addr = raspilotFindExport('libc.so', name);
@@ -86,43 +168,15 @@ function hookLibcStringHooks() {
                 onEnter: function (args) {
                     this._hide = false;
                     try {
-                        if (name === 'strstr') {
-                            var haystack = args[0].readCString();
-                            var needle = args[1].readCString();
-                            if (looksLikeFrida(needle) || looksLikeFrida(haystack)) {
-                                this._hide = true;
-                            }
-                        } else if (name === 'strcmp') {
-                            if (looksLikeFrida(args[0].readCString()) ||
-                                looksLikeFrida(args[1].readCString())) {
-                                this._hide = true;
-                            }
-                        } else if (name === 'memcmp') {
-                            var n = args[2].toInt32();
-                            if (n > 0 && n < 4096) {
-                                var buf = args[0].readByteArray(n);
-                                if (buf !== null) {
-                                    var s = '';
-                                    var bytes = new Uint8Array(buf);
-                                    for (var i = 0; i < bytes.length; i++) {
-                                        var c = bytes[i];
-                                        s += (c >= 32 && c < 127)
-                                            ? String.fromCharCode(c)
-                                            : String.fromCharCode(32);
-                                    }
-                                    if (looksLikeFrida(s)) { this._hide = true; }
-                                }
-                            }
+                        if (containsMarkerAt(args[0]) ||
+                                containsMarkerAt(args[1])) {
+                            this._hide = true;
                         }
                     } catch (e) { /* best-effort */ }
                 },
                 onLeave: function (retval) {
                     if (!this._hide) { return; }
-                    if (name === 'strstr') {
-                        retval.replace(ptr(0)); // não encontrado
-                    } else if (name === 'strcmp' || name === 'memcmp') {
-                        retval.replace(ptr(1)); // "diferente"
-                    }
+                    retval.replace(ptr(0)); // não encontrado
                 }
             });
             report('libc.' + name + ' hookado');
@@ -315,29 +369,6 @@ function isSelfPid(pid) {
     }
 }
 
-// Números de syscall de sinal por arquitetura. O alvo pode chamá-los
-// direto, por dentro do wrapper syscall(), para não passar pelos
-// ganchos de libc.
-//
-// Os índices são relativos aos argumentos da chamada, sem contar o
-// número do syscall: selfIndex aponta o alvo e sigIndex o sinal.
-var SIGNAL_SYSCALLS = {
-    arm64: [
-        { nr: 129, selfIndex: 0, sigIndex: 1, name: 'kill' },
-        { nr: 130, selfIndex: 0, sigIndex: 1, name: 'tkill' },
-        { nr: 131, selfIndex: 0, sigIndex: 2, name: 'tgkill' },
-        { nr: 307, selfIndex: 0, sigIndex: 1, name: 'rt_sigqueueinfo' },
-        { nr: 314, selfIndex: 0, sigIndex: 2, name: 'rt_tgsigqueueinfo' }
-    ],
-    x64: [
-        { nr: 62, selfIndex: 0, sigIndex: 1, name: 'kill' },
-        { nr: 200, selfIndex: 0, sigIndex: 1, name: 'tkill' },
-        { nr: 234, selfIndex: 0, sigIndex: 2, name: 'tgkill' },
-        { nr: 307, selfIndex: 0, sigIndex: 1, name: 'rt_sigqueueinfo' },
-        { nr: 314, selfIndex: 0, sigIndex: 2, name: 'rt_tgsigqueueinfo' }
-    ]
-};
-
 function hookSelfTermination() {
     // raise(sig): o app sinaliza a si mesmo.
     //
@@ -426,52 +457,37 @@ function hookSelfTermination() {
         report('falha ao substituir abort: ' + e);
     }
 
-    hookRawSignalSyscalls();
-}
-
-// Chamadas diretas a syscall() para entrega de sinal.
-//
-// Um alvo que quer evitar os ganchos de libc chama a syscall direto.
-// É por isso que a neutralização do sinal de parada precisa existir
-// também nesse caminho: sem ele, o processo inteiro (e a thread do
-// agente de instrumentação) congela sem que nada seja registrado.
-//
-// A substituição repassa os argumentos com 64 bits, preservando o
-// retorno de syscalls que devolvem ponteiros.
-function hookRawSignalSyscalls() {
-    var specs = SIGNAL_SYSCALLS[Process.arch];
-    if (!specs) { return; }
+    // exit()/_exit(): o app pode encerrar o processo por conta própria
+    // depois de identificar a instrumentação — System.exit e
+    // Runtime.exit chegam aqui. Sem neutralizar, a janela de observação
+    // termina antes de produzir sinal algum.
     try {
-        var addr = raspilotFindExport('libc.so', 'syscall');
-        if (addr === null) { return; }
-        var orig = new NativeFunction(addr, 'long',
-            ['long', 'long', 'long', 'long', 'long', 'long', 'long']);
-        var callback = new NativeCallback(function (nr, a1, a2, a3, a4, a5, a6) {
-            try {
-                var n = nr | 0;
-                for (var i = 0; i < specs.length; i++) {
-                    var spec = specs[i];
-                    if (spec.nr !== n) { continue; }
-                    // O número do syscall é o primeiro argumento; os
-                    // demais são os do sinal, conforme a chamada.
-                    var callArgs = [a1, a2, a3, a4, a5, a6];
-                    var target = callArgs[spec.selfIndex] | 0;
-                    var sig = callArgs[spec.sigIndex] | 0;
-                    if (SELF_SIGNALS[sig] !== undefined && isSelfPid(target)) {
-                        reportNeutralized('auto-destruição neutralizada: syscall(' +
-                               spec.name + ', ' + signalName(sig) + ')');
-                        return 0;
-                    }
-                    break;
-                }
-            } catch (e) { /* best-effort */ }
-            return orig(nr, a1, a2, a3, a4, a5, a6);
-        }, 'long', ['long', 'long', 'long', 'long', 'long', 'long', 'long']);
-        Interceptor.replace(addr, callback);
-        report('libc.syscall substituído (auto-destruição)');
+        var exitAddr = raspilotFindExport('libc.so', 'exit');
+        if (exitAddr !== null) {
+            var origExit = new NativeFunction(exitAddr, 'void', ['int']);
+            Interceptor.replace(exitAddr, new NativeCallback(function (code) {
+                // A saída não é entregue: o app continua vivo até o fim
+                // da janela de observação. O gancho é removido no fim
+                // da execução, e o encerramento normal volta a valer.
+                reportNeutralized('auto-destruição neutralizada: exit(' + code + ')');
+            }, 'void', ['int']));
+            report('libc.exit substituído (auto-destruição)');
+        }
     } catch (e) {
-        report('falha ao substituir syscall: ' + e);
+        report('falha ao substituir exit: ' + e);
     }
+
+    // A entrega de sinal por syscall direta não é interceptada.
+    //
+    // Substituir a função syscall() significa que toda chamada de
+    // syscall do processo passa pelo gancho — e o gancho é executado
+    // pelo agente de instrumentação. Quando o agente está ocupado (por
+    // exemplo, carregando a camada Java), a thread que chamou a
+    // syscall fica esperando o agente, e o app trava esperando a
+    // thread: a sessão inteira para de responder sem erro nenhum.
+    //
+    // O custo de manter a sessão viva é maior do que o de cobrir esse
+    // caminho, que exige do alvo uma montagem de syscall na mão.
 }
 
 // ----------------------------------------------------------------------
@@ -486,6 +502,7 @@ var RASPILOT_JAVA_ONLY = (typeof __RASPILOT_JAVA_ONLY__ !== 'undefined')
     : false;
 
 function main() {
+    initMarkerTables();
     hookLibcStringHooks();
     hookConnectPorts();
     hookSelfTermination();

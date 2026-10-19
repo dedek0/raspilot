@@ -142,7 +142,7 @@ class TestAttemptBypass:
                                           "message": "OkHttp CertificatePinner.check bypass (api.x.com)"}},
             {"type": "send", "payload": {"type": "ssl-bypass-host", "host": "api.x.com"}},
         ])
-        with mock.patch("checks.ssl_pinning.time.sleep"):
+        with mock.patch("checks.ssl_pinning.OBSERVATION_POLL_INTERVAL", 0.0):
             res = SSLPinningCheck(dm).attempt_bypass("com.app")
         assert res["success"] is True
         assert res["intercepted_hosts"] == ["api.x.com"]
@@ -154,7 +154,7 @@ class TestAttemptBypass:
             {"type": "send", "payload": {"type": "ssl-bypass",
                                           "message": "OkHttp CertificatePinner.check(String, List) hookado"}},
         ])
-        with mock.patch("checks.ssl_pinning.time.sleep"):
+        with mock.patch("checks.ssl_pinning.OBSERVATION_POLL_INTERVAL", 0.0):
             res = SSLPinningCheck(dm).attempt_bypass("com.app")
         assert res["success"] is False
 
@@ -173,7 +173,7 @@ class TestAttemptBypass:
             {"type": "send", "payload": {"type": "app-kill",
                                           "message": "System.exit(1) <- com.x.Security.kill"}},
         ])
-        with mock.patch("checks.ssl_pinning.time.sleep"):
+        with mock.patch("checks.ssl_pinning.OBSERVATION_POLL_INTERVAL", 0.0):
             res = SSLPinningCheck(dm).attempt_bypass("com.app")
         assert any(log.startswith("app-kill:") for log in res["bypass_logs"])
         assert res["success"] is False
@@ -188,7 +188,7 @@ class TestAttemptBypass:
             "evidence": [], "signal": None,
             "summary": "sem registro externo (SIGKILL externo ou exit_group direto)",
         }
-        with mock.patch("checks.ssl_pinning.time.sleep"):
+        with mock.patch("checks.ssl_pinning.OBSERVATION_POLL_INTERVAL", 0.0):
             res = SSLPinningCheck(dm).attempt_bypass("com.app", window=3)
         assert res["app_alive_at_end"] is False
         assert res["death_cause"]["signal"] is None
@@ -298,7 +298,7 @@ class TestRunAll:
                                           "message": "CertificatePinner.check bypass (api.x.com)"}},
             {"type": "send", "payload": {"type": "ssl-bypass-host", "host": "api.x.com"}},
         ])
-        with mock.patch("checks.ssl_pinning.time.sleep"):
+        with mock.patch("checks.ssl_pinning.OBSERVATION_POLL_INTERVAL", 0.0):
             res = SSLPinningCheck(dm).run_all("com.app", apk_path=apk)
         assert res["pinning_detected"] is True
         assert res["pinning_type"] == "okhttp"
@@ -331,11 +331,38 @@ class TestReliability:
         ])
         dm.last_spawn_pid = 42
         dm.is_app_alive.return_value = True
-        with mock.patch("checks.ssl_pinning.time.sleep"):
+        with mock.patch("checks.ssl_pinning.OBSERVATION_POLL_INTERVAL", 0.0):
             res = SSLPinningCheck(dm).attempt_bypass("com.app", window=2)
         assert res["success"] is False
         assert res["evidence_strength"] == "config_only"
         assert res["effective_logs"]
+
+    def test_bypass_never_exercised_is_inconclusive(self):
+        """Bypass instalado e nunca exercitado não é "resistiu ao bypass".
+
+        Sem uma requisição TLS observada, o pinning não chegou a ser
+        testado: a conclusão honesta é inconclusivo.
+        """
+        dm = mock.MagicMock()
+        dm.spawn_app.return_value = TestAttemptBypass._FakeSession([
+            {"type": "send", "payload": {
+                "type": "ssl-bypass",
+                "message": "libssl.so: SSL_get_verify_result -> X509_V_OK",
+            }},
+        ])
+        dm.last_spawn_pid = 42
+        dm.is_app_alive.return_value = True
+        with mock.patch("checks.ssl_pinning.OBSERVATION_POLL_INTERVAL", 0.0), \
+             mock.patch.object(
+                 SSLPinningCheck, "detect_pinning",
+                 return_value={
+                     "pinning_detected": True, "type": "okhttp",
+                     "evidence": ["[okhttp] classe okhttp3.CertificatePinner"],
+                 },
+             ):
+            res = SSLPinningCheck(dm).run_all("com.app", window=2)
+        assert res["bypass_successful"] is None
+        assert "não exercido" in res["bypass_skipped_reason"]
 
     def test_success_requires_alive_app_and_host(self):
         """Host interceptado com app morto não é sucesso."""
@@ -348,7 +375,7 @@ class TestReliability:
         dm.capture_death_cause.return_value = {
             "evidence": [], "signal": "SIGKILL", "summary": "SIGKILL",
         }
-        with mock.patch("checks.ssl_pinning.time.sleep"):
+        with mock.patch("checks.ssl_pinning.OBSERVATION_POLL_INTERVAL", 0.0):
             res = SSLPinningCheck(dm).attempt_bypass("com.app", window=2)
         assert res["success"] is False
         assert res["intercepted_hosts"] == ["api.x.com"]
@@ -364,7 +391,7 @@ class TestReliability:
         dm.logcat_since.return_value = [
             "10-16 10:00:00.000 42 42 E com.app: SSLHandshakeException: pinning",
         ]
-        with mock.patch("checks.ssl_pinning.time.sleep"):
+        with mock.patch("checks.ssl_pinning.OBSERVATION_POLL_INTERVAL", 0.0):
             res = SSLPinningCheck(dm).attempt_bypass("com.app", window=2)
         assert res["success"] is True
         assert res["logcat"]["tls_errors"]

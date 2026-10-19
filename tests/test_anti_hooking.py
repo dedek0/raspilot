@@ -307,7 +307,7 @@ class TestAppDetection:
     def test_app_without_protection_not_detected(self):
         """Sem mensagens => detected=False, lists vazias."""
         check = AntiHookingCheck(mock.MagicMock())
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_hook_detection_in_app(FakeSession())
         assert res["detected"] is False
         assert res["detection_methods_found"] == []
@@ -319,7 +319,7 @@ class TestAppDetection:
         session = FakeSession(detection_messages=[
             _det("Class.forName", "de.robv.android.xposed.XposedBridge"),
         ])
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_hook_detection_in_app(session)
         assert res["detected"] is True
         assert any("Class.forName" in s for s in res["strong_signals"])
@@ -330,7 +330,7 @@ class TestAppDetection:
         session = FakeSession(detection_messages=[
             _det("maps_scan", "/proc/self/maps via open"),
         ])
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_hook_detection_in_app(session)
         assert res["detected"] is False
         assert res["weak_signals"]
@@ -343,7 +343,7 @@ class TestAppDetection:
             _det("net_scan", "/proc/net/tcp via open"),
             _det("comm_scan", "/proc/self/task/1/comm via open"),
         ])
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_hook_detection_in_app(session)
         assert res["detected"] is False
         assert len(res["weak_signals"]) == 2
@@ -355,7 +355,7 @@ class TestAppDetection:
             _det("status_scan", "/proc/self/status via open"),
             _det("native_strstr", "needle=frida"),
         ])
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_hook_detection_in_app(session)
         assert res["detected"] is True
         assert res["weak_signals"] and res["strong_signals"]
@@ -367,7 +367,7 @@ class TestAppDetection:
             {"type": "send", "payload": {"type": "raspilot-hooking-bypass",
                                          "message": "neutralizado: x -> null"}},
         ])
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_hook_detection_in_app(session)
         assert res["detected"] is False
         assert res["detection_methods_found"] == []
@@ -379,7 +379,7 @@ class TestAppDetection:
             {"type": "send", "payload": {"type": "hook-detection-error",
                                          "message": "instalação de strstr falhou"}},
         ])
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_hook_detection_in_app(session)
         assert res["detected"] is False
         assert res["detection_methods_found"] == []
@@ -394,7 +394,7 @@ class TestAppDetection:
             "summary": "morte registrada em logcat",
         }
         check = AntiHookingCheck(dm)
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_hook_detection_in_app(
                 FakeSession(), window=3, pid=99, package_name="com.app"
             )
@@ -412,7 +412,7 @@ class TestAppDetection:
             {"type": "send", "payload": {"type": "app-kill",
                                           "message": "System.exit(1) <- com.x.Security.kill"}},
         ])
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_hook_detection_in_app(session)
         assert res["detected"] is True
         assert any("app_kill" in s for s in res["strong_signals"])
@@ -454,7 +454,7 @@ class TestAttemptBypass:
         ])
         dm.last_spawn_pid = 42
         dm.is_app_alive.return_value = True
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = AntiHookingCheck(dm).attempt_bypass("com.app")
         assert res["success"] is True
         assert res["effective_logs"]
@@ -468,7 +468,7 @@ class TestAttemptBypass:
         ])
         dm.last_spawn_pid = 42
         dm.is_app_alive.return_value = True
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = AntiHookingCheck(dm).attempt_bypass("com.app")
         assert res["success"] is False
         assert res["effective_logs"] == []
@@ -481,7 +481,7 @@ class TestAttemptBypass:
         ])
         dm.last_spawn_pid = 42
         dm.is_app_alive.return_value = False
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = AntiHookingCheck(dm).attempt_bypass("com.app", window=3)
         assert res["success"] is False
         assert res["app_alive_at_end"] is False
@@ -547,7 +547,7 @@ class TestRunAll:
         """Sem sinal estático nem dinâmico => sem bypass, sem error."""
         apk = _make_apk(str(tmp_path / "clean.apk"), {"classes.dex": b"plain"})
         dm = self._mock_dm()
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = AntiHookingCheck(dm).run_all("com.app", apk_path=apk)
         assert res["protection_detected"] is False
         assert res["bypass_successful"] is None
@@ -563,7 +563,7 @@ class TestRunAll:
         dm = self._mock_dm(session=FakeSession(bypass_messages=[
             _bypass("neutralizado: Class.forName('de.robv.android.xposed.XposedBridge') -> null"),
         ]))
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = AntiHookingCheck(dm).run_all("com.app", apk_path=apk)
         assert res["protection_detected"] is True
         assert res["bypass_successful"] is True
@@ -576,7 +576,7 @@ class TestRunAll:
             detection_messages=[_det("Class.forName", "org.lsposed.XposedBridge")],
             bypass_messages=[_bypass("libc.strstr hookado")],
         ))
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = AntiHookingCheck(dm).run_all("com.app", apk_path=apk)
         assert res["protection_detected"] is True
         assert res["bypass_successful"] is False
@@ -587,7 +587,7 @@ class TestRunAll:
         dm = self._mock_dm(session=FakeSession(
             detection_messages=[_det("maps_scan", "/proc/self/maps via open")],
         ))
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = AntiHookingCheck(dm).run_all("com.app", apk_path=apk)
         assert res["protection_detected"] is False
         assert res["bypass_successful"] is None
@@ -604,7 +604,7 @@ class TestRunAll:
         })
         dm = self._mock_dm()
         dm.spawn_app.side_effect = [FakeSession(), RuntimeError("spawn falhou")]
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = AntiHookingCheck(dm).run_all("com.app", apk_path=apk)
         assert res["protection_detected"] is True
         assert res["bypass_successful"] is None
@@ -615,7 +615,7 @@ class TestRunAll:
         apk = _make_apk(str(tmp_path / "clean.apk"), {"classes.dex": b"plain"})
         dm = self._mock_dm()
         dm.spawn_app.side_effect = RuntimeError("spawn falhou")
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = AntiHookingCheck(dm).run_all("com.app", apk_path=apk)
         assert res["protection_detected"] is False
         assert "spawn falhou" in res["error"]
@@ -629,7 +629,7 @@ class TestRunAll:
             "ok": True, "rc": 0,
             "stdout": "package:org.lsposed.manager\n", "stderr": "",
         }
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = AntiHookingCheck(dm).run_all("com.app", apk_path=apk)
         assert res["hook_frameworks_present"] is True
         assert res["checks"]["hook_framework_packages"]["detected"] is True
@@ -637,7 +637,7 @@ class TestRunAll:
     def test_timestamp_present(self, tmp_path):
         """O resultado consolidado carrega timestamp ISO8601."""
         apk = _make_apk(str(tmp_path / "clean.apk"), {"classes.dex": b"plain"})
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = AntiHookingCheck(self._mock_dm()).run_all("com.app", apk_path=apk)
         assert res["timestamp"]
         assert "T" in res["timestamp"]
@@ -654,7 +654,7 @@ class TestLogcatCorrelation:
             "10-16 10:00:00.000 42 42 I com.app: detected xposed framework",
         ]
         check = AntiHookingCheck(dm)
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_hook_detection_in_app(
                 FakeSession(), window=2, pid=42, package_name="com.app",
                 logcat_mark=0,
@@ -674,7 +674,7 @@ class TestLogcatCorrelation:
         ]
         dm.baseline = {"available": True, "alive_at_end": True}
         check = AntiHookingCheck(dm)
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_hook_detection_in_app(
                 FakeSession(), window=2, pid=42, package_name="com.app",
                 logcat_mark=0,
@@ -695,7 +695,7 @@ class TestLogcatCorrelation:
         ]
         dm.baseline = {"available": True, "alive_at_end": False}
         check = AntiHookingCheck(dm)
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_hook_detection_in_app(
                 FakeSession(), window=2, pid=42, package_name="com.app",
                 logcat_mark=0,

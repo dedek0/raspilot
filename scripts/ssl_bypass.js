@@ -179,6 +179,13 @@ function hookAllOverloads(cls, methodName, impl) {
 // 1) Java — X509TrustManager (checkServerTrusted / checkClientTrusted)
 // ----------------------------------------------------------------------
 function registerNoopTrustManager(TrustManager) {
+    // A classe é gerada em um arquivo temporário dentro do diretório de
+    // cache da bridge. O diretório é aplicado aqui, no momento do uso:
+    // a bridge redefine o valor quando se inicializa, e isso pode
+    // acontecer depois de o script ter sido carregado.
+    if (typeof raspilotApplyJavaCacheDir === 'function') {
+        raspilotApplyJavaCacheDir();
+    }
     // Forma 1: a bridge resolve os overloads da interface automaticamente.
     try {
         var cls = Java.registerClass({
@@ -343,6 +350,12 @@ function hookTrustManager() {
 // 2) Java — HostnameVerifier
 // ----------------------------------------------------------------------
 function registerAllowAllVerifier() {
+    // O diretório de cache é aplicado no momento do uso: a bridge
+    // redefine o valor quando se inicializa, e isso pode acontecer
+    // depois de o script ter sido carregado.
+    if (typeof raspilotApplyJavaCacheDir === 'function') {
+        raspilotApplyJavaCacheDir();
+    }
     // Forma 1: classloader padrão.
     try {
         var Verifier = Java.use('javax.net.ssl.HostnameVerifier');

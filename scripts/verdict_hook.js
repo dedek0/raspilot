@@ -163,11 +163,24 @@ function hookKnownVendors() {
     return total;
 }
 
+// Agenda a instalação: varrer classes exige o runtime Java pronto, e
+// fazer isso durante o carregamento do script bloqueia o load (e o
+// agente descarta o script ao atingir o limite).
+function schedule(fn, label) {
+    if (typeof raspilotDeferJava === 'function') {
+        raspilotDeferJava(fn, label);
+        return;
+    }
+    fn();
+}
+
 function main() {
     report('verdict_hook.js carregado');
-    var known = hookKnownVendors();
-    var swept = sweepLoadedClasses();
-    report('verdict_hook pronto: ' + (known + swept) + ' método(s)');
+    schedule(function () {
+        var known = hookKnownVendors();
+        var swept = sweepLoadedClasses();
+        report('verdict_hook pronto: ' + (known + swept) + ' método(s)');
+    }, 'verdict-hook');
 }
 
 main();

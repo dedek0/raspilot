@@ -92,6 +92,62 @@ rpc.exports = {
 COMPAT_PRELUDE = """
 'use strict';
 
+// Aplica o diretório de cache da bridge Java.
+//
+// A bridge grava as classes que cria em um arquivo temporário dentro do
+// diretório de cache. O padrão da bridge é um diretório que o processo
+// do app não pode gravar — e o registro da classe falha com "No such
+// file or directory". Aplicar o diretório do próprio app resolve.
+//
+// A helper fica disponível para todos os scripts: ela é chamada no
+// momento do uso, e não no carregamento, porque a bridge define o
+// diretório quando se inicializa — o que pode acontecer depois de o
+// script ter sido carregado.
+function raspilotApplyJavaCacheDir() {
+    try {
+        if (typeof Java === 'undefined' || !Java.available) { return null; }
+        if (typeof Java.classFactory === 'undefined') { return null; }
+
+        var pkg = (typeof __RASPILOT_PACKAGE_NAME__ !== 'undefined')
+            ? __RASPILOT_PACKAGE_NAME__
+            : '';
+
+        var dir = null;
+        try {
+            var AT = Java.use('android.app.ActivityThread');
+            var app = AT.currentApplication();
+            if (app !== null) {
+                try {
+                    var d = app.getCodeCacheDir();
+                    if (d !== null) { dir = d.getCanonicalPath(); }
+                } catch (e) { /* sem code_cache */ }
+                if (dir === null) {
+                    try {
+                        var f = app.getFilesDir();
+                        if (f !== null) { dir = f.getCanonicalPath(); }
+                    } catch (e) { /* sem files dir */ }
+                }
+            }
+        } catch (e) { /* sem ActivityThread */ }
+
+        // O app ainda não foi criado (spawn muito cedo): o diretório de
+        // dados é derivado do package name, que pertence ao uid do app.
+        if (dir === null && pkg) {
+            dir = '/data/data/' + pkg + '/code_cache';
+        }
+        if (dir === null) { return null; }
+
+        Java.classFactory.cacheDir = dir;
+        Java.classFactory.codeCacheDir = dir;
+        try {
+            Java.classFactory.tempFileNaming = { prefix: 'opt', suffix: '' };
+        } catch (e) { /* best-effort */ }
+        return dir;
+    } catch (e) {
+        return null;
+    }
+}
+
 function raspilotFindExport(moduleName, exportName) {
     try {
         if (typeof Process !== 'undefined' && typeof Process.getModuleByName === 'function') {
@@ -213,75 +269,17 @@ JAVA_BOOTSTRAP = """
 // dex leva dezenas de segundos. Feito no topo do script, ele bloqueia o
 // carregamento e o agente descarta o script ao atingir o limite.
 setImmediate(function () {
-    if (typeof Java === 'undefined' || !Java.available) { return; }
-    if (typeof Java.classFactory === 'undefined') { return; }
+    if (typeof Java === 'undefined') { return; }
 
-    function applyDir(dir) {
-        if (!dir) { return false; }
-        try {
-            Java.classFactory.cacheDir = dir;
-            Java.classFactory.codeCacheDir = dir;
-            return true;
-        } catch (e) { return false; }
-    }
+    // O runtime Java pode não estar pronto ainda — logo após o resume
+    // isso é comum. A espera é repetida: desistir na primeira tentativa
+    // deixa o processo sem diretório de cache gravável, e o registro de
+    // classes falha.
+    var attempts = 0;
 
-    function currentApplication() {
-        try {
-            var AT = Java.use('android.app.ActivityThread');
-            var app = AT.currentApplication();
-            if (app !== null) { return app; }
-        } catch (e) { /* sem ActivityThread */ }
-        try {
-            var AG = Java.use('android.app.AppGlobals');
-            var app = AG.getInitialApplication();
-            if (app !== null) { return app; }
-        } catch (e) { /* sem AppGlobals */ }
-        return null;
-    }
-
-    function appCacheDir(app) {
-        if (app === null) { return null; }
-        try {
-            if ('getCodeCacheDir' in app) {
-                var d = app.getCodeCacheDir();
-                if (d !== null) { return d.getCanonicalPath(); }
-            }
-        } catch (e) { /* sem code_cache */ }
-        try {
-            var d = app.getFilesDir();
-            if (d !== null) { return d.getCanonicalPath(); }
-        } catch (e) { /* sem files dir */ }
-        return null;
-    }
-
-    var app = currentApplication();
-    var dir = appCacheDir(app);
-    if (dir === null) {
-        // O app ainda não foi criado (spawn muito cedo): deriva o diretório
-        // de dados do processo a partir do link simbólico do cwd, que
-        // pertence ao uid do app.
-        try {
-            var pid = Process.id;
-            var link = Memory.allocUtf8String('/proc/' + pid + '/cwd');
-            var buf = Memory.alloc(1024);
-            var rl = new NativeFunction(
-                Module.findGlobalExportByName('readlink'), 'pointer',
-                ['pointer', 'pointer', 'pointer'], { exceptions: 'propagate' });
-            var n = rl(link, buf, ptr(1024)).toInt32();
-            if (n > 0) {
-                var cwd = buf.readUtf8String(n);
-                var idx = cwd.lastIndexOf('/');
-                if (idx > 0) {
-                    dir = cwd.substring(0, idx) + '/code_cache';
-                }
-            }
-        } catch (e) { /* best-effort */ }
-    }
-
-    if (applyDir(dir)) {
-        try {
-            Java.classFactory.tempFileNaming = { prefix: 'opt', suffix: '' };
-        } catch (e) { /* best-effort */ }
+    function install() {
+        var dir = raspilotApplyJavaCacheDir();
+        if (dir === null) { return; }
         try {
             send({
                 type: 'raspilot-java-bootstrap',
@@ -289,6 +287,24 @@ setImmediate(function () {
             });
         } catch (e) { /* host indisponível */ }
     }
+
+    function attempt() {
+        if (attempts++ > 40) { return; }
+        if (!Java.available) {
+            setTimeout(attempt, 500);
+            return;
+        }
+        // A aplicação do diretório é adiada para dentro da camada Java:
+        // a bridge define o diretório quando se inicializa, e isso
+        // acontece depois deste ponto.
+        if (typeof raspilotDeferJava === 'function') {
+            raspilotDeferJava(install, 'java-bootstrap');
+        } else {
+            install();
+        }
+    }
+
+    attempt();
 });
 """
 

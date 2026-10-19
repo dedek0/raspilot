@@ -40,6 +40,21 @@ DEFAULT_ADB_TIMEOUT = 20
 # Timeout para o dispositivo ficar em estado 'device' após `adb connect`.
 CONNECT_TIMEOUT = 15
 
+# Intervalo entre as tentativas de conexão.
+CONNECT_RETRY_INTERVAL = 1.0
+
+# Intervalo entre as consultas de pid durante o baseline.
+BASELINE_POLL_INTERVAL = 1.0
+
+# Tempo máximo de espera pelo app alvo ficar em foco antes de carregar a
+# camada Java. É um limite de paciência, não uma garantia: um app lento
+# (splash longo) pode demorar mais, e forçar o prazo aqui só adia o
+# carregamento da bridge, que já tem o próprio timeout.
+APP_READY_TIMEOUT = 8.0
+
+# Intervalo entre as consultas de foco do app alvo.
+APP_READY_POLL = 0.5
+
 # Stealth do frida-server: porta não-padrão + nome de binário opaco.
 # Apps com anti-frida varrem /proc/net/tcp pelas portas 27042/27043
 # (:69A2/:69A3) e o `ps`/paths pelo nome 'frida-server' — evitar esses
@@ -299,7 +314,7 @@ class DeviceManager:
             serials = self._list_devices()
             if not serials:
                 last_state = "nenhum dispositivo"
-                time.sleep(1)
+                time.sleep(CONNECT_RETRY_INTERVAL)
                 continue
 
             # Escolhe o dispositivo: o explicitado ou o primeiro disponível.
@@ -317,7 +332,7 @@ class DeviceManager:
                 )
             last_state = state
             logger.debug("Aguardando estado 'device' (atual: %s)", state)
-            time.sleep(1)
+            time.sleep(CONNECT_RETRY_INTERVAL)
 
         available = ", ".join(f"{s}={st}" for s, st in serials) or "nenhum"
         raise DeviceConnectionError(
@@ -510,7 +525,7 @@ class DeviceManager:
                 if res.get("ok") and value.isdigit():
                     pid = int(value)
                     break
-                time.sleep(1)
+                time.sleep(BASELINE_POLL_INTERVAL)
 
             if pid is None:
                 result["reason"] = "app não iniciou (sem pid)"
@@ -520,7 +535,7 @@ class DeviceManager:
             result["pid"] = pid
             died_after: Optional[int] = None
             for elapsed in range(max(1, int(window))):
-                time.sleep(1)
+                time.sleep(BASELINE_POLL_INTERVAL)
                 if not self.is_app_alive(pid):
                     died_after = elapsed + 1
                     break
@@ -1158,6 +1173,61 @@ class DeviceManager:
         if self.last_spawn_package in (None, package_name):
             return self.last_spawn_pid
         return None
+
+    def wait_for_app_ready(
+        self,
+        package_name: str,
+        timeout: Optional[float] = None,
+        poll: float = APP_READY_POLL,
+        pid: Optional[int] = None,
+    ) -> bool:
+        """Aguarda o app alvo ter uma activity em foco.
+
+        A bridge Java do Frida resolve a classe do app pelo class loader
+        da aplicação, que só existe depois que o processo cria o
+        ``Application``. Enquanto isso não acontece, a bridge fica em
+        espera ativa — e a espera bloqueia a thread de JavaScript do
+        agente, o que faz o carregamento do script estourar o limite do
+        agente e ser descartado no meio.
+
+        A espera é uma otimização, não um pré-requisito: ela é
+        interrompida assim que o app entra em foco, assim que o processo
+        morre (ele nunca mais vai entrar em foco) e assim que o prazo
+        acaba. O carregamento da bridge tem timeout próprio e continua
+        mesmo sem a espera.
+
+        Args:
+            package_name: Package name do app alvo.
+            timeout: Tempo máximo de espera em segundos. ``None`` usa
+                :data:`APP_READY_TIMEOUT`.
+            poll: Intervalo entre as consultas.
+            pid: PID do processo alvo, quando conhecido. Permite encerrar
+                a espera assim que o processo morre.
+
+        Returns:
+            True se o app ficou em foco dentro do tempo limite.
+        """
+        limit = APP_READY_TIMEOUT if timeout is None else max(0.0, timeout)
+        deadline = time.monotonic() + limit
+        while True:
+            try:
+                out = self.run_shell(
+                    "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'",
+                    timeout=8,
+                ).get("stdout", "")
+                if package_name in out:
+                    return True
+            except Exception:
+                logger.debug("Falha ao consultar a activity em foco", exc_info=True)
+
+            # O app já morreu: ele não vai chegar a ficar em foco, e
+            # insistir só consome a janela de observação.
+            if pid is not None and not self.is_app_alive(pid):
+                return False
+
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(poll)
 
     def is_app_alive(self, pid: int) -> bool:
         """Verifica se um processo continua em execução no dispositivo.

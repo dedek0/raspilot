@@ -33,6 +33,12 @@ if TYPE_CHECKING:  # evita import circular em tempo de importação
     from device_manager import DeviceManager
 
 logger = logging.getLogger("raspilot.checks.ssl_pinning")
+
+# Intervalo entre as consultas feitas durante a janela de observacao.
+# Exposto como constante para que os testes nao dependam de esperar
+# tempo real.
+OBSERVATION_POLL_INTERVAL = 1.0
+
 console = Console()
 
 # Caminho do script de bypass relativo à raiz do projeto.
@@ -134,6 +140,7 @@ class SSLPinningCheck:
             "__RASPILOT_FRIDA_PORT__": str(port),
             "__RASPILOT_FRIDA_PORT_HEX__": f"{port:04X}",
             "__RASPILOT_JAVA_ONLY__": "true" if java_only else "false",
+            "__RASPILOT_PACKAGE_NAME__": getattr(self.dm, "last_spawn_package", None) or "",
         }
 
     # ------------------------------------------------------------------
@@ -345,7 +352,7 @@ class SSLPinningCheck:
                 except Exception:
                     logger.debug("kill_trace.js indisponível no bypass SSL", exc_info=True)
             for elapsed in range(max(1, int(window))):
-                time.sleep(1)
+                time.sleep(OBSERVATION_POLL_INTERVAL)
                 if pid is not None and not self.dm.is_app_alive(pid):
                     died_after = elapsed + 1
                     logger.info(
@@ -570,13 +577,25 @@ class SSLPinningCheck:
             else self.attempt_bypass(package_name, window=window)
         )
         bypass_error = bypass.get("error") if not bypass.get("success") else None
+        # A força da evidência separa "o bypass venceu" de "o bypass foi
+        # instalado mas nunca exercido". Sem uma requisição TLS
+        # observada, o pinning não chegou a ser testado: afirmar que
+        # resistiu seria uma conclusão sem base.
+        strength = bypass.get("evidence_strength")
+        not_exercised = (
+            not bypass.get("success")
+            and bypass_error is None
+            and strength == "config_only"
+        )
         result = {
             "pinning_detected": True,
             "pinning_type": detection.get("type", "none"),
             # Sem bypass avaliado o resultado é desconhecido, e não
             # "resistiu ao bypass": o pinning detectado continua valendo.
             "bypass_successful": (
-                None if bypass_error else bool(bypass.get("success"))
+                None
+                if (bypass_error or not_exercised)
+                else bool(bypass.get("success"))
             ),
             "evidence": detection.get("evidence", []),
             "bypass_details": bypass,
@@ -585,4 +604,9 @@ class SSLPinningCheck:
         }
         if bypass_error:
             result["bypass_skipped_reason"] = f"bypass: {bypass_error}"
+        elif not_exercised:
+            result["bypass_skipped_reason"] = (
+                "bypass não exercido: nenhuma requisição TLS observada "
+                "durante a janela"
+            )
         return result

@@ -117,7 +117,7 @@ class TestHookingVerdict:
         dm.is_app_alive.return_value = True
         dm.logcat_since.return_value = lines
         check = AntiHookingCheck(dm)
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             return check.check_hook_detection_in_app(
                 mock.MagicMock(), window=2, pid=PID, package_name=PKG,
                 logcat_mark=0,
@@ -144,7 +144,7 @@ class TestBypassEvidence:
         dm.logcat_since.return_value = []
         dm.baseline = None
         check = AntiHookingCheck(dm)
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             return check.attempt_bypass("com.example.app", window=1)
 
     def test_hook_installed_alone_is_not_evidence(self, monkeypatch):
@@ -189,7 +189,7 @@ class TestBypassEvidence:
         dm.logcat_since.return_value = []
         dm.baseline = None
         check = mod.AntiHookingCheck(dm)
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.attempt_bypass("com.example.app", window=1)
         assert res["bypass_logs"], "os logs do script devem ser coletados"
         assert res["effective_logs"] == []
@@ -233,7 +233,7 @@ class TestBypassEvidence:
         dm.logcat_since.return_value = []
         dm.baseline = None
         check = mod.AntiHookingCheck(dm)
-        with mock.patch("checks.anti_hooking.time.sleep"):
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.attempt_bypass("com.example.app", window=1)
         assert res["effective_logs"], "a checagem exercitada é evidência"
         assert res["success"] is True
@@ -273,3 +273,26 @@ class TestAgentCrashIsNotProtection:
         )
         assert hooking["detected"] is False
         assert hooking["weak_signals"], "o crash do agente é contexto"
+
+
+class TestVendorSignalScope:
+    """Sinal de vendor só vale quando a linha pertence ao alvo."""
+
+    def test_system_line_mentioning_a_vendor_is_not_a_detection(self):
+        """Linha de serviço do sistema não é reação do app."""
+        analysis = analyze_logcat(
+            ["10-19 16:56:26.430 27799 27799 D BoundBrokerSvc: onUnbind: "
+             "Intent { act=com.google.android.gms.safetynet.service.START "
+             "pkg=com.google.android.gms }"],
+            PKG, PID,
+        )
+        assert analysis["vendor_signals"] == []
+        assert analysis["has_rasp_evidence"] is False
+
+    def test_vendor_line_in_the_target_process_is_a_detection(self):
+        """O mesmo log, vindo do processo alvo, é reação do app."""
+        analysis = analyze_logcat(
+            [_line("SecShell", "integrity check failed")], PKG, PID
+        )
+        assert analysis["vendor_signals"]
+        assert analysis["has_rasp_evidence"] is True

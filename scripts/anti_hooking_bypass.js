@@ -390,8 +390,19 @@ function hookStackTrace() {
 }
 
 // ----------------------------------------------------------------------
-// 5) Native — libc: strstr / strcmp / strcasestr / memcmp
+// 5) Native — libc: strstr / strcasestr / memcmp
 // ----------------------------------------------------------------------
+//
+// strcmp é deixado de fora de propósito: ele é chamado dezenas de
+// milhares de vezes por segundo pelo runtime do app e pelo motor
+// JavaScript do próprio agente. Um gancho nesse ponto consome o tempo
+// do agente de instrumentação, que deixa de responder — e o sintoma é
+// uma sessão que trava sem erro.
+//
+// A comparação de nomes exatos continua coberta em outro nível: a
+// camada Java devolve "classe inexistente" para os frameworks de
+// hooking, e o /proc do processo não mostra nenhum deles.
+
 // Busca por palavra-chave diretamente nos bytes do buffer.
 //
 // Evita materializar a string caractere a caractere: em função muito
@@ -399,14 +410,24 @@ function hookStackTrace() {
 function bytesContainKeyword(buffer, keywords) {
     if (buffer === null || buffer === undefined) { return false; }
     var bytes = new Uint8Array(buffer);
-    var chunk = new Array(bytes.length);
+    var lower = [];
     for (var i = 0; i < bytes.length; i++) {
         var c = bytes[i];
-        chunk[i] = (c >= 65 && c <= 90) ? (c + 32) : c;
+        lower[i] = (c >= 65 && c <= 90) ? (c + 32) : c;
     }
-    var text = String.fromCharCode.apply(null, chunk);
     for (var k = 0; k < keywords.length; k++) {
-        if (text.indexOf(keywords[k]) !== -1) { return true; }
+        var needle = keywords[k];
+        var limit = lower.length - needle.length;
+        for (var p = 0; p <= limit; p++) {
+            var match = true;
+            for (var j = 0; j < needle.length; j++) {
+                if (lower[p + j] !== needle.charCodeAt(j)) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) { return true; }
+        }
     }
     return false;
 }
@@ -422,7 +443,7 @@ function containsKeyword(cstr, keywords) {
 }
 
 function hookLibcStringHooks() {
-    ['strstr', 'strcmp', 'strcasestr'].forEach(function (name) {
+    ['strstr', 'strcasestr'].forEach(function (name) {
         try {
             var addr = raspilotFindExport('libc.so', name);
             if (addr === null) { return; }
@@ -434,22 +455,15 @@ function hookLibcStringHooks() {
                         // needle — é o nome que o app procura. Esconder
                         // o haystack quebraria buscas legítimas do app
                         // por um termo qualquer.
-                        var a = args[0].readCString();
                         var b = args[1].readCString();
-                        var hit = (name === 'strstr' || name === 'strcasestr')
-                            ? containsKeyword(b, HOOK_KEYWORDS)
-                            : (containsKeyword(a, HOOK_KEYWORDS) ||
-                               containsKeyword(b, HOOK_KEYWORDS));
-                        if (hit) { this._hide = true; }
+                        if (containsKeyword(b, HOOK_KEYWORDS)) {
+                            this._hide = true;
+                        }
                     } catch (e) { /* best-effort */ }
                 },
                 onLeave: function (retval) {
                     if (!this._hide) { return; }
-                    if (name === 'strstr' || name === 'strcasestr') {
-                        retval.replace(ptr(0)); // não encontrado
-                    } else {
-                        retval.replace(ptr(1)); // "diferente"
-                    }
+                    retval.replace(ptr(0)); // não encontrado
                     reportEvidence('neutralizado: libc.' + name + ' -> string de framework oculta');
                 }
             });
@@ -470,7 +484,7 @@ function hookLibcStringHooks() {
                         // Buffers grandes são o caso comum (comparação de
                         // blocos inteiros) e não é neles que mora o nome
                         // de um framework.
-                        if (n > 0 && n <= 512) {
+                        if (n > 0 && n <= 64) {
                             if (bytesContainKeyword(args[0].readByteArray(n), HOOK_KEYWORDS) ||
                                     bytesContainKeyword(args[1].readByteArray(n), HOOK_KEYWORDS)) {
                                 this._hide = true;

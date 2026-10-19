@@ -68,7 +68,7 @@ def test_combined_observation_runs_one_session():
     dm.baseline = None
     session = _Session()
     resumed = []
-    with mock.patch("checks.combined.time.sleep"):
+    with mock.patch("checks.combined.OBSERVATION_POLL_INTERVAL", 0.0):
         frida, hooking = run_combined_observation(
             dm, session, 42, "com.example.app", 1, 0,
             on_resume=lambda: resumed.append(True),
@@ -89,7 +89,7 @@ def test_combined_observation_no_java():
     dm.logcat_since.return_value = []
     dm.baseline = None
     session = _Session()
-    with mock.patch("checks.combined.time.sleep"):
+    with mock.patch("checks.combined.OBSERVATION_POLL_INTERVAL", 0.0):
         frida, hooking = run_combined_observation(
             dm, session, 42, "com.example.app", 1, 0,
             on_resume=lambda: None, no_java=True,
@@ -107,7 +107,7 @@ def test_combined_observation_mode_detect_does_not_neutralize():
     dm.logcat_since.return_value = []
     dm.baseline = None
     session = _Session()
-    with mock.patch("checks.combined.time.sleep"):
+    with mock.patch("checks.combined.OBSERVATION_POLL_INTERVAL", 0.0):
         run_combined_observation(
             dm, session, 42, "com.example.app", 1, 0,
             on_resume=lambda: None, mode="detect",
@@ -122,7 +122,7 @@ def test_combined_observation_neutralizes_self_termination_in_bypass_mode():
     dm.logcat_since.return_value = []
     dm.baseline = None
     session = _Session()
-    with mock.patch("checks.combined.time.sleep"):
+    with mock.patch("checks.combined.OBSERVATION_POLL_INTERVAL", 0.0):
         run_combined_observation(
             dm, session, 42, "com.example.app", 1, 0,
             on_resume=lambda: None, mode="bypass",
@@ -151,7 +151,7 @@ def test_combined_bypass_reuses_one_spawn():
     dm.is_app_alive.return_value = True
     dm.logcat_since.return_value = []
     dm.baseline = None
-    with mock.patch("checks.combined.time.sleep"):
+    with mock.patch("checks.combined.OBSERVATION_POLL_INTERVAL", 0.0):
         hooking, ssl = run_combined_bypass(
             dm, "com.example.app", 1, mode="bypass"
         )
@@ -170,7 +170,7 @@ def test_combined_bypass_loads_java_layers_in_one_script():
     dm.is_app_alive.return_value = True
     dm.logcat_since.return_value = []
     dm.baseline = None
-    with mock.patch("checks.combined.time.sleep"):
+    with mock.patch("checks.combined.OBSERVATION_POLL_INTERVAL", 0.0):
         run_combined_bypass(dm, "com.example.app", 1, mode="bypass")
     # uma única compilação da bridge
     java_sources = _java_sources(dm.spawn_app.return_value)
@@ -178,3 +178,20 @@ def test_combined_bypass_loads_java_layers_in_one_script():
     # e as três camadas Java presentes no mesmo script
     assert "CertificatePinner" in java_sources[0]
     assert "kill-trace" in java_sources[0]
+
+
+def test_combined_bypass_includes_the_verdict_hook_in_the_bundle():
+    """O hook de veredito compartilha o bundle: bridge compilada uma vez."""
+    dm = mock.MagicMock()
+    dm.spawn_app.return_value = _Session()
+    dm.last_spawn_pid = 42
+    dm.is_app_alive.return_value = True
+    dm.logcat_since.return_value = []
+    dm.baseline = None
+    with mock.patch("checks.combined.OBSERVATION_POLL_INTERVAL", 0.0):
+        run_combined_bypass(dm, "com.example.app", 1, mode="bypass")
+    java_sources = _java_sources(dm.spawn_app.return_value)
+    assert len(java_sources) == 1
+    assert "VERDICT_METHODS" in java_sources[0]
+    # o catálogo do host substitui os placeholders do script
+    assert "__RASPILOT_VERDICT_METHODS__" not in java_sources[0]

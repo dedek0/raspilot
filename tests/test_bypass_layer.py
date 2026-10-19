@@ -109,11 +109,77 @@ class TestHookingBypassSemantics:
         """Concatenar caractere a caractere trava o app."""
         source = _read("anti_hooking_bypass.js")
         assert "bytesContainKeyword" in source
-        assert "String.fromCharCode.apply" in source
+        # A comparação é feita sobre os bytes: nenhuma string é montada
+        # a partir do buffer.
+        assert "String.fromCharCode.apply" not in source
 
     def test_memcmp_skips_large_buffers(self):
         source = _read("anti_hooking_bypass.js")
-        assert "n <= 512" in source
+        # O limite é pequeno: comparar blocos inteiros é o caso comum
+        # e não é neles que mora o nome de um framework.
+        assert "n <= 64" in source
+
+    def test_hot_string_functions_are_not_hooked(self):
+        """strcmp é chamado dezenas de milhares de vezes por segundo.
+
+        Um gancho nesse ponto consome o tempo do agente de
+        instrumentação, que deixa de responder.
+        """
+        source = _read("anti_hooking_bypass.js")
+        hooked = source.split("function hookLibcStringHooks()")[1]
+        hooked = hooked.split("\n}")[0]
+        assert "'strcmp'" not in hooked
+
+    def test_no_global_syscall_replacement(self):
+        """Substituir syscall() trava a sessão.
+
+        Toda chamada de syscall do processo passaria pelo gancho, e o
+        agente ocupado não responde.
+        """
+        source = _read("anti_hooking_bypass.js")
+        assert "'syscall'" not in source
+
+
+class TestEvasionHotPath:
+    """Os ganchos precisam ser raros: o volume consome o agente."""
+
+    def test_hot_string_functions_are_not_hooked(self):
+        """strcmp e memcmp são chamados milhares de vezes por segundo.
+
+        Um gancho nesses pontos consome o tempo do agente de
+        instrumentação, que deixa de responder — e o sintoma é uma
+        sessão que trava sem erro.
+        """
+        source = _read("anti_frida_bypass.js")
+        hooked = source.split("function hookLibcStringHooks()")[1].split("\n}")[0]
+        assert "'strcmp'" not in hooked
+        assert "'memcmp'" not in hooked
+
+    def test_no_global_syscall_replacement(self):
+        """Substituir syscall() serializa o processo inteiro.
+
+        Toda chamada de syscall passa pelo gancho; com o agente
+        ocupado, a thread que chamou a syscall fica esperando e o app
+        trava esperando a thread.
+        """
+        source = _read("anti_frida_bypass.js")
+        assert "'syscall'" not in source
+
+    def test_marker_scan_does_not_build_strings(self):
+        """A verificação de marcador não monta string por chamada."""
+        source = _read("anti_frida_bypass.js")
+        assert "containsMarkerInString" in source
+        hooked = source.split("function hookLibcStringHooks()")[1].split("\n}")[0]
+        assert "toLowerCase" not in hooked
+
+    def test_marker_scan_stops_at_the_string_terminator(self):
+        """Ler um tamanho fixo a partir do ponteiro derruba o processo.
+
+        A string pode terminar exatamente no fim da página mapeada.
+        """
+        source = _read("anti_frida_bypass.js")
+        assert "readCString" in source
+        assert "readByteArray(MAX_SCAN" not in source
 
 
 class TestVendorCatalog:
@@ -161,6 +227,19 @@ class TestVerdictHookScript:
         assert os.path.isfile(
             os.path.join(SCRIPTS_DIR, "verdict_hook.js")
         )
+
+    def test_script_path_resolves(self):
+        """O caminho do script é resolvido a partir do módulo."""
+        from verdict_hook import VERDICT_HOOK_SCRIPT
+
+        assert os.path.isfile(VERDICT_HOOK_SCRIPT), (
+            f"script de veredito não encontrado: {VERDICT_HOOK_SCRIPT}"
+        )
+
+    def test_installation_is_deferred(self):
+        """A varredura de classes não pode bloquear o carregamento."""
+        source = _read("verdict_hook.js")
+        assert "raspilotDeferJava" in source
 
     def test_hooks_by_method_name(self):
         source = _read("verdict_hook.js")

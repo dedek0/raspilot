@@ -13,6 +13,7 @@ import pytest
 
 import checks.anti_frida as anti_frida_mod
 import checks.anti_hooking as anti_hooking_mod
+import checks.combined as combined_mod
 import checks.ssl_pinning as ssl_pinning_mod
 import main as mainmod
 from device_manager import DeviceManager
@@ -94,9 +95,10 @@ class FakeSession:
 @pytest.fixture
 def fast_windows():
     """Encurta as janelas de observação (sleeps) dos checks."""
-    with mock.patch.object(anti_frida_mod.time, "sleep"), \
-         mock.patch.object(anti_hooking_mod.time, "sleep"), \
-         mock.patch.object(ssl_pinning_mod.time, "sleep"):
+    with mock.patch.object(anti_frida_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
+         mock.patch.object(anti_hooking_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
+         mock.patch.object(ssl_pinning_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
+         mock.patch.object(combined_mod, "OBSERVATION_POLL_INTERVAL", 0.0):
         yield
 
 
@@ -111,7 +113,10 @@ def runtime_mocks():
          ), \
          mock.patch.object(DeviceManager, "logcat_mark", return_value=0), \
          mock.patch.object(DeviceManager, "logcat_since", return_value=[]), \
-         mock.patch.object(DeviceManager, "is_app_alive", return_value=True):
+         mock.patch.object(DeviceManager, "is_app_alive", return_value=True), \
+         mock.patch.object(
+             DeviceManager, "wait_for_app_ready", return_value=True
+         ):
         yield
 
 

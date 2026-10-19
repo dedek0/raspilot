@@ -26,7 +26,7 @@ from script_loader import load_script_file
 logger = logging.getLogger("raspilot.verdict_hook")
 
 SCRIPTS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"
+    os.path.dirname(os.path.abspath(__file__)), "scripts"
 )
 VERDICT_HOOK_SCRIPT = os.path.join(SCRIPTS_DIR, "verdict_hook.js")
 
@@ -88,6 +88,11 @@ def load_verdict_hook(
     load_timeout: float = 20.0,
 ) -> Optional[object]:
     """Carrega o script de hook de veredito na sessão.
+
+    Uso preferencial: incluir :data:`VERDICT_HOOK_SCRIPT` no mesmo
+    bundle Java das demais camadas, com
+    :func:`build_replacements` — assim a bridge Java é compilada uma
+    vez só. Esta função existe para cargas isoladas.
 
     Args:
         session: Sessão Frida ativa.

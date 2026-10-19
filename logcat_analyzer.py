@@ -130,7 +130,7 @@ LOW_CONFIDENCE_PATTERNS = {
 RASP_VENDOR_TAGS = tuple(
     list({token.lower() for token in all_tokens()})
     + [
-        "playintegrity", "play integrity", "safetynet", "appcheck",
+        "playintegrity", "play integrity", "appcheck",
         "cloudflare", "turnstile", "nucleus", "apk-protector",
     ]
 )
@@ -200,15 +200,24 @@ def _is_operator_framework_line(line: str) -> bool:
     return False
 
 
-def _vendor_signals(lines: List[str]) -> List[str]:
+def _vendor_signals(
+    lines: List[str],
+    package: Optional[str] = None,
+    pid: Optional[int] = None,
+) -> List[str]:
     """Localiza linhas de log de SDKs de RASP conhecidos.
 
     O log de um SDK de RASP costuma vir na tag do próprio SDK e não cita
-    o pacote do app — por isso a busca é feita por identificador de
-    vendor, sem exigir menção ao alvo.
+    o pacote do app — a associação é feita pelo pid do processo.
+
+    A linha precisa pertencer ao alvo: sem esse filtro, qualquer linha
+    do sistema que mencione o nome de um serviço (uma intent de
+    framework, por exemplo) seria contada como reação do app.
 
     Args:
         lines: Linhas do logcat.
+        package: Package name do app alvo.
+        pid: PID do processo alvo.
 
     Returns:
         Linhas que correspondem a um SDK de RASP conhecido.
@@ -217,6 +226,8 @@ def _vendor_signals(lines: List[str]) -> List[str]:
     for raw in lines or []:
         line = _clip(raw)
         if not line:
+            continue
+        if not _line_matches_target(line, package, pid):
             continue
         low = line.lower()
         for vendor in RASP_VENDOR_TAGS:
@@ -442,7 +453,7 @@ def analyze_logcat(
     context_signals = [
         s for s in security if s.get("confidence") != "high"
     ]
-    vendor_signals = _vendor_signals(lines)
+    vendor_signals = _vendor_signals(lines, package, pid)
     has_rasp_evidence = bool(rasp_signals) or bool(tls_errors) or bool(vendor_signals)
     agent_terminated = bool(categories.get("frida_agent_crash"))
 

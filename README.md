@@ -161,6 +161,11 @@ Semântica de status:
 > instalados no device e o crash do próprio agente de instrumentação são
 > contexto — nunca sustentam um veredito. Uma morte sem causa atribuível
 > resulta em inconclusivo, não em "o app detectou".
+>
+> O mesmo vale para o bypass: um bypass **instalado** mas nunca
+> **exercitado** (nenhuma requisição TLS observada, por exemplo) não
+> prova que a proteção resistiu — a etapa fica `SKIP`, com o motivo em
+> `skip_reason`.
 
 > **Importante:** o RASPilot **não modifica permanentemente** o dispositivo.
 > Ao final de cada execução ele encerra o `frida-server`, remove
@@ -351,6 +356,9 @@ vs contexto), a camada de bypass e o pipeline completo de ponta a ponta
 (com `DeviceManager` mockado). Nenhum dispositivo físico é necessário
 para os testes.
 
+Cada teste tem um teto de tempo: um teste que trava vira falha com o
+stack de todas as threads, em vez de segurar a máquina indefinidamente.
+
 Há também um **teste de device** para o bypass de SSL pinning, que exige
 aparelho conectado e um app instalado:
 
@@ -424,6 +432,22 @@ tentou fazer, e não uma detecção do app.
 **O logcat é evidência de apoio, não de veredito.** Termos genéricos
 (`root`, `hook`, `detected`) e logs de ferramentas do operador não
 sustentam nenhuma conclusão. Ver *Semântica de status*.
+
+**A evasão nativa só cobre pontos de baixo volume.** As funções de
+string da libc (`strcmp`, `memcmp`) são chamadas dezenas de milhares de
+vezes por segundo pelo runtime do app e pelo motor JavaScript do agente
+de instrumentação. Um gancho nesses pontos consome o tempo do agente,
+que deixa de responder — e o sintoma é uma sessão que trava sem erro.
+Por isso a camada nativa se concentra nas funções de baixo volume
+(`strstr`, `raise`, `kill`, `abort`, `exit`); a comparação exata de
+nomes continua coberta pela camada Java e pelo filtro de `/proc`.
+
+**As classes geradas pela camada Java dependem do diretório de cache.**
+A bridge grava a classe temporária em um diretório próprio; o padrão
+dela não é gravável pelo processo do app, e o registro falha. O
+diretório do app é aplicado no momento do uso — a bridge redefine o
+valor quando se inicializa, e isso pode acontecer depois do
+carregamento do script.
 
 ## Licença e uso
 
