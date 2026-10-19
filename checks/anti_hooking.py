@@ -33,10 +33,19 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from checks.apk_utils import pull_apk, scan_apk
+from logcat_analyzer import (
+    RASP_CATEGORIES,
+    analyze_since,
+    classify_failure,
+    format_detection_signals,
+    format_evidence,
+    get_logcat_mark,
+)
 from script_loader import (
     enumerate_module_names,
     load_script,
     load_script_file,
+    safe_detach,
     safe_unload,
 )
 
@@ -169,6 +178,12 @@ BYPASS_EVIDENCE_MARKERS = ("neutralizado", "bloqueado", "removido")
 HOOK_DETECTION_SCRIPT = """
 'use strict';
 
+// true = apenas hooks Java (após o resume); false = apenas nativos
+// (antes do resume, sem bridge Java, rápido).
+var RASPILOT_JAVA_ONLY = (typeof __RASPILOT_JAVA_ONLY__ !== 'undefined')
+    ? __RASPILOT_JAVA_ONLY__
+    : false;
+
 // Palavras-chave de frameworks de hooking que apps anti-hook procuram
 // (em classes, paths, comandos e buscas nativas).
 var HOOK_KEYWORDS = [
@@ -222,6 +237,7 @@ function observePath(api, path) {
 // ----------------------------------------------------------------------
 // Native — buscas por strings de frameworks (sem terminador garantido)
 // ----------------------------------------------------------------------
+if (!RASPILOT_JAVA_ONLY) {
 ['strstr', 'strcmp', 'strcasestr'].forEach(function (name) {
     try {
         var addr = raspilotFindExport('libc.so', name);
@@ -310,6 +326,8 @@ try {
         });
     } catch (e) { reportHookError('instalação de ' + name + ' falhou: ' + e); }
 });
+
+}
 
 // ----------------------------------------------------------------------
 // Java — checagens anti-hook clássicas
@@ -463,6 +481,24 @@ class AntiHookingCheck:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _frida_port(self) -> int:
+        """Retorna a porta real do frida-server configurada no host."""
+        value = getattr(self.dm, "frida_port", None)
+        return int(value) if isinstance(value, int) else 27999
+
+    def _script_replacements(self, java_only: bool = False) -> Dict[str, str]:
+        """Placeholders de configuração injetados nos scripts Frida."""
+        return {
+            "__RASPILOT_FRIDA_PORT__": str(self._frida_port()),
+            "__RASPILOT_FRIDA_PORT_HEX__": f"{self._frida_port():04X}",
+            "__RASPILOT_JAVA_ONLY__": "true" if java_only else "false",
+        }
+
+    def _baseline(self) -> Optional[dict]:
+        """Retorna o baseline somente se ele for um dict válido."""
+        value = getattr(self.dm, "baseline", None)
+        return value if isinstance(value, dict) else None
+
     def _shell(self, command: str, timeout: int = 20) -> dict:
         """Executa um comando shell e retorna a resposta estruturada.
 
@@ -755,6 +791,7 @@ class AntiHookingCheck:
         window: int = 12,
         pid: Optional[int] = None,
         package_name: Optional[str] = None,
+        logcat_mark: Optional[int] = None,
     ) -> dict:
         """Observa se o app alvo executa checagens anti-hook em runtime.
 
@@ -790,7 +827,9 @@ class AntiHookingCheck:
         strong: List[str] = []
         weak: List[str] = []
         script = None
+        java_script = None
         kill_script = None
+        java_load_error: Optional[str] = None
         resumed = False
         died_after: Optional[int] = None
 
@@ -825,20 +864,41 @@ class AntiHookingCheck:
                 logger.debug("Erro no script anti-hook: %s", message.get("description"))
 
         try:
+            # Fase 1 (antes do resume): hooks nativos, sem bridge Java.
             script = load_script(
                 session, HOOK_DETECTION_SCRIPT, on_message=on_message,
-                name="raspilot-hook-detect",
+                name="raspilot-hook-detect-native",
+                replacements=self._script_replacements(java_only=False),
+                with_java_bridge=False,
+                load_timeout=5.0,
             )
-            try:
-                kill_script = load_script_file(
-                    session, KILL_TRACE_SCRIPT, on_message=on_message,
-                    name="raspilot-kill-trace",
-                )
-            except Exception:
-                logger.warning("kill_trace.js indisponível", exc_info=True)
             if on_script_loaded is not None:
                 on_script_loaded()
                 resumed = True
+            # Fase 2 (após o resume): hooks Java, com o app rodando.
+            try:
+                java_script = load_script(
+                    session, HOOK_DETECTION_SCRIPT, on_message=on_message,
+                    name="raspilot-hook-detect-java",
+                    replacements=self._script_replacements(java_only=True),
+                    with_java_bridge=True,
+                    load_timeout=5.0,
+                )
+            except Exception as exc:
+                java_load_error = str(exc)
+                logger.warning(
+                    "Hooks Java anti-hook não carregaram: %s", exc
+                )
+                safe_detach(session)
+            if java_load_error is None:
+                # Diagnóstico de kill (usa Java) carregado por último.
+                try:
+                    kill_script = load_script_file(
+                        session, KILL_TRACE_SCRIPT, on_message=on_message,
+                        name="raspilot-kill-trace", load_timeout=3.0,
+                    )
+                except Exception:
+                    logger.debug("kill_trace.js indisponível na observação", exc_info=True)
             for elapsed in range(max(1, int(window))):
                 time.sleep(1)
                 if pid is not None and not self.dm.is_app_alive(pid):
@@ -849,17 +909,95 @@ class AntiHookingCheck:
                     break
         except Exception as exc:
             logger.warning("Falha ao observar checagens anti-hook no app", exc_info=True)
+            logcat = analyze_since(self.dm, logcat_mark, package_name, pid)
+            baseline = self._baseline()
+            failure = classify_failure(logcat, baseline)
+            death_cause = None
+            app_alive: Optional[bool] = None
+            if pid is not None:
+                try:
+                    app_alive = self.dm.is_app_alive(pid)
+                except Exception:
+                    app_alive = None
+            if app_alive is False:
+                try:
+                    death_cause = self.dm.capture_death_cause(
+                        pid=pid, package=package_name
+                    )
+                except Exception:
+                    logger.debug("Falha ao capturar morte na falha de script", exc_info=True)
+
+            if failure.get("is_rasp"):
+                for entry in format_detection_signals(
+                    logcat, ("root", "hooking", "emulator", "debug", "integrity"),
+                    limit=4,
+                ):
+                    method, _, detail = entry.partition(": ")
+                    add_signal(method, detail)
+                for item in logcat.get("security_signals", []) or []:
+                    if isinstance(item, dict) and item.get("category") == "frida_agent_crash":
+                        add_signal("frida_agent_crash", item.get("line", ""))
+                        break
+                add_signal(
+                    "app_terminated",
+                    "sessão encerrada durante o carregamento (reação do RASP)",
+                )
+                if death_cause:
+                    add_signal("app_kill_external", death_cause.get("summary", "?"))
+                return {
+                    "detected": True,
+                    "detection_methods_found": found,
+                    "strong_signals": strong,
+                    "weak_signals": weak,
+                    "app_alive_at_end": app_alive,
+                    "observed": True,
+                    "observation_status": "rasp_reaction",
+                    "death_cause": death_cause,
+                    "death_classification": "rasp_reaction",
+                    "baseline": baseline,
+                    "logcat": logcat,
+                    "logcat_evidence": format_evidence(logcat),
+                    "details": (
+                        "Sessão encerrada durante o carregamento com evidência de "
+                        "segurança no logcat — reação anti-hook"
+                    ),
+                }
+
+            kind = str(failure.get("kind", "unknown"))
+            status = "error" if kind in ("unknown", "unknown_death") else kind
+            if kind == "start_timeout":
+                error = (
+                    "app morto por ActivityManager start timeout enquanto o script "
+                    "era carregado (instrumentação); reduza o trabalho antes do resume"
+                )
+            elif kind == "baseline_death":
+                error = "app encerrou no baseline sem instrumentação; observação inconclusiva"
+            elif kind == "instrumentation_crash":
+                error = (
+                    "app encerrou por crash/ANR sem evidência de segurança no logcat "
+                    "(possível crash da instrumentação)"
+                )
+            else:
+                error = f"sessão encerrada antes da instalação dos hooks: {exc}"
             return {
                 "detected": False,
                 "detection_methods_found": [],
                 "strong_signals": [],
                 "weak_signals": [],
-                "app_alive_at_end": True,
-                "death_cause": None,
-                "error": str(exc),
+                "app_alive_at_end": app_alive,
+                "observed": False,
+                "observation_status": status,
+                "death_cause": death_cause,
+                "death_classification": kind,
+                "baseline": baseline,
+                "logcat": logcat,
+                "logcat_evidence": format_evidence(logcat),
+                "session_unsafe": True,
+                "error": error,
             }
         finally:
             safe_unload(script)
+            safe_unload(java_script)
             safe_unload(kill_script)
             if not resumed and on_script_loaded is not None:
                 # Garante que um spawn suspenso nunca fique travado.
@@ -868,20 +1006,94 @@ class AntiHookingCheck:
                 except Exception:
                     logger.debug("Falha no resume de emergência", exc_info=True)
 
+        logcat = analyze_since(self.dm, logcat_mark, package_name, pid)
+        baseline = self._baseline()
+        baseline_died = bool(
+            baseline and baseline.get("available") and baseline.get("alive_at_end") is False
+        )
+        if died_after is None and pid is not None:
+            try:
+                if not self.dm.is_app_alive(pid):
+                    died_after = max(1, int(window))
+                    logger.info("Processo %s morreu após a janela de observação", pid)
+            except Exception:
+                logger.debug("Falha na rechecagem de vida", exc_info=True)
+
+        # Evidências de segurança observadas apenas no logcat. TLS/Frida
+        # ficam de fora: são sintomas de pinning/anti-Frida, não de
+        # anti-hooking. Uma linha por categoria.
+        for entry in format_detection_signals(
+            logcat, ("root", "hooking", "emulator", "debug", "integrity"), limit=4
+        ):
+            method, _, detail = entry.partition(": ")
+            add_signal(method, detail)
+        if logcat.get("agent_terminated"):
+            for item in logcat.get("security_signals", []) or []:
+                if isinstance(item, dict) and item.get("category") == "frida_agent_crash":
+                    add_signal("frida_agent_crash", item.get("line", ""))
+                    break
+
         death_cause: Optional[dict] = None
+        death_classification: Optional[str] = None
+        observation_status = "ok"
+        error: Optional[str] = None
         app_alive = died_after is None
-        if not app_alive:
-            add_signal(
-                "app_terminated",
-                f"processo encerrou ~{died_after}s após resume (reação do RASP)",
+
+        if app_alive and java_load_error and not strong:
+            observation_status = "error"
+            error = (
+                "hooks Java de observação não carregaram e nenhuma checagem "
+                f"anti-hook foi observada: {java_load_error}"
             )
+
+        if not app_alive:
             try:
                 death_cause = self.dm.capture_death_cause(
                     pid=pid, package=package_name
                 )
-                add_signal("app_kill_external", death_cause.get("summary", "?"))
             except Exception:
                 logger.debug("Falha ao capturar causa da morte", exc_info=True)
+
+            logcat_death = logcat.get("death") or {}
+            logcat_rasp = any(
+                category in (logcat.get("categories") or {})
+                for category in RASP_CATEGORIES
+            )
+            kill_traced = any(item.startswith("app_kill") for item in strong)
+
+            if kill_traced:
+                death_classification = "rasp_kill"
+            elif baseline_died:
+                # Já morria sozinho no baseline: não é possível isolar uma
+                # reação anti-hook da instrumentação.
+                death_classification = "baseline_death"
+                observation_status = "baseline_death"
+                error = (
+                    "app encerrou no baseline sem instrumentação; não é possível "
+                    "isolar uma reação anti-hook"
+                )
+            elif logcat_rasp:
+                death_classification = "rasp_reaction"
+            elif logcat.get("available") and logcat_death.get("kind") in ("crash", "anr"):
+                # Crash/ANR sem evidência de segurança: provável crash da
+                # instrumentação, não reação anti-hook.
+                death_classification = "instrumentation_crash"
+                observation_status = "crashed"
+                error = (
+                    "app encerrou por crash/ANR sem evidência de segurança no logcat "
+                    "(possível crash da instrumentação)"
+                )
+            else:
+                death_classification = "unclassified_death"
+
+            if death_classification in ("rasp_kill", "rasp_reaction", "unclassified_death"):
+                add_signal(
+                    "app_terminated",
+                    f"processo encerrou ~{died_after}s após resume "
+                    f"({death_classification})",
+                )
+                if death_cause:
+                    add_signal("app_kill_external", death_cause.get("summary", "?"))
 
         detected = bool(strong)
         result = {
@@ -890,7 +1102,15 @@ class AntiHookingCheck:
             "strong_signals": strong,
             "weak_signals": weak,
             "app_alive_at_end": app_alive,
+            "observed": True,
+            "observation_status": observation_status,
             "death_cause": death_cause,
+            "death_classification": death_classification,
+            "baseline": baseline,
+            "logcat": logcat,
+            "logcat_evidence": format_evidence(logcat),
+            "java_load_error": java_load_error,
+            "session_unsafe": bool(java_load_error),
             "details": (
                 f"App executou checagens anti-hook: {'; '.join(strong)}"
                 if strong
@@ -902,9 +1122,11 @@ class AntiHookingCheck:
                 )
             ),
         }
+        if error:
+            result["error"] = error
         logger.info(
-            "check_hook_detection_in_app: detected=%s strong=%s weak=%s",
-            detected, len(strong), len(weak),
+            "check_hook_detection_in_app: detected=%s strong=%s weak=%s death=%s",
+            detected, len(strong), len(weak), death_classification,
         )
         return result
 
@@ -934,8 +1156,10 @@ class AntiHookingCheck:
         bypass_logs: List[str] = []
         session = None
         script = None
+        java_script = None
         proc_script = None
         kill_script = None
+        java_load_error: Optional[str] = None
         died_after: Optional[int] = None
 
         def on_message(message, data):  # noqa: ANN001 - assinatura frida
@@ -956,21 +1180,48 @@ class AntiHookingCheck:
                 if desc:
                     bypass_logs.append(f"[script-error] {desc}")
 
+        logcat_mark = get_logcat_mark(self.dm)
         try:
             # Spawn suspenso: instala os hooks ANTES do app rodar, para
             # não perder as checagens anti-hook da inicialização.
             session = self.dm.spawn_app(package_name, resume=False)
+            # Fase 1 (antes do resume): hooks nativos de bypass e filtro
+            # de /proc, sem bridge Java.
             script = load_script_file(
-                session, HOOK_BYPASS_SCRIPT, on_message=on_message
+                session, HOOK_BYPASS_SCRIPT, on_message=on_message,
+                replacements=self._script_replacements(java_only=False),
+                with_java_bridge=False,
+                load_timeout=5.0,
             )
             proc_script = load_script_file(
-                session, PROC_FILTER_SCRIPT, on_message=on_message
-            )
-            kill_script = load_script_file(
-                session, KILL_TRACE_SCRIPT, on_message=on_message
+                session, PROC_FILTER_SCRIPT, on_message=on_message,
+                replacements=self._script_replacements(java_only=False),
+                with_java_bridge=False,
+                load_timeout=5.0,
             )
             self.dm.resume_app()
             pid = self.dm.last_spawn_pid or self.dm.get_app_pid(package_name)
+            # Fase 2 (após o resume): hooks Java de bypass.
+            try:
+                java_script = load_script_file(
+                    session, HOOK_BYPASS_SCRIPT, on_message=on_message,
+                    replacements=self._script_replacements(java_only=True),
+                    with_java_bridge=True,
+                    load_timeout=5.0,
+                )
+            except Exception as exc:
+                java_load_error = str(exc)
+                logger.warning("Hooks Java do bypass não carregaram: %s", exc)
+                safe_detach(session)
+            if java_load_error is None:
+                # Diagnóstico de kill carregado por último.
+                try:
+                    kill_script = load_script_file(
+                        session, KILL_TRACE_SCRIPT, on_message=on_message,
+                        load_timeout=3.0,
+                    )
+                except Exception:
+                    logger.debug("kill_trace.js indisponível no bypass", exc_info=True)
             for elapsed in range(max(1, int(window))):
                 time.sleep(1)
                 if pid is not None and not self.dm.is_app_alive(pid):
@@ -982,23 +1233,78 @@ class AntiHookingCheck:
                     break
         except Exception as exc:
             logger.warning("Bypass anti-hook falhou", exc_info=True)
+            pid = locals().get("pid") or self.dm.last_spawn_pid
+            logcat = analyze_since(self.dm, logcat_mark, package_name, pid)
+            failure = classify_failure(logcat, self._baseline())
+            app_alive: Optional[bool] = None
+            death_cause = None
+            if pid is not None:
+                try:
+                    app_alive = self.dm.is_app_alive(pid)
+                except Exception:
+                    app_alive = None
+            if app_alive is False:
+                try:
+                    death_cause = self.dm.capture_death_cause(
+                        pid=pid, package=package_name
+                    )
+                except Exception:
+                    logger.debug("Falha ao capturar morte no bypass", exc_info=True)
+
+            if app_alive is False:
+                bypass_logs.append("app_terminated: processo morreu durante o bypass")
+                if death_cause:
+                    bypass_logs.append(
+                        "death_cause: " + str(death_cause.get("summary", "?"))
+                    )
+
+            # Reação do RASP durante o carregamento: a proteção resistiu
+            # (inclusive quando o agente foi derrubado e o app sobreviveu).
+            if failure.get("is_rasp"):
+                return {
+                    "success": False,
+                    "bypass_logs": bypass_logs,
+                    "effective_logs": [],
+                    "app_alive_at_end": False,
+                    "death_cause": death_cause,
+                    "logcat": logcat,
+                    "logcat_evidence": format_evidence(logcat),
+                    "error": None,
+                }
+
+            kind = str(failure.get("kind", "unknown"))
+            status = "error" if kind in ("unknown", "unknown_death") else kind
+            if kind == "start_timeout":
+                error = (
+                    "app morto por ActivityManager start timeout durante o bypass "
+                    "(instrumentação); reduza o trabalho antes do resume"
+                )
+            elif kind == "baseline_death":
+                error = "app encerrou no baseline sem instrumentação; bypass inconclusivo"
+            elif kind == "instrumentation_crash":
+                error = (
+                    "app encerrou por crash/ANR sem evidência de segurança no logcat "
+                    "(possível crash da instrumentação)"
+                )
+            else:
+                error = str(exc)
             return {
                 "success": False,
                 "bypass_logs": bypass_logs,
                 "effective_logs": [],
-                "app_alive_at_end": True,
-                "death_cause": None,
-                "error": str(exc),
+                "app_alive_at_end": app_alive if app_alive is not None else True,
+                "death_cause": death_cause,
+                "logcat": logcat,
+                "logcat_evidence": format_evidence(logcat),
+                "error": error,
             }
         finally:
             safe_unload(script)
+            safe_unload(java_script)
             safe_unload(proc_script)
             safe_unload(kill_script)
             if session is not None:
-                try:
-                    session.detach()
-                except Exception:
-                    logger.debug("Falha ao detach da sessão", exc_info=True)
+                safe_detach(session)
 
         if died_after is not None:
             bypass_logs.append(
@@ -1024,6 +1330,15 @@ class AntiHookingCheck:
         ]
         alive = died_after is None
         success = bool(effective) and alive
+        logcat = analyze_since(
+            self.dm, logcat_mark, package_name, locals().get("pid")
+        )
+        error: Optional[str] = None
+        if alive and java_load_error:
+            # Hooks Java são essenciais para o anti-hooking; neutralizar
+            # só a camada nativa não permite afirmar que o bypass venceu.
+            success = False
+            error = f"hooks Java do bypass não carregaram: {java_load_error}"
 
         result = {
             "success": success,
@@ -1031,7 +1346,10 @@ class AntiHookingCheck:
             "effective_logs": effective,
             "app_alive_at_end": alive,
             "death_cause": death_cause,
-            "error": None,
+            "logcat": logcat,
+            "logcat_evidence": format_evidence(logcat),
+            "java_load_error": java_load_error,
+            "error": error,
         }
         logger.info(
             "Bypass anti-hook: success=%s evidências=%s alive=%s",
@@ -1081,7 +1399,8 @@ class AntiHookingCheck:
         # Fase dinâmica: spawn suspenso + script de observação.
         session = None
         pid: Optional[int] = None
-        app_detection: dict
+        app_detection: dict = {}
+        logcat_mark = get_logcat_mark(self.dm)
         try:
             session = self.dm.spawn_app(package_name, resume=False)
             pid = self.dm.last_spawn_pid or self.dm.get_app_pid(package_name)
@@ -1104,15 +1423,23 @@ class AntiHookingCheck:
                     window=window,
                     pid=pid,
                     package_name=package_name,
+                    logcat_mark=logcat_mark,
                 )
             finally:
                 # App está vivo (ou morreu) — enumera libs de hooking do
-                # processo antes de soltar a sessão.
-                checks["hook_libraries"] = self.check_hook_libraries(session, pid=pid)
-                try:
-                    session.detach()
-                except Exception:
-                    logger.debug("Falha ao detach da sessão", exc_info=True)
+                # processo antes de soltar a sessão. Sessão degradada
+                # (timeout de bridge) pode travar a enumeração.
+                if app_detection.get("session_unsafe"):
+                    checks["hook_libraries"] = {
+                        "detected": False,
+                        "evidence": [],
+                        "source": None,
+                        "details": "enumeração pulada: sessão Frida degradada",
+                        "skipped": True,
+                    }
+                else:
+                    checks["hook_libraries"] = self.check_hook_libraries(session, pid=pid)
+                safe_detach(session)
 
         protection_detected = bool(static.get("static_detected")) or bool(
             app_detection.get("detected")

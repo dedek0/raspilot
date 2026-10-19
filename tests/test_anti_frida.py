@@ -290,3 +290,93 @@ class TestRunAll:
             res = check.run_all(session, pid=1234)
         assert res["vulnerable"] is False
         assert res["app_detection"]["detection_methods_found"]
+
+
+class TestObservationReliability:
+    """Correlação de erro/logcat/baseline no veredito anti-Frida."""
+
+    def test_observation_error_is_error_not_vulnerable(self):
+        """Falha ao carregar o script vira error inconclusivo, não FALHOU."""
+        class _BadSession:
+            def create_script(self, source, **kwargs):
+                raise RuntimeError("script load falhou")
+
+        check = AntiFridaCheck(mock.MagicMock())
+        with mock.patch("checks.anti_frida.time.sleep"):
+            res = check.check_frida_detection_in_app(_BadSession())
+        assert res["vulnerable"] is None
+        assert res["observation_status"] == "error"
+        assert "script load falhou" in res["error"]
+
+    def test_logcat_security_signal_marks_detection(self):
+        """Sinal de segurança no logcat conta como detecção mesmo sem hook."""
+        dm = mock.MagicMock()
+        dm.is_app_alive.return_value = True
+        dm.logcat_since.return_value = [
+            "10-16 10:00:00.000 1234 1234 I com.app: detected frida-server",
+        ]
+        check = AntiFridaCheck(dm)
+        session = FakeSession(messages=[])
+        with mock.patch("checks.anti_frida.time.sleep"):
+            res = check.check_frida_detection_in_app(
+                session, window=2, pid=1234, package_name="com.app", logcat_mark=0
+            )
+        assert res["vulnerable"] is False
+        assert any(s.startswith("logcat_frida") for s in res["detection_methods_found"])
+
+    def test_crash_without_security_is_inconclusive(self):
+        """Crash nativo sem evidência de segurança não vira proteção OK."""
+        dm = mock.MagicMock()
+        dm.is_app_alive.return_value = False
+        dm.capture_death_cause.return_value = {
+            "evidence": [], "signal": "SIGSEGV", "summary": "sinal fatal SIGSEGV",
+        }
+        dm.logcat_since.return_value = [
+            "10-16 10:00:00.000 1234 1234 F libc: Fatal signal 11 (SIGSEGV), pid 1234",
+        ]
+        dm.baseline = {"available": True, "alive_at_end": True}
+        check = AntiFridaCheck(dm)
+        with mock.patch("checks.anti_frida.time.sleep"):
+            res = check.check_frida_detection_in_app(
+                FakeSession(messages=[]), window=2, pid=1234,
+                package_name="com.app", logcat_mark=0,
+            )
+        assert res["vulnerable"] is None
+        assert res["observation_status"] == "crashed"
+        assert res["death_classification"] == "instrumentation_crash"
+
+    def test_baseline_death_is_not_rasp_detection(self):
+        """Morte que já ocorre no baseline não é reação ao Frida."""
+        dm = mock.MagicMock()
+        dm.is_app_alive.return_value = False
+        dm.capture_death_cause.return_value = {
+            "evidence": [], "signal": None, "summary": "sem registro externo",
+        }
+        dm.logcat_since.return_value = [
+            "10-16 10:00:00.000 1234 1234 I com.app: normal shutdown",
+        ]
+        dm.baseline = {"available": True, "alive_at_end": False}
+        check = AntiFridaCheck(dm)
+        with mock.patch("checks.anti_frida.time.sleep"):
+            res = check.check_frida_detection_in_app(
+                FakeSession(messages=[]), window=2, pid=1234,
+                package_name="com.app", logcat_mark=0,
+            )
+        assert res["death_classification"] == "baseline_death"
+        assert res["observation_status"] == "baseline_death"
+        assert res["vulnerable"] is None
+        assert res["error"]
+
+    def test_stealth_port_is_checked(self, fake_dm_factory):
+        """A porta stealth real (não só 27042/27043) é procurada."""
+        dm = fake_dm_factory(
+            {"netstat -tlnp": "tcp 0 0 127.0.0.1:27999 0.0.0.0:* LISTEN"}
+        )
+        dm.frida_port = 27999
+        res = AntiFridaCheck(dm).check_frida_ports()
+        assert res["detected"] is True
+        assert 27999 in res["ports_checked"]
+
+    def test_detection_script_has_port_placeholder(self):
+        """O script usa o placeholder para receber a porta real no load."""
+        assert "__RASPILOT_FRIDA_PORT__" in DETECTION_SCRIPT

@@ -128,3 +128,29 @@ class TestSafeUnload:
     def test_handles_none(self):
         """``None`` é um no-op."""
         script_loader.safe_unload(None)
+
+
+class TestScriptReplacements:
+    """Placeholders de configuração injetados antes da injeção."""
+
+    def test_render_script_replaces_placeholders(self):
+        """Placeholders __RASPILOT_*__ são trocados pelos valores reais."""
+        source = "var port = __RASPILOT_FRIDA_PORT__;"
+        rendered = script_loader.render_script(
+            source, {"__RASPILOT_FRIDA_PORT__": "27999"}
+        )
+        assert rendered == "var port = 27999;"
+
+    def test_load_script_applies_replacements(self):
+        """load_script resolve placeholders antes de create_script."""
+        fake_script = mock.MagicMock()
+        fake_session = mock.MagicMock()
+        fake_session.create_script.return_value = fake_script
+
+        script_loader.load_script(
+            fake_session,
+            "send(__RASPILOT_FRIDA_PORT__);",
+            replacements={"__RASPILOT_FRIDA_PORT__": "27999"},
+        )
+        prepared = fake_session.create_script.call_args[0][0]
+        assert prepared.endswith("send(27999);")

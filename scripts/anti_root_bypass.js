@@ -174,4 +174,4 @@ function main() {
     }
 }
 
-setImmediate(main);
+main();

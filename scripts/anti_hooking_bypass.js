@@ -26,6 +26,12 @@
 
 'use strict';
 
+// true = apenas hooks Java (após resume); false = apenas nativos
+// (antes do resume, sem bridge Java).
+var RASPILOT_JAVA_ONLY = (typeof __RASPILOT_JAVA_ONLY__ !== 'undefined')
+    ? __RASPILOT_JAVA_ONLY__
+    : false;
+
 // Strings que apps anti-hook procuram (frameworks + instrumentação).
 var HOOK_KEYWORDS = [
     'frida', 'xposed', 'lsposed', 'lspd', 'edxposed', 'substrate',
@@ -481,10 +487,12 @@ function hookAccessStatFamily() {
 // Bootstrap — idempotente
 // ----------------------------------------------------------------------
 function main() {
-    hookLibcStringHooks();
-    hookOpenFamily();
-    hookFopenFamily();
-    hookAccessStatFamily();
+    if (!RASPILOT_JAVA_ONLY) {
+        hookLibcStringHooks();
+        hookOpenFamily();
+        hookFopenFamily();
+        hookAccessStatFamily();
+    }
 
     var attachJava = function () {
         var ok = raspilotPerformJava(function () {
@@ -502,4 +510,4 @@ function main() {
     report('anti_hooking_bypass.js carregado');
 }
 
-setImmediate(main);
+main();

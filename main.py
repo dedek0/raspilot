@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
+import time
 from typing import Callable, List, Optional
 
 from rich.console import Console
@@ -36,6 +38,7 @@ from device_manager import (
     FridaSetupError,
 )
 from reporter import Reporter
+from script_loader import safe_detach
 
 # Console rich global — único ponto de saída visual do CLI.
 console = Console()
@@ -118,6 +121,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=15,
         metavar="SEG",
         help="Janela de observação em segundos nos checks dinâmicos",
+    )
+    parser.add_argument(
+        "--baseline-window",
+        type=int,
+        default=5,
+        metavar="SEG",
+        help="Janela do baseline sem instrumentação (detecta morte/crash naturais)",
+    )
+    parser.add_argument(
+        "--no-baseline",
+        action="store_true",
+        help="Não executa o baseline sem instrumentação antes dos checks dinâmicos",
     )
     parser.add_argument(
         "--version",
@@ -270,6 +285,13 @@ def run_pipeline(args: argparse.Namespace) -> int:
     dm.setup_frida_server()
     console.print("[green]✓[/] frida-server instalado, iniciado e validado")
 
+    # Captura contínua de logcat: fonte independente de evidência para
+    # correlação de mortes, crashes e mensagens de segurança.
+    if dm.start_logcat_capture():
+        logger.info("Captura de logcat ativa")
+    else:
+        logger.warning("Captura de logcat indisponível (seguindo sem ela)")
+
     # 3) Relatório.
     reporter = Reporter(
         device_info=info,
@@ -296,10 +318,35 @@ def run_pipeline(args: argparse.Namespace) -> int:
             skipped="anti_emulator" in args.skip,
         )
 
-        # 6) Spawn do app alvo (necessário para anti-frida e ssl).
+        # 6) Baseline sem instrumentação (antes de qualquer spawn Frida):
+        #    estabelece se o app já morre sozinho, evitando classificar
+        #    crash/lifecycle normal como reação do RASP.
+        dynamic = any(
+            check not in args.skip
+            for check in ("anti_frida", "anti_hooking", "ssl_pinning")
+        )
+        if dynamic and not args.no_baseline:
+            with console.status("[cyan]Executando baseline sem instrumentação...[/]"):
+                dm.baseline = dm.run_app_baseline(
+                    args.package, window=max(1, args.baseline_window)
+                )
+            if dm.baseline.get("available"):
+                console.print(
+                    f"[green]✓[/] Baseline: pid={dm.baseline.get('pid')} "
+                    f"vivo={dm.baseline.get('alive_at_end')} "
+                    f"morte={dm.baseline.get('death_cause', {}).get('summary') if dm.baseline.get('death_cause') else 'não'}"
+                )
+            else:
+                console.print(
+                    "[yellow]![/] Baseline indisponível "
+                    f"({dm.baseline.get('reason', 'sem pid')})"
+                )
+
+        # 7) Spawn do app alvo (necessário para anti-frida e ssl).
         #    Spawn SUSPENSO: os hooks anti-frida são instalados antes do
         #    código do app rodar (detecções de RASP costumam executar na
         #    inicialização); o resume acontece via callback do check.
+        frida_logcat_mark = dm.logcat_mark()
         if "anti_frida" not in args.skip or "ssl_pinning" not in args.skip:
             with console.status(f"[cyan]Spawning {args.package}...[/]"):
                 session = dm.spawn_app(args.package, resume=False)
@@ -314,6 +361,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 lambda: AntiFridaCheck(dm).run_all(
                     session, pid, on_script_loaded=dm.resume_app,
                     window=args.window,
+                    package_name=args.package,
+                    logcat_mark=frida_logcat_mark,
                 ),
                 skipped="anti_frida" in args.skip,
             )
@@ -340,13 +389,20 @@ def run_pipeline(args: argparse.Namespace) -> int:
     finally:
         # 10) Cleanup — nunca deixar resíduos no dispositivo.
         try:
+            dm.stop_logcat_capture()
+        except Exception:
+            logger.debug("Falha ao encerrar captura de logcat", exc_info=True)
+        try:
             dm.resume_app()  # idempotente: destrava spawn suspenso, se houver
-            if session is not None:
-                session.detach()
+            safe_detach(session)
         except Exception:
             logger.debug("Falha ao detach da sessão final", exc_info=True)
         try:
             dm.remove_frida_server()
+            dm.run_shell(f"am force-stop {args.package}", timeout=10)
+            # Alguns apps reiniciam um processo logo após o force-stop;
+            # uma segunda passada garante o encerramento.
+            time.sleep(1)
             dm.run_shell(f"am force-stop {args.package}", timeout=10)
         except Exception:
             logger.warning("Falha no cleanup final do dispositivo", exc_info=True)
@@ -374,6 +430,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     logger = logging.getLogger("raspilot")
     logger.debug("Args: %s", args)
+
+    # Garante cleanup (force-stop/remoção do frida-server) também quando
+    # o processo recebe SIGTERM (ex: timeout do shell/CI).
+    def _raise_interrupt(signum, frame):  # noqa: ANN001
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _raise_interrupt)
+    except (ValueError, OSError):
+        logger.debug("Não foi possível instalar handler de SIGTERM", exc_info=True)
 
     try:
         return run_pipeline(args)

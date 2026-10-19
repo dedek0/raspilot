@@ -116,12 +116,23 @@ function filterStatus(text) {
 }
 
 // Portas Frida em hex (uppercase) como aparecem em /proc/net/tcp(6).
+// Inclui as portas clássicas e a porta stealth configurada no host.
+var FRIDA_NET_PORTS = ['69A2', '69A3', '__RASPILOT_FRIDA_PORT_HEX__'];
+
 function filterNetTcp(text) {
     var lines = text.split('\n');
     var kept = [];
     var removed = 0;
     for (var i = 0; i < lines.length; i++) {
-        if (lines[i].indexOf(':69A2') !== -1 || lines[i].indexOf(':69A3') !== -1) {
+        var hide = false;
+        for (var p = 0; p < FRIDA_NET_PORTS.length; p++) {
+            var port = FRIDA_NET_PORTS[p];
+            if (port && lines[i].indexOf(':' + port) !== -1) {
+                hide = true;
+                break;
+            }
+        }
+        if (hide) {
             removed++;
             continue;
         }
@@ -328,4 +339,4 @@ function main() {
     report('proc_filter.js carregado');
 }
 
-setImmediate(main);
+main();

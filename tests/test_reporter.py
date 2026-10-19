@@ -243,3 +243,16 @@ class TestSave:
         """Pacotes exóticos viram slug seguro (pontos preservados)."""
         assert Reporter._slug("com.foo/bar baz") == "com.foo_bar_baz"
         assert Reporter._slug("///") == "app"
+
+
+def test_anti_frida_inconclusive_is_error():
+    """Resultado inconclusivo (vulnerable=None) vira ERROR, não OK."""
+    rep = Reporter(device_info=DEVICE, package_name="pkg")
+    rep.collect("anti_frida", {
+        "vulnerable": None,
+        "frida_present": True,
+        "app_detection": {"observation_status": "crashed"},
+    })
+    summary = rep.generate_json()["summary"]["anti_frida"]
+    assert summary["status"] == "ERROR"
+    assert summary["error"]

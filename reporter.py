@@ -105,7 +105,15 @@ class Reporter:
             )
 
         if check_name == "anti_frida":
-            vulnerable = bool(result.get("vulnerable"))
+            raw_vulnerable = result.get("vulnerable")
+            if raw_vulnerable is None:
+                # Observação inconclusiva (crash da instrumentação, morte no
+                # baseline, script que não carregou) não é OK nem FALHOU.
+                return "ERROR", {
+                    "error": result.get("error") or "observação inconclusiva",
+                    "frida_present": bool(result.get("frida_present")),
+                }
+            vulnerable = bool(raw_vulnerable)
             return (
                 "FALHOU" if vulnerable else "OK",
                 {

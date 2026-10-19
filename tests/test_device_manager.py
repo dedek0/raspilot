@@ -406,3 +406,116 @@ class TestFridaHelpers:
         with mock.patch.object(dm, "_require_frida", return_value=mock.MagicMock()), \
              mock.patch.object(dm, "_frida_device", side_effect=Exception("sumiu")):
             assert dm.get_app_pid("com.example.app") == 4242
+
+
+class TestLogcatCapture:
+    """Buffer/marcadores de logcat usados pelos checks."""
+
+    def test_mark_and_since(self):
+        """Marcador monotônico devolve apenas linhas posteriores."""
+        dm = DeviceManager()
+        dm._logcat_lines.extend(["a", "b", "c"])
+        dm._logcat_count = 3
+        dm._logcat_proc = object()  # captura ativa (sem fallback)
+        assert dm.logcat_mark() == 3
+        assert dm.logcat_since(1) == ["b", "c"]
+
+    def test_since_falls_back_to_snapshot(self):
+        """Sem captura ativa, usa snapshot `logcat -d -t`."""
+        dm = DeviceManager()
+        with mock.patch.object(
+            dm, "run_shell",
+            return_value={"ok": True, "rc": 0, "stdout": "line1\nline2", "stderr": ""},
+        ):
+            assert dm.logcat_since(0) == ["line1", "line2"]
+
+    def test_start_stop_is_tolerant_to_missing_adb(self):
+        """Sem adb a captura fica indisponível sem propagar exceção."""
+        dm = DeviceManager()
+        with mock.patch("device_manager.subprocess.Popen", side_effect=FileNotFoundError):
+            assert dm.start_logcat_capture() is False
+        dm.stop_logcat_capture()
+
+
+class TestBaseline:
+    """Baseline sem instrumentação."""
+
+    def test_unavailable_without_pid(self):
+        """Sem pid o baseline é explicitamente indisponível."""
+        dm = DeviceManager()
+        with mock.patch.object(dm, "run_shell", return_value={
+            "ok": True, "rc": 0, "stdout": "", "stderr": ""
+        }), mock.patch("device_manager.time.sleep"):
+            res = dm.run_app_baseline("com.app", window=2)
+        assert res["available"] is False
+        assert "reason" in res
+
+    def test_alive_baseline(self):
+        """App que sobrevive ao baseline é registrado como vivo."""
+        dm = DeviceManager()
+        calls = []
+
+        def fake_shell(command, timeout=20):
+            calls.append(command)
+            if "pidof" in command:
+                return {"ok": True, "rc": 0, "stdout": "1234", "stderr": ""}
+            return {"ok": True, "rc": 0, "stdout": "", "stderr": ""}
+
+        with mock.patch.object(dm, "run_shell", side_effect=fake_shell), \
+             mock.patch.object(dm, "is_app_alive", return_value=True), \
+             mock.patch("device_manager.time.sleep"):
+            res = dm.run_app_baseline("com.app", window=2)
+        assert res["available"] is True
+        assert res["pid"] == 1234
+        assert res["alive_at_end"] is True
+        assert any("force-stop" in c for c in calls)
+
+    def test_death_baseline_captures_cause(self):
+        """Morte no baseline captura causa e tempo aproximado."""
+        dm = DeviceManager()
+
+        def fake_shell(command, timeout=20):
+            if "pidof" in command:
+                return {"ok": True, "rc": 0, "stdout": "1234", "stderr": ""}
+            return {"ok": True, "rc": 0, "stdout": "", "stderr": ""}
+
+        with mock.patch.object(dm, "run_shell", side_effect=fake_shell), \
+             mock.patch.object(dm, "is_app_alive", return_value=False), \
+             mock.patch.object(dm, "capture_death_cause", return_value={
+                 "evidence": [], "signal": "SIGSEGV", "summary": "SIGSEGV"
+             }), \
+             mock.patch("device_manager.time.sleep"):
+            res = dm.run_app_baseline("com.app", window=2)
+        assert res["alive_at_end"] is False
+        assert res["died_after"] == 1
+        assert res["death_cause"]["signal"] == "SIGSEGV"
+
+
+class TestPidAndDeviceSelection:
+    """Robustez na resolução de PID/dispositivo."""
+
+    def test_get_app_pid_does_not_reuse_other_package(self):
+        """PID do último spawn de outro package não é reutilizado."""
+        dm = DeviceManager(device_id="SER1")
+        dm.last_spawn_pid = 4242
+        dm.last_spawn_package = "com.other"
+        with mock.patch.object(dm, "_require_frida", return_value=mock.MagicMock()), \
+             mock.patch.object(dm, "_frida_device", side_effect=Exception("sumiu")), \
+             mock.patch.object(dm, "run_shell", return_value={
+                 "ok": True, "rc": 0, "stdout": "", "stderr": ""
+             }):
+            assert dm.get_app_pid("com.example.app") is None
+
+    def test_frida_device_excludes_local(self):
+        """Dispositivo 'local' do host nunca é usado como alvo."""
+        local = mock.MagicMock()
+        local.type = "local"
+        manager = mock.MagicMock()
+        manager.enumerate_devices.return_value = [local]
+        manager.add_remote_device.side_effect = Exception("sem remote")
+        fake_frida = mock.MagicMock()
+        fake_frida.get_device_manager.return_value = manager
+        dm = DeviceManager()
+        with mock.patch.object(dm, "_require_frida", return_value=fake_frida):
+            with pytest.raises(FridaSetupError):
+                dm._frida_device()

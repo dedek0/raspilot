@@ -94,7 +94,21 @@ def fast_windows():
         yield
 
 
-def test_pipeline_end_to_end(tmp_path, fast_windows, capsys):
+@pytest.fixture
+def runtime_mocks():
+    """Isola baseline/logcat (sem adb real) nos testes de pipeline."""
+    with mock.patch.object(DeviceManager, "start_logcat_capture", return_value=True), \
+         mock.patch.object(DeviceManager, "stop_logcat_capture", return_value=None), \
+         mock.patch.object(
+             DeviceManager, "run_app_baseline",
+             return_value={"available": False, "reason": "mock"},
+         ), \
+         mock.patch.object(DeviceManager, "logcat_mark", return_value=0), \
+         mock.patch.object(DeviceManager, "logcat_since", return_value=[]):
+        yield
+
+
+def test_pipeline_end_to_end(tmp_path, fast_windows, runtime_mocks, capsys):
     """Pipeline completo: roda, gera relatórios e retorna 0."""
     detection = {
         "pinning_detected": True,
@@ -147,7 +161,7 @@ def test_pipeline_end_to_end(tmp_path, fast_windows, capsys):
     assert "RASPilot — Relatório de Auditoria RASP" in out
 
 
-def test_pipeline_skip_marks_skip(tmp_path, fast_windows):
+def test_pipeline_skip_marks_skip(tmp_path, fast_windows, runtime_mocks):
     """Checks pulados aparecem como SKIP no relatório."""
     with mock.patch.object(DeviceManager, "connect_adb", return_value=True), \
          mock.patch.object(DeviceManager, "get_device_info", return_value={
@@ -178,7 +192,7 @@ def test_pipeline_skip_marks_skip(tmp_path, fast_windows):
     assert doc["summary"]["ssl_pinning"]["status"] == "N/A"
 
 
-def test_pipeline_check_failure_does_not_abort(tmp_path, fast_windows):
+def test_pipeline_check_failure_does_not_abort(tmp_path, fast_windows, runtime_mocks):
     """Falha em um check marca ERROR e o pipeline continua."""
     with mock.patch.object(DeviceManager, "connect_adb", return_value=True), \
          mock.patch.object(DeviceManager, "get_device_info", return_value={

@@ -634,3 +634,66 @@ class TestRunAll:
             res = AntiHookingCheck(self._mock_dm()).run_all("com.app", apk_path=apk)
         assert res["timestamp"]
         assert "T" in res["timestamp"]
+
+
+class TestLogcatCorrelation:
+    """Correlação de logcat/baseline no anti-hooking."""
+
+    def test_logcat_security_signal_is_detection(self):
+        """Mensagem de segurança no logcat vira sinal forte."""
+        dm = mock.MagicMock()
+        dm.is_app_alive.return_value = True
+        dm.logcat_since.return_value = [
+            "10-16 10:00:00.000 42 42 I com.app: detected xposed framework",
+        ]
+        check = AntiHookingCheck(dm)
+        with mock.patch("checks.anti_hooking.time.sleep"):
+            res = check.check_hook_detection_in_app(
+                FakeSession(), window=2, pid=42, package_name="com.app",
+                logcat_mark=0,
+            )
+        assert res["detected"] is True
+        assert any(s.startswith("logcat_hooking") for s in res["strong_signals"])
+
+    def test_crash_without_security_is_inconclusive(self):
+        """Crash sem evidência de segurança não é reação anti-hook."""
+        dm = mock.MagicMock()
+        dm.is_app_alive.return_value = False
+        dm.capture_death_cause.return_value = {
+            "evidence": [], "signal": "SIGSEGV", "summary": "SIGSEGV",
+        }
+        dm.logcat_since.return_value = [
+            "10-16 10:00:00.000 42 42 F libc: Fatal signal 11 (SIGSEGV), pid 42",
+        ]
+        dm.baseline = {"available": True, "alive_at_end": True}
+        check = AntiHookingCheck(dm)
+        with mock.patch("checks.anti_hooking.time.sleep"):
+            res = check.check_hook_detection_in_app(
+                FakeSession(), window=2, pid=42, package_name="com.app",
+                logcat_mark=0,
+            )
+        assert res["observation_status"] == "crashed"
+        assert res["death_classification"] == "instrumentation_crash"
+        assert res["detected"] is False
+
+    def test_baseline_death_is_not_detection(self):
+        """Morte que também ocorre sem instrumentação não é anti-hook."""
+        dm = mock.MagicMock()
+        dm.is_app_alive.return_value = False
+        dm.capture_death_cause.return_value = {
+            "evidence": [], "signal": None, "summary": "sem registro",
+        }
+        dm.logcat_since.return_value = [
+            "10-16 10:00:00.000 42 42 I com.app: normal exit",
+        ]
+        dm.baseline = {"available": True, "alive_at_end": False}
+        check = AntiHookingCheck(dm)
+        with mock.patch("checks.anti_hooking.time.sleep"):
+            res = check.check_hook_detection_in_app(
+                FakeSession(), window=2, pid=42, package_name="com.app",
+                logcat_mark=0,
+            )
+        assert res["death_classification"] == "baseline_death"
+        assert res["observation_status"] == "baseline_death"
+        assert res["error"]
+        assert res["detected"] is False

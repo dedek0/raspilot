@@ -29,6 +29,12 @@ var FRIDA_PATHS = [
 
 var FRIDA_THREADS = ['gum-js-loop', 'gmain', 'pool-frida', 'frida'];
 
+// Porta stealth configurada no host (substituída antes da injeção).
+// O typeof mantém o script válido mesmo se o placeholder não for trocado.
+var RASPILOT_FRIDA_PORT = (typeof __RASPILOT_FRIDA_PORT__ !== 'undefined')
+    ? __RASPILOT_FRIDA_PORT__
+    : 27999;
+
 // Envia log para o host (visível em bypass_logs do relatório).
 function report(msg) {
     try {
@@ -116,11 +122,14 @@ function hookConnectPorts() {
                 try {
                     var sa = args[1];
                     var family = sa.readU16();
-                    if (family === 2) { // AF_INET
+                    // AF_INET (2) e AF_INET6 (10) usam o mesmo offset de
+                    // porta (network byte order) no início de sockaddr.
+                    if (family === 2 || family === 10) {
                         var port = (sa.add(2).readU8() << 8) | sa.add(3).readU8();
-                        if (port === 27042 || port === 27043) {
+                        if (port === 27042 || port === 27043 ||
+                            port === RASPILOT_FRIDA_PORT) {
                             this._block = true;
-                            report('connect(127.0.0.1:' + port + ') bloqueado');
+                            report('connect(porta ' + port + ') bloqueado');
                         }
                     }
                 } catch (e) { /* best-effort */ }
@@ -268,4 +277,4 @@ function main() {
     report('anti_frida_bypass.js carregado');
 }
 
-setImmediate(main);
+main();

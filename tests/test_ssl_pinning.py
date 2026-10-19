@@ -301,3 +301,68 @@ class TestRunAll:
         assert res["pinning_type"] == "okhttp"
         assert res["bypass_successful"] is True
         assert res["timestamp"]
+
+
+class TestReliability:
+    """Propagação de erro e rigor da evidência de bypass."""
+
+    def test_detection_error_is_propagated(self):
+        """Falha ao obter o APK vira ERROR, não N/A."""
+        dm = mock.MagicMock()
+        dm.run_shell.return_value = {
+            "ok": False, "rc": 1, "stdout": "", "stderr": "pull falhou"
+        }
+        res = SSLPinningCheck(dm).run_all("com.missing")
+        assert res["bypass_successful"] is None
+        assert "error" in res
+        dm.spawn_app.assert_not_called()
+
+    def test_config_only_logs_are_not_success(self):
+        """Log de configuração nativa sem host não comprova bypass."""
+        dm = mock.MagicMock()
+        dm.spawn_app.return_value = TestAttemptBypass._FakeSession([
+            {"type": "send", "payload": {
+                "type": "ssl-bypass",
+                "message": "libssl.so: SSL_get_verify_result -> X509_V_OK",
+            }},
+        ])
+        dm.last_spawn_pid = 42
+        dm.is_app_alive.return_value = True
+        with mock.patch("checks.ssl_pinning.time.sleep"):
+            res = SSLPinningCheck(dm).attempt_bypass("com.app", window=2)
+        assert res["success"] is False
+        assert res["evidence_strength"] == "config_only"
+        assert res["effective_logs"]
+
+    def test_success_requires_alive_app_and_host(self):
+        """Host interceptado com app morto não é sucesso."""
+        dm = mock.MagicMock()
+        dm.spawn_app.return_value = TestAttemptBypass._FakeSession([
+            {"type": "send", "payload": {"type": "ssl-bypass-host", "host": "api.x.com"}},
+        ])
+        dm.last_spawn_pid = 42
+        dm.is_app_alive.return_value = False
+        dm.capture_death_cause.return_value = {
+            "evidence": [], "signal": "SIGKILL", "summary": "SIGKILL",
+        }
+        with mock.patch("checks.ssl_pinning.time.sleep"):
+            res = SSLPinningCheck(dm).attempt_bypass("com.app", window=2)
+        assert res["success"] is False
+        assert res["intercepted_hosts"] == ["api.x.com"]
+
+    def test_logcat_evidence_is_attached(self):
+        """O logcat do intervalo é anexado ao resultado do bypass."""
+        dm = mock.MagicMock()
+        dm.spawn_app.return_value = TestAttemptBypass._FakeSession([
+            {"type": "send", "payload": {"type": "ssl-bypass-host", "host": "api.x.com"}},
+        ])
+        dm.last_spawn_pid = 42
+        dm.is_app_alive.return_value = True
+        dm.logcat_since.return_value = [
+            "10-16 10:00:00.000 42 42 E com.app: SSLHandshakeException: pinning",
+        ]
+        with mock.patch("checks.ssl_pinning.time.sleep"):
+            res = SSLPinningCheck(dm).attempt_bypass("com.app", window=2)
+        assert res["success"] is True
+        assert res["logcat"]["tls_errors"]
+        assert res["logcat_evidence"]

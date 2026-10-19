@@ -72,6 +72,8 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--wifi IP:PORTA` | não | Endereço para `adb connect` |
 | `--output-dir` | não | Diretório dos relatórios (default `reports/`) |
 | `--window SEG` | não | Janela de observação em segundos nos checks dinâmicos (default `15`) |
+| `--baseline-window SEG` | não | Janela do baseline sem instrumentação (default `5`) |
+| `--no-baseline` | não | Não executa o baseline antes dos checks dinâmicos |
 | `--verbose` | não | Logging em nível DEBUG |
 | `--skip CHECK...` | não | Checks a pular (`anti_root`, `anti_frida`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
 
@@ -82,6 +84,14 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
   summary, details) para consumo por LLMs/MCP
 - `reports/<package>_<timestamp>.html` — relatório visual com badges de status
   e evidências
+
+Durante os checks dinâmicos o RASPilot também captura o **logcat** do
+dispositivo. O logcat é usado como fonte independente de evidência para
+correlacionar mortes (`SIGKILL`, `SIGSEGV`, `am_kill`, `am_crash`, ANR),
+mensagens de SDKs de segurança e erros de TLS/pinning. Antes de qualquer
+spawn com Frida, um **baseline sem instrumentação** verifica se o app já
+morre sozinho; assim um crash da instrumentação ou o ciclo de vida normal
+do app não é confundido com uma reação do RASP.
 
 Semântica de status:
 
@@ -120,16 +130,20 @@ Confiança: `high` (≥2 vetores), `medium` (1), `low` (0).
 ### 2. Anti-Frida (`checks/anti_frida.py`)
 
 - Processos (`ps -A | grep frida`)
-- Portas 27042/27043 (`netstat`/`ss`/`/proc/net/tcp`)
+- Portas Frida clássicas (27042/27043) **e a porta stealth real** do
+  `frida-server` (`netstat`/`ss`/`/proc/net/tcp`)
 - Módulos Frida carregados no processo alvo (via Frida)
 - Threads `gum-js-loop`, `gmain`, `pool-frida` (`/proc/<pid>/task`)
 - Observação de detecção de Frida **pelo app** (hooks de observação em
   `File.exists`, `Runtime.exec`, `ProcessBuilder`, `strstr`/`strcmp`,
-  `connect` nas portas Frida e `open`/`access`/`stat`/`faccessat` em paths
-  Frida)
-- Durante a janela de observação o processo é monitorado: se o app se
-  encerrar (reação típica de RASP ao detectar ameaça), isso vira evidência
-  e o veredito passa a `vulnerable=False`
+  `connect` nas portas Frida, `open`/`access`/`stat`/`faccessat` em paths
+  Frida e no `kill_trace`)
+- Correlação com o **logcat** e com o **baseline sem instrumentação**: uma
+  morte só vira evidência de detecção quando há sinal de segurança, kill
+  rastreado ou o app não morria no baseline; crash da instrumentação vira
+  `ERROR`/inconclusivo, não `OK`
+- Se a observação não puder executar (script/attach), o resultado é
+  `ERROR`, não `vulnerable=True`
 
 `vulnerable=True` ⇒ o app **não** detectou o Frida (falha de RASP).
 O bypass correspondente vive em `scripts/anti_frida_bypass.js`.
@@ -187,9 +201,9 @@ mas o bypass venceu.
 - **Bypass dinâmico**: injeta `scripts/ssl_bypass.js` (universal) cobrindo
   TrustManager, HostnameVerifier, OkHttp 3/4, NSC, Conscrypt, Apache
   HttpClient, WebView, BoringSSL/OpenSSL e Flutter. Bypass só é considerado
-  bem-sucedido com **evidência real** (host interceptado ou log de
-  `check()` contornado). O processo é monitorado durante a janela — se o
-  app se encerrar, isso é registrado no resultado.
+  bem-sucedido com **host real interceptado e app vivo**; logs de instalação
+  de hooks ou de configuração nativa são apenas diagnóstico. O logcat é
+  anexado ao resultado para corroborar erros de TLS/pinning.
 
 ---
 
@@ -198,7 +212,8 @@ mas o bypass venceu.
 ```
 raspilot/
 ├── main.py                     # CLI + pipeline de auditoria
-├── device_manager.py           # ADB (USB/Wi-Fi) + ciclo de vida do frida-server
+├── device_manager.py           # ADB (USB/Wi-Fi) + frida-server + logcat/baseline
+├── logcat_analyzer.py          # Correlação de mortes/segurança/TLS no logcat
 ├── reporter.py                 # Relatórios JSON/HTML (Jinja2)
 ├── checks/
 │   ├── anti_root.py            # Detecção de root multi-vetor

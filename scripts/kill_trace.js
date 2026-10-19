@@ -143,4 +143,4 @@ function main() {
     report('kill-trace carregado');
 }
 
-setImmediate(main);
+main();

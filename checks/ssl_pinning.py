@@ -20,7 +20,13 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 from rich.console import Console
 
 from checks.apk_utils import pull_apk, scan_apk
-from script_loader import load_script_file, safe_unload
+from logcat_analyzer import (
+    analyze_since,
+    classify_failure,
+    format_evidence,
+    get_logcat_mark,
+)
+from script_loader import load_script_file, safe_detach, safe_unload
 
 if TYPE_CHECKING:  # evita import circular em tempo de importação
     from device_manager import DeviceManager
@@ -115,6 +121,19 @@ class SSLPinningCheck:
             dm: Instância conectada de ``DeviceManager``.
         """
         self.dm = dm
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _script_replacements(self, java_only: bool = False) -> Dict[str, str]:
+        """Placeholders de configuração injetados nos scripts Frida."""
+        value = getattr(self.dm, "frida_port", None)
+        port = int(value) if isinstance(value, int) else 27999
+        return {
+            "__RASPILOT_FRIDA_PORT__": str(port),
+            "__RASPILOT_FRIDA_PORT_HEX__": f"{port:04X}",
+            "__RASPILOT_JAVA_ONLY__": "true" if java_only else "false",
+        }
 
     # ------------------------------------------------------------------
     # Detecção estática
@@ -236,8 +255,10 @@ class SSLPinningCheck:
         intercepted_hosts: List[str] = []
         session = None
         script = None
+        java_script = None
         proc_script = None
         kill_script = None
+        java_load_error: Optional[str] = None
         died_after: Optional[int] = None
 
         def on_message(message, data):  # noqa: ANN001 - assinatura frida
@@ -262,24 +283,51 @@ class SSLPinningCheck:
                 if desc:
                     bypass_logs.append(f"[script-error] {desc}")
 
+        logcat_mark = get_logcat_mark(self.dm)
         try:
             # Spawn suspenso: instala os hooks ANTES do app rodar, para
             # não perder validações de certificado da inicialização.
             session = self.dm.spawn_app(package_name, resume=False)
+            # Fase 1 (antes do resume): hooks nativos SSL + filtro /proc,
+            # sem bridge Java.
             script = load_script_file(
-                session, SSL_BYPASS_SCRIPT, on_message=on_message
+                session, SSL_BYPASS_SCRIPT, on_message=on_message,
+                replacements=self._script_replacements(java_only=False),
+                with_java_bridge=False,
+                load_timeout=5.0,
             )
             try:
                 proc_script = load_script_file(
-                    session, PROC_FILTER_SCRIPT, on_message=on_message
-                )
-                kill_script = load_script_file(
-                    session, KILL_TRACE_SCRIPT, on_message=on_message
+                    session, PROC_FILTER_SCRIPT, on_message=on_message,
+                    replacements=self._script_replacements(java_only=False),
+                    with_java_bridge=False,
+                    load_timeout=3.0,
                 )
             except Exception:
-                logger.warning("scripts auxiliares indisponíveis", exc_info=True)
+                logger.warning("proc_filter.js indisponível", exc_info=True)
             self.dm.resume_app()
             pid = self.dm.last_spawn_pid
+            # Fase 2 (após o resume): hooks Java de SSL.
+            try:
+                java_script = load_script_file(
+                    session, SSL_BYPASS_SCRIPT, on_message=on_message,
+                    replacements=self._script_replacements(java_only=True),
+                    with_java_bridge=True,
+                    load_timeout=5.0,
+                )
+            except Exception as exc:
+                java_load_error = str(exc)
+                logger.warning("Hooks Java SSL não carregaram: %s", exc)
+                safe_detach(session)
+            if java_load_error is None:
+                # Diagnóstico de kill carregado por último.
+                try:
+                    kill_script = load_script_file(
+                        session, KILL_TRACE_SCRIPT, on_message=on_message,
+                        load_timeout=3.0,
+                    )
+                except Exception:
+                    logger.debug("kill_trace.js indisponível no bypass SSL", exc_info=True)
             for elapsed in range(max(1, int(window))):
                 time.sleep(1)
                 if pid is not None and not self.dm.is_app_alive(pid):
@@ -291,24 +339,79 @@ class SSLPinningCheck:
                     break
         except Exception as exc:
             logger.warning("Bypass SSL falhou", exc_info=True)
+            pid = locals().get("pid") or self.dm.last_spawn_pid
+            logcat = analyze_since(self.dm, logcat_mark, package_name, pid)
+            failure = classify_failure(logcat, getattr(self.dm, "baseline", None))
+            app_alive: Optional[bool] = None
+            death_cause = None
+            if pid is not None:
+                try:
+                    app_alive = self.dm.is_app_alive(pid)
+                except Exception:
+                    app_alive = None
+            if app_alive is False:
+                try:
+                    death_cause = self.dm.capture_death_cause(
+                        pid=pid, package=package_name
+                    )
+                except Exception:
+                    logger.debug("Falha ao capturar morte no bypass SSL", exc_info=True)
+
+            if app_alive is False:
+                bypass_logs.append("app_terminated: processo morreu durante o bypass")
+                if death_cause:
+                    bypass_logs.append(
+                        "death_cause: " + str(death_cause.get("summary", "?"))
+                    )
+
+            # Reação do RASP durante o carregamento: o pinning resistiu
+            # (inclusive quando o agente foi derrubado e o app sobreviveu).
+            if failure.get("is_rasp"):
+                return {
+                    "success": False,
+                    "intercepted_hosts": intercepted_hosts,
+                    "bypass_logs": bypass_logs,
+                    "effective_logs": [],
+                    "app_alive_at_end": False,
+                    "death_cause": death_cause,
+                    "logcat": logcat,
+                    "logcat_evidence": format_evidence(logcat),
+                    "error": None,
+                }
+
+            kind = str(failure.get("kind", "unknown"))
+            if kind == "start_timeout":
+                error = (
+                    "app morto por ActivityManager start timeout durante o bypass "
+                    "(instrumentação); reduza o trabalho antes do resume"
+                )
+            elif kind == "baseline_death":
+                error = "app encerrou no baseline sem instrumentação; bypass inconclusivo"
+            elif kind == "instrumentation_crash":
+                error = (
+                    "app encerrou por crash/ANR sem evidência de segurança no logcat "
+                    "(possível crash da instrumentação)"
+                )
+            else:
+                error = str(exc)
             return {
                 "success": False,
                 "intercepted_hosts": intercepted_hosts,
                 "bypass_logs": bypass_logs,
                 "effective_logs": [],
-                "app_alive_at_end": True,
-                "death_cause": None,
-                "error": str(exc),
+                "app_alive_at_end": app_alive if app_alive is not None else True,
+                "death_cause": death_cause,
+                "logcat": logcat,
+                "logcat_evidence": format_evidence(logcat),
+                "error": error,
             }
         finally:
             safe_unload(script)
+            safe_unload(java_script)
             safe_unload(proc_script)
             safe_unload(kill_script)
             if session is not None:
-                try:
-                    session.detach()
-                except Exception:
-                    logger.debug("Falha ao detach da sessão", exc_info=True)
+                safe_detach(session)
 
         if died_after is not None:
             bypass_logs.append(
@@ -328,24 +431,48 @@ class SSLPinningCheck:
             death_cause = None
 
         alive = died_after is None
-        # Evidência real: hosts interceptados OU logs de bypass efetivo.
+        # Logs de bypass efetivo são úteis como diagnóstico, mas NÃO
+        # provam interceptação: hooks nativos de configuração podem ser
+        # instalados sem que nenhuma conexão pinada seja contornada.
         effective = [
             log for log in bypass_logs
             if any(marker in log for marker in EVIDENCE_MARKERS)
         ]
-        success = bool(intercepted_hosts) or bool(effective)
+        logcat = analyze_since(
+            self.dm, logcat_mark, package_name, locals().get("pid")
+        )
+        # Veredito estrito: exige host real interceptado e app vivo.
+        success = bool(intercepted_hosts) and alive
+        if intercepted_hosts:
+            evidence_strength = "host"
+        elif effective:
+            evidence_strength = "config_only"
+        else:
+            evidence_strength = "none"
+
+        error: Optional[str] = None
+        if alive and java_load_error and not intercepted_hosts:
+            # OkHttp/TrustManager são Java; sem esses hooks o bypass não
+            # pode ser confirmado, mesmo com hooks nativos ativos.
+            success = False
+            error = f"hooks Java de SSL não carregaram: {java_load_error}"
 
         result = {
             "success": success,
             "intercepted_hosts": intercepted_hosts,
             "bypass_logs": bypass_logs,
             "effective_logs": effective,
+            "evidence_strength": evidence_strength,
             "app_alive_at_end": alive,
             "death_cause": death_cause,
-            "error": None,
+            "logcat": logcat,
+            "logcat_evidence": format_evidence(logcat),
+            "java_load_error": java_load_error,
+            "error": error,
         }
         logger.info(
-            "SSL bypass: success=%s hosts=%s", success, intercepted_hosts
+            "SSL bypass: success=%s hosts=%s strength=%s",
+            success, intercepted_hosts, evidence_strength,
         )
         return result
 
@@ -372,6 +499,19 @@ class SSLPinningCheck:
         """
         detection = self.detect_pinning(package_name, apk_path=apk_path)
 
+        # Falha ao obter/analisar o APK é inconclusiva, não "sem pinning".
+        if detection.get("error"):
+            return {
+                "pinning_detected": False,
+                "pinning_type": "none",
+                "bypass_successful": None,
+                "evidence": [],
+                "bypass_details": None,
+                "detection": detection,
+                "error": str(detection["error"]),
+                "timestamp": _now_iso(),
+            }
+
         if not detection.get("pinning_detected"):
             return {
                 "pinning_detected": False,
@@ -384,7 +524,7 @@ class SSLPinningCheck:
             }
 
         bypass = self.attempt_bypass(package_name, window=window)
-        return {
+        result = {
             "pinning_detected": True,
             "pinning_type": detection.get("type", "none"),
             "bypass_successful": bool(bypass.get("success")),
@@ -393,3 +533,6 @@ class SSLPinningCheck:
             "detection": detection,
             "timestamp": _now_iso(),
         }
+        if bypass.get("error") and not bypass.get("success"):
+            result["error"] = f"bypass: {bypass['error']}"
+        return result

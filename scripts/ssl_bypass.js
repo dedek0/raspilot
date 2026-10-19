@@ -30,6 +30,12 @@
 
 'use strict';
 
+// true = apenas hooks Java (após resume); false = apenas nativos
+// (antes do resume, sem bridge Java).
+var RASPILOT_JAVA_ONLY = (typeof __RASPILOT_JAVA_ONLY__ !== 'undefined')
+    ? __RASPILOT_JAVA_ONLY__
+    : false;
+
 // Hosts interceptados durante a sessão (para relatório).
 var interceptedHosts = [];
 
@@ -55,6 +61,19 @@ function markHost(host) {
             send({ type: 'ssl-bypass-host', host: '' + host });
         }
     } catch (e) { /* best-effort */ }
+}
+
+// Extrai o hostname real de sockets/engines Conscrypt. NÃO confundir com
+// authType: em checkServerTrusted(chain, authType) o 2º argumento é o
+// tipo de autenticação (ex: "ECDHE_RSA"), não o host.
+function hostFromTlsObject(obj) {
+    try {
+        if (obj === null || obj === undefined) { return ''; }
+        if (typeof obj.getHostname === 'function') {
+            return '' + obj.getHostname();
+        }
+    } catch (e) { /* best-effort */ }
+    return '';
 }
 
 // ----------------------------------------------------------------------
@@ -104,10 +123,55 @@ function registerNoopTrustManager(TrustManager) {
             });
             return cls2.$new();
         } catch (err2) {
+            // Forma 3: registra no classloader do app. Alguns security SDKs
+            // restringem o classloader padrão ("Permission denied").
+            try {
+                var found = null;
+                Java.enumerateClassLoaders({
+                    onMatch: function (loader) {
+                        if (found !== null) { return; }
+                        try {
+                            var factory = Java.ClassFactory.get(loader);
+                            var TM = factory.use('javax.net.ssl.X509TrustManager');
+                            var cls3 = factory.registerClass({
+                                name: 'org.raspilot.NoopX509TrustManager',
+                                implements: [TM],
+                                methods: {
+                                    checkClientTrusted: {
+                                        returnType: '',
+                                        argumentTypes: [
+                                            '[Ljava.security.cert.X509Certificate;',
+                                            'java.lang.String'
+                                        ],
+                                        implementation: function (chain, authType) {}
+                                    },
+                                    checkServerTrusted: {
+                                        returnType: '',
+                                        argumentTypes: [
+                                            '[Ljava.security.cert.X509Certificate;',
+                                            'java.lang.String'
+                                        ],
+                                        implementation: function (chain, authType) {}
+                                    },
+                                    getAcceptedIssuers: {
+                                        returnType: '[Ljava.security.cert.X509Certificate;',
+                                        argumentTypes: [],
+                                        implementation: function () { return []; }
+                                    }
+                                }
+                            });
+                            found = cls3.$new();
+                        } catch (e) { /* outro classloader */ }
+                    },
+                    onComplete: function () {}
+                });
+                if (found !== null) { return found; }
+            } catch (err3) { /* enumerate indisponível */ }
+
             // Classe já registrada (idempotência) — reutiliza.
             try {
                 return Java.use('org.raspilot.NoopX509TrustManager').$new();
-            } catch (err3) {
+            } catch (err4) {
                 log('TrustManager noop indisponível: ' + err1 + ' | fallback: ' + err2);
                 return null;
             }
@@ -155,14 +219,92 @@ function hookTrustManager() {
 // ----------------------------------------------------------------------
 // 2) Java — HostnameVerifier
 // ----------------------------------------------------------------------
+function registerAllowAllVerifier() {
+    // Forma 1: classloader padrão.
+    try {
+        var Verifier = Java.use('javax.net.ssl.HostnameVerifier');
+        var cls = Java.registerClass({
+            name: 'org.raspilot.AllowAllHostnameVerifier',
+            implements: [Verifier],
+            methods: {
+                verify: function (hostname, session) {
+                    try {
+                        markHost(hostname);
+                        log('HostnameVerifier.verify bypass (' + hostname + ')');
+                    } catch (e) { /* best-effort */ }
+                    return true;
+                }
+            }
+        });
+        return cls.$new();
+    } catch (e1) {
+        // Forma 2: registra no classloader do app (RX/security SDK).
+        try {
+            var found = null;
+            Java.enumerateClassLoaders({
+                onMatch: function (loader) {
+                    if (found !== null) { return; }
+                    try {
+                        var factory = Java.ClassFactory.get(loader);
+                        var Verifier2 = factory.use('javax.net.ssl.HostnameVerifier');
+                        var cls2 = factory.registerClass({
+                            name: 'org.raspilot.AllowAllHostnameVerifier',
+                            implements: [Verifier2],
+                            methods: {
+                                verify: function (hostname, session) {
+                                    try {
+                                        markHost(hostname);
+                                        log('HostnameVerifier.verify bypass (' + hostname + ')');
+                                    } catch (e) { /* best-effort */ }
+                                    return true;
+                                }
+                            }
+                        });
+                        found = cls2.$new();
+                    } catch (e) { /* outro classloader */ }
+                },
+                onComplete: function () {}
+            });
+            if (found !== null) { return found; }
+        } catch (e2) { /* enumerate indisponível */ }
+
+        // Forma 3: classe já registrada (idempotência).
+        try {
+            return Java.use('org.raspilot.AllowAllHostnameVerifier').$new();
+        } catch (e3) {
+            log('HostnameVerifier allow-all indisponível: ' + e1 + ' | fallback: ' + e3);
+            return null;
+        }
+    }
+}
+
 function hookHostnameVerifier() {
+    var allowAll = registerAllowAllVerifier();
+    if (allowAll === null) {
+        log('HostnameVerifier: nenhum verifier allow-all disponível');
+    }
+
     try {
         var HttpsURLConnection = Java.use('javax.net.ssl.HttpsURLConnection');
         HttpsURLConnection.setDefaultHostnameVerifier.implementation = function (v) {
-            log('setDefaultHostnameVerifier ignorado');
+            try {
+                // Substitui o verifier do app por um allow-all, em vez de
+                // apenas ignorar a chamada (que deixaria o anterior ativo).
+                if (allowAll !== null) {
+                    log('setDefaultHostnameVerifier -> allow-all');
+                    return this.setDefaultHostnameVerifier(allowAll);
+                }
+            } catch (e) { /* best-effort */ }
+            return this.setDefaultHostnameVerifier(v);
         };
         HttpsURLConnection.setHostnameVerifier.implementation = function (v) {
-            log('setHostnameVerifier ignorado');
+            try {
+                if (allowAll !== null) {
+                    log('setHostnameVerifier -> allow-all');
+                    return this.setHostnameVerifier(allowAll);
+                }
+            } catch (e) { /* best-effort */ }
+            return this.setHostnameVerifier(v);
         };
         log('HttpsURLConnection.setHostnameVerifier hookado');
     } catch (e) {
@@ -301,7 +443,9 @@ function hookNetworkSecurityConfig() {
         NSTM.checkServerTrusted.overload(
             '[Ljava.security.cert.X509Certificate;', 'java.lang.String'
         ).implementation = function (chain, authType) {
-            log('NetworkSecurityTrustManager.checkServerTrusted bypass (sem host)');
+            // 2º argumento é authType, não host.
+            log('NetworkSecurityTrustManager.checkServerTrusted bypass (authType=' +
+                authType + ')');
         };
         log('NetworkSecurityTrustManager hookado');
     } catch (e) {
@@ -312,9 +456,11 @@ function hookNetworkSecurityConfig() {
         var RootTrustManager = Java.use('android.security.net.config.RootTrustManager');
         RootTrustManager.checkServerTrusted.overload(
             '[Ljava.security.cert.X509Certificate;', 'java.lang.String'
-        ).implementation = function (chain, host) {
-            markHost(host);
-            log('RootTrustManager.checkServerTrusted bypass (' + host + ')');
+        ).implementation = function (chain, authType) {
+            // 2º argumento é authType, não host. O host real é capturado
+            // em TrustManagerImpl.verifyChain/socket.
+            log('RootTrustManager.checkServerTrusted bypass (authType=' +
+                authType + ')');
         };
         log('RootTrustManager hookado');
     } catch (e) {
@@ -334,8 +480,11 @@ function hookConscrypt() {
                 '[Ljava.security.cert.X509Certificate;',
                 'java.lang.String',
                 'com.android.org.conscrypt.AbstractConscryptSocket'
-            ).implementation = function (tm, chain, host, socket) {
-                log('Conscrypt Platform.checkServerTrusted bypass (' + host + ')');
+            ).implementation = function (tm, chain, authType, socket) {
+                var host = hostFromTlsObject(socket);
+                markHost(host);
+                log('Conscrypt Platform.checkServerTrusted bypass (' +
+                    (host || 'authType=' + authType) + ')');
             };
             log('Conscrypt Platform.checkServerTrusted hookado');
         } catch (e1) {
@@ -344,8 +493,11 @@ function hookConscrypt() {
                 '[Ljava.security.cert.X509Certificate;',
                 'java.lang.String',
                 'com.android.org.conscrypt.ConscryptEngine'
-            ).implementation = function (tm, chain, host, engine) {
-                log('Conscrypt Platform.checkServerTrusted bypass (' + host + ')');
+            ).implementation = function (tm, chain, authType, engine) {
+                var host = hostFromTlsObject(engine);
+                markHost(host);
+                log('Conscrypt Platform.checkServerTrusted bypass (' +
+                    (host || 'authType=' + authType) + ')');
             };
             log('Conscrypt Platform.checkServerTrusted hookado (engine)');
         }
@@ -475,12 +627,16 @@ function hookNativeSsl() {
 // ----------------------------------------------------------------------
 // 10) Flutter — ssl_verify_result + ber
 // ----------------------------------------------------------------------
+var flutterState = { done: false };
+
 function hookFlutter() {
+    if (flutterState.done) { return; }
     var flutter = Process.findModuleByName('libflutter.so');
     if (flutter === null) {
         log('libflutter.so não carregado — hook Flutter pulado');
         return;
     }
+    flutterState.done = true;
     try {
         // ssl_verify_result: força o valor de retorno para 'ok'.
         var exports = flutter.enumerateExports();
@@ -522,6 +678,9 @@ function hookFlutter() {
 function main() {
     log('ssl_bypass.js carregado');
 
+    // Instalação SÍNCRONA: o host faz resume logo após script.load(). Se
+    // os hooks fossem adiados com setImmediate, validações de certificado
+    // da inicialização poderiam rodar antes deles.
     var javaOk = raspilotPerformJava(function () {
         hookTrustManager();
         hookHostnameVerifier();
@@ -535,11 +694,20 @@ function main() {
     }
     scheduleOkHttpRetries();
 
-    // Hooks nativos e Flutter podem ser needed independentemente do Java.
-    setImmediate(function () {
+    if (!RASPILOT_JAVA_ONLY) {
         hookNativeSsl();
         hookFlutter();
-    });
+        // Flutter pode carregar libflutter.so um pouco depois do spawn.
+        [2500, 6000, 12000].forEach(function (delay) {
+            setTimeout(function () {
+                try {
+                    if (!flutterState.done) {
+                        hookFlutter();
+                    }
+                } catch (e) { /* best-effort */ }
+            }, delay);
+        });
+    }
 }
 
-setImmediate(main);
+main();

@@ -16,8 +16,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
-from typing import List, Optional, Tuple
+from collections import deque
+from typing import Deque, List, Optional, Tuple
+
+from logcat_analyzer import analyze_logcat, analyze_since
 
 try:
     import frida
@@ -107,8 +111,21 @@ class DeviceManager:
         self._device_info: Optional[dict] = None
         self._su_ok: Optional[bool] = None
         self.last_spawn_pid: Optional[int] = None
+        self.last_spawn_package: Optional[str] = None
         self._pending_resume: Optional[tuple] = None
         self.frida_ready: bool = False
+        self.frida_port: int = FRIDA_PORT
+
+        # Baseline sem instrumentação (preenchido por run_app_baseline).
+        self.baseline: Optional[dict] = None
+
+        # Captura contínua de logcat (thread leitora + buffer circular).
+        self._logcat_proc: Optional[subprocess.Popen] = None
+        self._logcat_thread: Optional[threading.Thread] = None
+        self._logcat_lines: Deque[str] = deque(maxlen=50000)
+        self._logcat_count = 0
+        self._logcat_lock = threading.Lock()
+        self._logcat_available = False
 
     # ------------------------------------------------------------------
     # Wrapper de comandos
@@ -330,6 +347,204 @@ class DeviceManager:
         return devices
 
     # ------------------------------------------------------------------
+    # Logcat
+    # ------------------------------------------------------------------
+    def start_logcat_capture(self) -> bool:
+        """Inicia a captura contínua de logcat em uma thread de fundo.
+
+        O buffer é circular (50k linhas) e cada check recebe um marcador
+        (:meth:`logcat_mark`) para analisar apenas as linhas do seu
+        intervalo. Nunca propaga exceção: em ambientes sem ``adb`` a
+        captura fica indisponível e os checks usam um snapshot sob
+        demanda.
+
+        Returns:
+            True se o processo de logcat foi iniciado.
+        """
+        if self._logcat_proc is not None:
+            return True
+
+        cmd = ["adb"]
+        if self.device_id:
+            cmd += ["-s", self.device_id]
+        cmd += ["logcat", "-v", "threadtime"]
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                errors="replace",
+            )
+        except (FileNotFoundError, OSError) as exc:
+            logger.warning("logcat indisponível: %s", exc)
+            self._logcat_available = False
+            return False
+
+        self._logcat_proc = proc
+        self._logcat_available = True
+
+        def _reader() -> None:
+            try:
+                if proc.stdout is None:
+                    return
+                for line in proc.stdout:
+                    with self._logcat_lock:
+                        self._logcat_lines.append(line.rstrip("\n"))
+                        self._logcat_count += 1
+            except Exception:  # noqa: BLE001 - leitura encerrada é esperada
+                logger.debug("Thread de logcat encerrou", exc_info=True)
+
+        self._logcat_thread = threading.Thread(
+            target=_reader, name="raspilot-logcat", daemon=True
+        )
+        self._logcat_thread.start()
+        logger.debug("Captura de logcat iniciada (%s)", " ".join(cmd))
+        return True
+
+    def stop_logcat_capture(self) -> None:
+        """Encerra a captura de logcat e a thread leitora.
+
+        Returns:
+            None.
+        """
+        proc = self._logcat_proc
+        thread = self._logcat_thread
+        self._logcat_proc = None
+        self._logcat_thread = None
+        self._logcat_available = False
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:  # noqa: BLE001 - processo já encerrado
+                try:
+                    proc.kill()
+                except Exception:
+                    logger.debug("Falha ao encerrar logcat", exc_info=True)
+        if thread is not None:
+            thread.join(timeout=2)
+
+    def logcat_mark(self) -> int:
+        """Retorna o índice atual (monotônico) do buffer de logcat.
+
+        Returns:
+            Número de linhas já capturadas desde o início da sessão.
+        """
+        with self._logcat_lock:
+            return self._logcat_count
+
+    def logcat_since(self, mark: int = 0) -> List[str]:
+        """Retorna as linhas de logcat posteriores a um marcador.
+
+        Se a captura contínua não estiver ativa, tenta um snapshot
+        ``logcat -d -t 500`` para ainda fornecer evidências.
+
+        Args:
+            mark: Marcador retornado por :meth:`logcat_mark`.
+
+        Returns:
+            Lista de linhas (possivelmente vazia).
+        """
+        with self._logcat_lock:
+            # Índice da primeira linha ainda presente no deque.
+            first_available = self._logcat_count - len(self._logcat_lines)
+            start = int(mark or 0) - first_available
+            if start < 0:
+                start = 0
+            if start > len(self._logcat_lines):
+                start = len(self._logcat_lines)
+            captured = list(self._logcat_lines)[start:]
+
+        if captured:
+            return captured
+        if self._logcat_proc is not None:
+            return []
+
+        res = self.run_shell("logcat -d -v threadtime -t 500 2>/dev/null", timeout=10)
+        if res.get("ok") and res.get("stdout"):
+            return res["stdout"].splitlines()
+        return []
+
+    def run_app_baseline(self, package_name: str, window: int = 5) -> dict:
+        """Executa o app sem instrumentação para estabelecer um baseline.
+
+        O baseline responde: "o app já morre sozinho após o launch?".
+        Sem ele, uma morte durante a observação com Frida pode ser
+        confundida com reação do RASP, quando na verdade é crash/lifecycle
+        normal. Também captura o logcat do intervalo.
+
+        Args:
+            package_name: Package name do app alvo.
+            window: Tempo de observação em segundos.
+
+        Returns:
+            Dict com ``available``, ``pid``, ``alive_at_end``,
+            ``died_after``, ``death_cause`` e ``logcat``.
+        """
+        mark = self.logcat_mark()
+        result: dict = {
+            "available": False,
+            "package": package_name,
+            "pid": None,
+            "alive_at_end": None,
+            "died_after": None,
+            "death_cause": None,
+            "logcat": analyze_logcat([], package=package_name),
+            "window": window,
+        }
+        try:
+            self.run_shell(f"am force-stop {package_name}", timeout=10)
+            launch = self.run_shell(
+                f"monkey -p {package_name} -c android.intent.category.LAUNCHER 1",
+                timeout=20,
+            )
+            logger.debug("Baseline launch: rc=%s %s", launch.get("rc"), launch.get("stderr"))
+
+            pid: Optional[int] = None
+            for _ in range(5):
+                res = self.run_shell(f"pidof -s {package_name} 2>/dev/null", timeout=5)
+                value = (res.get("stdout") or "").strip()
+                if res.get("ok") and value.isdigit():
+                    pid = int(value)
+                    break
+                time.sleep(1)
+
+            if pid is None:
+                result["reason"] = "app não iniciou (sem pid)"
+                return result
+
+            result["available"] = True
+            result["pid"] = pid
+            died_after: Optional[int] = None
+            for elapsed in range(max(1, int(window))):
+                time.sleep(1)
+                if not self.is_app_alive(pid):
+                    died_after = elapsed + 1
+                    break
+            result["died_after"] = died_after
+            result["alive_at_end"] = died_after is None
+            if died_after is not None:
+                result["death_cause"] = self.capture_death_cause(
+                    pid=pid, package=package_name
+                )
+            result["logcat"] = analyze_since(
+                self, mark, package=package_name, pid=pid
+            )
+            logger.info(
+                "Baseline: pid=%s alive=%s died_after=%s",
+                pid, result["alive_at_end"], died_after,
+            )
+            return result
+        finally:
+            try:
+                self.run_shell(f"am force-stop {package_name}", timeout=10)
+            except Exception:
+                logger.debug("Falha ao encerrar baseline", exc_info=True)
+
+    # ------------------------------------------------------------------
     # Informações do dispositivo
     # ------------------------------------------------------------------
     def get_device_info(self) -> dict:
@@ -451,7 +666,7 @@ class DeviceManager:
             # Fallback tolerante: tenta o primeiro item da lista de ABIs.
             abi_list = self._getprop("ro.product.cpu.abilist")
             abi = abi_list.split(",")[0].strip() if abi_list else "armeabi-v7a"
-        if abi not in ("arm64-v8a", "armeabi-v7a", "x86_64"):
+        if abi not in ("arm64-v8a", "armeabi-v7a", "x86", "x86_64", "riscv64"):
             # Mapeia ABI desconhecidas para a mais próxima esperada pelo Frida.
             if abi.startswith("arm64"):
                 abi = "arm64-v8a"
@@ -459,6 +674,10 @@ class DeviceManager:
                 abi = "armeabi-v7a"
             elif abi.startswith("x86_64"):
                 abi = "x86_64"
+            elif abi.startswith("x86"):
+                abi = "x86"
+            elif abi.startswith("riscv64"):
+                abi = "riscv64"
             else:
                 logger.warning("ABI desconhecida %r, usando armeabi-v7a", abi)
                 abi = "armeabi-v7a"
@@ -500,6 +719,10 @@ class DeviceManager:
             "killall frida-server",
             f"pkill -f {FRIDA_REMOTE_PATH}",
             "pkill -f .lloader",  # binário stealth do RASPilot
+            # Fallback por PID: alguns ROMs não têm pkill/ps completo e o
+            # nome truncado pode escapar do pkill -f.
+            "for p in $(pidof .lloader 2>/dev/null) $(pidof frida-server 2>/dev/null); "
+            "do kill -9 $p 2>/dev/null; done",
         )
         for cmd in base_cmds:
             for wrapped in (cmd, self._su_cmd(cmd)):
@@ -524,7 +747,9 @@ class DeviceManager:
         arch = {
             "arm64-v8a": "arm64",
             "armeabi-v7a": "arm",
+            "x86": "x86",
             "x86_64": "x86_64",
+            "riscv64": "riscv64",
         }.get(abi, "arm64")
         return f"frida-server-{version}-android-{arch}"
 
@@ -792,8 +1017,9 @@ class DeviceManager:
             except Exception as exc:
                 raise FridaSetupError(f"Dispositivo Frida {serial} não encontrado: {exc}") from exc
         # Sem serial explícito: primeiro dispositivo USB/remoto disponível.
+        # Nunca usar 'local': isso injetaria no host, não no Android.
         devices = [
-            d for d in manager.enumerate_devices() if d.type in ("usb", "remote", "local")
+            d for d in manager.enumerate_devices() if d.type in ("usb", "remote")
         ]
         if not devices:
             raise FridaSetupError("Nenhum dispositivo Frida disponível.")
@@ -820,12 +1046,25 @@ class DeviceManager:
         f = self._require_frida()
         device = self._frida_device()
         logger.info("Spawning %s... (resume=%s)", package_name, resume)
+
+        # Nunca deixar um spawn anterior suspenso ao iniciar outro.
+        self.resume_app()
+
+        pid = None
         try:
             pid = device.spawn([package_name])
             session = device.attach(pid)
         except Exception as exc:  # frida raising frida.core.ExecutableNotFoundError etc.
+            # Se o spawn aconteceu mas o attach falhou, o processo ficaria
+            # suspenso para sempre. Retoma para não travar o alvo.
+            if pid is not None:
+                try:
+                    device.resume(pid)
+                except Exception:
+                    logger.debug("Falha ao retomar pid %s após erro de attach", pid, exc_info=True)
             raise FridaSetupError(f"Falha ao spawna {package_name}: {exc}") from exc
         self.last_spawn_pid = pid
+        self.last_spawn_package = package_name
         if resume:
             device.resume(pid)
             time.sleep(1.0)  # aguarda a Activity subir
@@ -914,7 +1153,11 @@ class DeviceManager:
         if res["ok"] and res["stdout"].strip().isdigit():
             return int(res["stdout"].strip())
 
-        return self.last_spawn_pid
+        # Só reaproveita o PID do último spawn se ele pertencer ao mesmo
+        # package (evita devolver PID obsoleto de outro app).
+        if self.last_spawn_package in (None, package_name):
+            return self.last_spawn_pid
+        return None
 
     def is_app_alive(self, pid: int) -> bool:
         """Verifica se um processo continua em execução no dispositivo.
@@ -959,21 +1202,34 @@ class DeviceManager:
         )
 
         evidence: List[str] = []
+        death_keywords = (
+            "fatal signal", "sigsegv", "sigabrt", "sigbus", "sigkill",
+            "native crash", "tombstone", "has died", "am_proc_died",
+            "am_kill", "killing ", "force stop", "fatal exception",
+            "anr in", "application not responding", "exited due to signal",
+        )
         # crash: com pid conhecido, exige o pid como palavra na linha
         # (evita atribuir crash antigo cujo endereço/pid contenha o nº
         # por acaso); sem pid, aceita linhas fatais genéricas.
-        # events/main: só linhas que citam o alvo (evita ruído).
+        # events: só linhas que citam o alvo.
+        # main: só linhas que citam o alvo E têm conteúdo de morte (evita
+        # despejar centenas de logs normais no relatório).
         for cmd, tag, generic_ok in (
             ("logcat -d -b crash -t 300 2>/dev/null", "crash", pid is None),
             ("logcat -d -b events -t 500 2>/dev/null", "events", False),
             ("logcat -d -t 400 2>/dev/null", "main", False),
         ):
-            res = self.run_shell(cmd, timeout=15)
+            res = self.run_shell(cmd, timeout=10)
             if not res["ok"]:
                 continue
             for line in res["stdout"].splitlines():
+                low = line.lower()
                 if tag == "crash" and crash_pid_re is not None:
                     matched = bool(crash_pid_re.search(line))
+                elif tag == "main":
+                    matched = any(n in line for n in needles) and any(
+                        k in low for k in death_keywords
+                    )
                 else:
                     matched = any(n in line for n in needles)
                 if matched:
@@ -981,14 +1237,7 @@ class DeviceManager:
                     continue
                 if not generic_ok:
                     continue
-                low = line.lower()
-                if any(
-                    k in low
-                    for k in (
-                        "fatal signal", "sigsegv", "sigabrt", "sigbus",
-                        "native crash", "tombstone",
-                    )
-                ):
+                if any(k in low for k in death_keywords):
                     evidence.append(f"{tag}: {line.strip()}")
 
         signal: Optional[str] = None
