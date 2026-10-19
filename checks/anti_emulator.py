@@ -431,10 +431,20 @@ class AntiEmulatorCheck:
         weak = checks["sensors"].get("detected") or checks["bluetooth_mac"].get("detected")
 
         is_emulator = bool(strong or (checks["cpu_architecture"].get("detected") and weak))
+
+        # Sem vetor efetivamente avaliado não há conclusão: um device
+        # inacessível não pode ser declarado "físico".
+        evaluated = [
+            name for name, res in checks.items() if not res.get("error")
+        ]
+        failed = [name for name, res in checks.items() if res.get("error")]
+
         if is_emulator and strong:
             confidence = "high"
         elif is_emulator:
             confidence = "medium"
+        elif not evaluated:
+            confidence = "none"
         elif weak or checks["cpu_architecture"].get("detected"):
             confidence = "low"
         else:
@@ -444,9 +454,16 @@ class AntiEmulatorCheck:
             "is_emulator": is_emulator,
             "emulator_type": emulator_type if is_emulator else None,
             "confidence": confidence,
+            "evaluated_vectors": evaluated,
+            "failed_vectors": failed,
             "checks": checks,
             "timestamp": _now_iso(),
         }
+        if not evaluated:
+            result["error"] = (
+                "nenhum vetor anti-emulador pôde ser avaliado: "
+                f"falhas em {', '.join(failed) or 'todos os vetores'}"
+            )
         logger.info(
             "Anti-Emulador: is_emulator=%s type=%s confidence=%s",
             is_emulator, result["emulator_type"], confidence,

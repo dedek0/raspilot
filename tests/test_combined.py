@@ -32,14 +32,36 @@ class _Session:
 
     def create_script(self, source, **kwargs):
         self.sources.append(source)
-        return _Script(self.messages)
+        messages = list(self.messages)
+        if "var Java = bridge;" in source:
+            # A camada Java e instalada de forma adiada: o script
+            # sinaliza a prontidao depois do carregamento.
+            messages.append({"type": "send", "payload": {
+                "type": "raspilot-java-ready", "label": "fake"}})
+        return _Script(messages)
 
     def detach(self):
         self.detached = True
 
 
+# Marcadores estáveis de cada camada carregada. Verificar *o que* foi
+# carregado é mais robusto do que contar scripts: a composição das
+# camadas muda conforme o modo, mas o comportamento exigido não.
+def _has(source, marker):
+    return marker in source
+
+
+def _count(session, marker):
+    return sum(1 for src in session.sources if _has(src, marker))
+
+
+def _java_sources(session):
+    """Fontes carregadas com a bridge Java."""
+    return [src for src in session.sources if _has(src, "var Java = bridge;")]
+
+
 def test_combined_observation_runs_one_session():
-    """Observação combinada carrega fase nativa + Java uma única vez."""
+    """Observação combinada carrega as camadas nativa e Java uma única vez."""
     dm = mock.MagicMock()
     dm.is_app_alive.return_value = True
     dm.logcat_since.return_value = []
@@ -52,13 +74,16 @@ def test_combined_observation_runs_one_session():
             on_resume=lambda: resumed.append(True),
         )
     assert resumed == [True]
-    assert len(session.sources) == 2
+    # camada Java carregada uma única vez, com a bridge
+    assert _count(session, "var Java = bridge;") == 1
+    # a fase nativa carrega o mesmo script de detecção, sem a bridge
+    assert _count(session, "frida-detection") == 2
     assert frida["vulnerable"] is True
     assert hooking["detected"] is False
 
 
 def test_combined_observation_no_java():
-    """--no-java carrega apenas a fase nativa."""
+    """--no-java não carrega a bridge Java."""
     dm = mock.MagicMock()
     dm.is_app_alive.return_value = True
     dm.logcat_since.return_value = []
@@ -69,9 +94,40 @@ def test_combined_observation_no_java():
             dm, session, 42, "com.example.app", 1, 0,
             on_resume=lambda: None, no_java=True,
         )
-    assert len(session.sources) == 1
+    assert _count(session, "var Java = bridge;") == 0
     assert frida["java_skipped"] is True
     assert hooking["java_skipped"] is True
+
+
+def test_combined_observation_mode_detect_does_not_neutralize():
+    """No modo detect a evasão fica desligada: a reação do app precisa
+    acontecer para ser observada."""
+    dm = mock.MagicMock()
+    dm.is_app_alive.return_value = True
+    dm.logcat_since.return_value = []
+    dm.baseline = None
+    session = _Session()
+    with mock.patch("checks.combined.time.sleep"):
+        run_combined_observation(
+            dm, session, 42, "com.example.app", 1, 0,
+            on_resume=lambda: None, mode="detect",
+        )
+    assert _count(session, "auto-destruição neutralizada") == 0
+
+
+def test_combined_observation_neutralizes_self_termination_in_bypass_mode():
+    """Fora do modo detect, a auto-destruição do app é neutralizada."""
+    dm = mock.MagicMock()
+    dm.is_app_alive.return_value = True
+    dm.logcat_since.return_value = []
+    dm.baseline = None
+    session = _Session()
+    with mock.patch("checks.combined.time.sleep"):
+        run_combined_observation(
+            dm, session, 42, "com.example.app", 1, 0,
+            on_resume=lambda: None, mode="bypass",
+        )
+    assert _count(session, "auto-destruição neutralizada") == 1
 
 
 def test_combined_bypass_reuses_one_spawn():
@@ -103,3 +159,22 @@ def test_combined_bypass_reuses_one_spawn():
     assert hooking["success"] is True
     assert ssl["success"] is True
     assert ssl["intercepted_hosts"] == ["api.example"]
+
+
+def test_combined_bypass_loads_java_layers_in_one_script():
+    """Os scripts Java do bypass são carregados em um único script, o que
+    compila a bridge uma vez só."""
+    dm = mock.MagicMock()
+    dm.spawn_app.return_value = _Session()
+    dm.last_spawn_pid = 42
+    dm.is_app_alive.return_value = True
+    dm.logcat_since.return_value = []
+    dm.baseline = None
+    with mock.patch("checks.combined.time.sleep"):
+        run_combined_bypass(dm, "com.example.app", 1, mode="bypass")
+    # uma única compilação da bridge
+    java_sources = _java_sources(dm.spawn_app.return_value)
+    assert len(java_sources) == 1
+    # e as três camadas Java presentes no mesmo script
+    assert "CertificatePinner" in java_sources[0]
+    assert "kill-trace" in java_sources[0]

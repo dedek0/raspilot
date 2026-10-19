@@ -205,9 +205,12 @@ class TestAttemptBypass:
         for marker in (
             "System.exit", "Runtime.exit", "Runtime.halt", "killProcess",
             "tgkill", "killpg", "abort", "syscall", "app-kill", "backtrace",
-            "raspilotFindExport", "raspilotPerformJava",
+            "raspilotFindExport",
         ):
             assert marker in source, f"vetor ausente: {marker}"
+        # A camada Java e instalada por um dos helpers de compatibilidade.
+        assert ("raspilotPerformJava" in source
+                or "raspilotDeferJava" in source)
 
     def test_script_file_exists(self):
         """O arquivo ssl_bypass.js existe e cobre as camadas essenciais."""

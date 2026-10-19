@@ -18,11 +18,59 @@ the collected evidence.
 
 ## Requirements
 
+### On the host
+
 - Python 3.9+
 - `adb` (Android Platform Tools) on `PATH`
-- Android device with **USB Debugging** enabled (physical or emulator)
 - Frida — a compatible `frida-server` is downloaded automatically matching
   the locally installed `frida` package version
+
+### On the Android device
+
+RASPilot runs on a **physical device or an emulator**, with the
+requirements below. The closer to a real production environment, the more
+useful the result: an emulator does not reproduce hardware-backed
+protections.
+
+| Item | Requirement | Why |
+|---|---|---|
+| Android version | API 24+ (Android 7.0) | the `frida-server` used for auditing does not support older versions |
+| Architecture | `arm64-v8a`, `armeabi-v7a`, `x86_64` or `x86` | the `frida-server` is downloaded for the device ABI; `riscv64` is **not** supported |
+| USB debugging | enabled in Developer options | `adb` needs to talk to the device |
+| Debug authorisation | the "Allow USB debugging" prompt must be accepted | otherwise the device shows up as `unauthorized` and there is no connection |
+| Root | **recommended** (Magisk, KernelSU, APatch) | without root the `frida-server` runs as the `shell` uid and some detection vectors (TracerPid, ports, reading another process's `/proc/<pid>/maps`) stay incomplete |
+| SELinux | `permissive` is easier; `enforcing` works | under enforcing, `frida-server` needs root to inject into app processes |
+| Free space | ~200 MB | `frida-server` (~60 MB) and the APK cache |
+| Battery | auditing is CPU intensive | a 20–30 s observation window is enough |
+
+Common setup (all optional, but they change the result):
+
+```bash
+# 1) USB debugging + accept the authorisation prompt
+# 2) root (Magisk/KernelSU), if available
+# 3) ADB over Wi-Fi, to avoid depending on the cable
+adb tcpip 5555
+```
+
+**Audit environment hygiene.** RASPilot reports what is installed on the
+device, and an active hooking tool **contaminates the result**: the log
+of an installed hooking framework belongs to the operator, not to the
+protection of the audited app. The report keeps those two apart — but for
+a clean read, audit on a device without hooking frameworks installed.
+
+### Permissions and artifacts used
+
+RASPilot is **non-destructive**, but it uses the device in an observable
+way:
+
+- `/data/local/tmp` — receives the `frida-server` (under an opaque name)
+  during the run and is **removed at the end**
+- `adb forward` — a local tunnel to the Frida server, torn down at the end
+- `logcat` — continuous read of the system buffer
+- The target app is **force-stopped** at the end of every run
+
+The `frida-server` and the tunnel are torn down even when the audit fails
+halfway through.
 
 ## Installation
 
@@ -76,6 +124,8 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--no-baseline` | no | Skip the uninstrumented baseline |
 | `--mode MODE` | no | Mode: `detect` (observation only), `bypass` (observation+bypass) or `stealth` (native bootstrap before resume) |
 | `--no-java` | no | Do not load Java hooks; useful when RASP blocks the Java bridge |
+| `--java-timeout SEC` | no | Maximum time to load the Java scripts (default `30`). Bridge loading is dominated by the Java runtime initialisation in the target and by classloader enumeration |
+| `--js-runtime RUNTIME` | no | Frida JavaScript runtime: `qjs` (default) or `v8` |
 | `--verbose` | no | DEBUG-level logging |
 | `--skip CHECK...` | no | Checks to skip (`anti_root`, `anti_frida`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
 
@@ -101,9 +151,16 @@ Status semantics:
 |---|---|
 | `OK` | Environment/protection OK (e.g. physical device, SSL pinning resisted the bypass, app detected and blocked Frida/hooking) |
 | `FALHOU` | Threat present or bypass won (e.g. root/emulator in the environment, pinning circumvented, app failed to detect Frida or anti-hook checks) |
-| `N/A` | Not applicable (e.g. no SSL pinning — bypass does not apply) |
-| `SKIP` | Check skipped via `--skip` |
-| `ERROR` | Check could not run (pipeline continues) |
+| `N/A` | Not applicable: the protection being measured does not exist (e.g. no SSL pinning) |
+| `SKIP` | A step did not run: skipped via `--skip`, or the bypass was not evaluated even though the protection exists (reason in `skip_reason`) |
+| `ERROR` | Check could not conclude (pipeline continues) — includes inconclusive observation |
+
+> **Golden rule:** RASPilot only claims a protection held when there is
+> high-confidence evidence. Generic logcat terms (`root`, `hook`,
+> `detected`, `checksum`), logs from hooking frameworks installed on the
+> device and the crash of the instrumentation agent itself are context —
+> they never support a verdict. A death with no attributable cause yields
+> inconclusive, not "the app detected it".
 
 > **Important:** RASPilot **does not permanently modify** the device.
 > After each run it stops the `frida-server`, removes
@@ -270,6 +327,10 @@ be wrapped as MCP tools with `FastMCP`:
 
 The JSON emitted by RASPilot already follows a stable schema
 (`metadata` / `summary` / `details`) designed for direct LLM reading.
+`metadata.schema_version` detects incompatible changes and
+`metadata.run` records the execution context (CLI arguments, Frida
+version, port, sha256 hashes of the injection scripts, target pid and
+baseline result) so the run can be reproduced.
 
 ---
 
@@ -283,6 +344,29 @@ The JSON emitted by RASPilot already follows a stable schema
 | `Dispositivo não ficou pronto em 15s` | Offline/connection issue | Check cable / `adb kill-server` |
 | App spawned but checks empty | App protected against debuggers | Use `--verbose` and inspect `details` in the JSON |
 | Window too short for slow apps | Long splash or late RASP checks | Increase with `--window 20` (or more) |
+
+---
+
+## Known limitations
+
+**The Java layer depends on the agent attaching to the app's virtual
+machine.** The Java bridge obtains the `JNIEnv` of the instrumentation
+thread. When a protection aborts or blocks that attachment, the Java
+layer simply does not come up: the checks that depend on it end up
+`SKIP` with the reason in `skip_reason`, and the native layer still
+holds. This is per-app behaviour and needs a workaround specific to the
+SDK.
+
+**Self-destruction neutralisation is on by default.** RASP techniques
+that abort the process or stop it with a signal are intercepted in the
+native layer, so the observation window does not end prematurely. The
+neutralised actions are listed in
+`details.<check>.<phase>.neutralized_actions` — they are evidence of
+what the app tried to do, not a detection of the app.
+
+**The logcat is supporting evidence, never a verdict.** Generic terms
+(`root`, `hook`, `detected`) and logs from operator tooling support no
+conclusion. See *Status semantics*.
 
 ## License and usage
 

@@ -21,9 +21,37 @@ import logging
 import os
 import threading
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 logger = logging.getLogger("raspilot.script_loader")
+
+# Conteúdo da bridge Java cacheado por caminho absoluto.
+_BRIDGE_CACHE: Dict[str, str] = {}
+
+# Runtime JavaScript padrão usado pelo Frida nos scripts do RASPilot.
+# Definido uma vez pela CLI (``--js-runtime``) e aplicável a todos os
+# carregamentos, sem precisar propagar o parâmetro por cada check.
+_JS_RUNTIME: Optional[str] = None
+
+
+def set_js_runtime(runtime: Optional[str]) -> None:
+    """Define o runtime JavaScript padrão dos próximos scripts.
+
+    Args:
+        runtime: ``"qjs"``, ``"v8"`` ou ``None`` para usar o padrão do
+            Frida.
+    """
+    global _JS_RUNTIME
+    _JS_RUNTIME = runtime
+
+
+def js_runtime() -> Optional[str]:
+    """Retorna o runtime JavaScript padrão configurado.
+
+    Returns:
+        ``"qjs"``, ``"v8"`` ou ``None``.
+    """
+    return _JS_RUNTIME
 
 try:
     import frida_tools
@@ -104,6 +132,164 @@ function raspilotPerformJava(fn) {
         return false;
     }
 }
+
+// Executa um callback na thread principal do app.
+//
+// A thread do JavaScript do Frida não é uma thread Java: a ponte Java a
+// anexa ao runtime sob demanda, e a resolução de classes nesse contexto
+// pode não concluir. Executar na thread principal do app é o caminho
+// suportado pela ponte e o que as ferramentas de instrumentação usam.
+function raspilotPerformJavaOnMain(fn) {
+    try {
+        if (typeof Java === 'undefined' || !Java.available) { return false; }
+        if (typeof Java.perform === 'function') {
+            Java.perform(fn);
+            return true;
+        }
+        return raspilotPerformJava(fn);
+    } catch (e) {
+        try {
+            send({ type: 'raspilot-script-error', message: 'hooks Java: ' + e });
+        } catch (e2) { /* host indisponível */ }
+        return false;
+    }
+}
+
+// Agenda a instalação dos hooks Java para depois do carregamento do
+// script.
+//
+// O script.load() só retorna quando o código de primeiro nível termina.
+// Instalar os hooks Java sincronamente faz o load bloquear pelo tempo
+// de inicialização do runtime Java no processo alvo — em apps com muitos
+// dex isso passa de meio minuto e o carregamento é interrompido pelo
+// limite do agente, que descarta o script no meio da execução.
+//
+// Adiar a instalação devolve o load imediatamente e deixa os hooks
+// entrarem em background. O script sinaliza a prontidão com
+// 'raspilot-java-ready'.
+function raspilotDeferJava(fn, label) {
+    try {
+        setImmediate(function () {
+            try {
+                if (typeof Java === 'undefined' || !Java.available) {
+                    try {
+                        send({ type: 'raspilot-java-unavailable', label: label || '' });
+                    } catch (e) { /* host indisponível */ }
+                    return;
+                }
+                raspilotPerformJavaOnMain(fn);
+                try {
+                    send({ type: 'raspilot-java-ready', label: label || '' });
+                } catch (e) { /* host indisponível */ }
+            } catch (e) {
+                try {
+                    send({ type: 'raspilot-script-error', message: 'hooks Java: ' + e });
+                } catch (e2) { /* host indisponível */ }
+            }
+        });
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+"""
+
+# Bootstrap da bridge Java, executado no topo de todo script Java.
+#
+# A bridge grava as classes geradas por ``Java.registerClass`` em um DEX
+# temporário dentro de ``Java.classFactory.cacheDir``. O diretório padrão
+# da bridge fica fora do sandbox do app, e o processo alvo roda com o uid
+# do próprio app: a gravação falha e ``registerClass`` deixa de funcionar.
+#
+# Este bootstrap redireciona o cache para um diretório gravável pelo app
+# (o code_cache do próprio app), o que torna ``registerClass`` utilizável.
+# O nome do arquivo temporário também é neutralizado, porque o DEX gerado
+# é um artefato observável pelo app.
+JAVA_BOOTSTRAP = """
+'use strict';
+
+// O bootstrap é adiado: tocar em ``Java.classFactory`` dispara a
+// inicialização do runtime Java no processo alvo, que em apps com muitos
+// dex leva dezenas de segundos. Feito no topo do script, ele bloqueia o
+// carregamento e o agente descarta o script ao atingir o limite.
+setImmediate(function () {
+    if (typeof Java === 'undefined' || !Java.available) { return; }
+    if (typeof Java.classFactory === 'undefined') { return; }
+
+    function applyDir(dir) {
+        if (!dir) { return false; }
+        try {
+            Java.classFactory.cacheDir = dir;
+            Java.classFactory.codeCacheDir = dir;
+            return true;
+        } catch (e) { return false; }
+    }
+
+    function currentApplication() {
+        try {
+            var AT = Java.use('android.app.ActivityThread');
+            var app = AT.currentApplication();
+            if (app !== null) { return app; }
+        } catch (e) { /* sem ActivityThread */ }
+        try {
+            var AG = Java.use('android.app.AppGlobals');
+            var app = AG.getInitialApplication();
+            if (app !== null) { return app; }
+        } catch (e) { /* sem AppGlobals */ }
+        return null;
+    }
+
+    function appCacheDir(app) {
+        if (app === null) { return null; }
+        try {
+            if ('getCodeCacheDir' in app) {
+                var d = app.getCodeCacheDir();
+                if (d !== null) { return d.getCanonicalPath(); }
+            }
+        } catch (e) { /* sem code_cache */ }
+        try {
+            var d = app.getFilesDir();
+            if (d !== null) { return d.getCanonicalPath(); }
+        } catch (e) { /* sem files dir */ }
+        return null;
+    }
+
+    var app = currentApplication();
+    var dir = appCacheDir(app);
+    if (dir === null) {
+        // O app ainda não foi criado (spawn muito cedo): deriva o diretório
+        // de dados do processo a partir do link simbólico do cwd, que
+        // pertence ao uid do app.
+        try {
+            var pid = Process.id;
+            var link = Memory.allocUtf8String('/proc/' + pid + '/cwd');
+            var buf = Memory.alloc(1024);
+            var rl = new NativeFunction(
+                Module.findGlobalExportByName('readlink'), 'pointer',
+                ['pointer', 'pointer', 'pointer'], { exceptions: 'propagate' });
+            var n = rl(link, buf, ptr(1024)).toInt32();
+            if (n > 0) {
+                var cwd = buf.readUtf8String(n);
+                var idx = cwd.lastIndexOf('/');
+                if (idx > 0) {
+                    dir = cwd.substring(0, idx) + '/code_cache';
+                }
+            }
+        } catch (e) { /* best-effort */ }
+    }
+
+    if (applyDir(dir)) {
+        try {
+            Java.classFactory.tempFileNaming = { prefix: 'opt', suffix: '' };
+        } catch (e) { /* best-effort */ }
+        try {
+            send({
+                type: 'raspilot-java-bootstrap',
+                message: 'classFactory cacheDir: ' + dir
+            });
+        } catch (e) { /* host indisponível */ }
+    }
+});
 """
 
 
@@ -122,16 +308,24 @@ def java_bridge_prelude() -> str:
     O ``bridges/java.js`` define ``var bridge = ...``; o epílogo
     ``var Java = bridge`` torna o uso nos scripts idêntico ao Frida 16.
 
+    O conteúdo é cacheado por caminho: a bridge tem centenas de KB e é
+    lida por todo script Java carregado na mesma execução.
+
     Returns:
         Código JS do prelúdio (string vazia se a bridge não existir).
     """
     if not java_bridge_available():
         return ""
-    try:
-        bridge_src = (_BRIDGES_DIR / "java.js").read_text(encoding="utf-8")
-    except OSError:
-        logger.warning("Falha ao ler bridge Java; script será carregado cru")
-        return ""
+    path = _BRIDGES_DIR / "java.js"
+    key = str(path)
+    bridge_src = _BRIDGE_CACHE.get(key)
+    if bridge_src is None:
+        try:
+            bridge_src = path.read_text(encoding="utf-8")
+        except OSError:
+            logger.warning("Falha ao ler bridge Java; script será carregado cru")
+            return ""
+        _BRIDGE_CACHE[key] = bridge_src
     return bridge_src + "\nvar Java = bridge;\n"
 
 
@@ -164,9 +358,9 @@ def prepare_script(
     """Prepara o código-fonte de um script Frida para injeção.
 
     Concatena (1) a bridge Java do frida-tools quando disponível e
-    solicitada, (2) o prelúdio de compatibilidade Frida 16/17 e (3) o
-    código do check/bypass. Placeholders de configuração são resolvidos
-    antes.
+    solicitada, (2) o prelúdio de compatibilidade Frida 16/17, (3) o
+    bootstrap da bridge Java e (4) o código do check/bypass. Placeholders
+    de configuração são resolvidos antes.
 
     Scripts puramente nativos (ex: ``proc_filter.js``) podem desativar a
     bridge com ``with_java_bridge=False``. Isso reduz drasticamente o
@@ -183,8 +377,25 @@ def prepare_script(
         Código preparado para ``session.create_script``.
     """
     rendered = render_script(source, replacements)
-    bridge = java_bridge_prelude() if with_java_bridge else ""
-    return bridge + COMPAT_PRELUDE + rendered
+    if not with_java_bridge:
+        return COMPAT_PRELUDE + rendered
+    return java_bridge_prelude() + COMPAT_PRELUDE + JAVA_BOOTSTRAP + rendered
+
+
+def iife(source: str) -> str:
+    """Encapsula um script em IIFE para evitar colisão de globais.
+
+    Usado para compor múltiplos scripts no mesmo ``create_script``: cada
+    um ganha seu próprio escopo, evitando que um script sobrescreva
+    ``rpc.exports`` ou variáveis globais de outro.
+
+    Args:
+        source: Código JS do script.
+
+    Returns:
+        Código encapsulado em IIFE.
+    """
+    return "(function(){\n" + source + "\n})();\n"
 
 
 def load_script(
@@ -195,6 +406,7 @@ def load_script(
     replacements: Optional[Dict[str, str]] = None,
     with_java_bridge: bool = True,
     load_timeout: Optional[float] = None,
+    runtime: Optional[str] = None,
 ) -> object:
     """Cria e carrega um script Frida preparado (com bridge Java).
 
@@ -208,6 +420,8 @@ def load_script(
             puramente nativos carregam muito mais rápido).
         load_timeout: Timeout opcional (segundos) para ``script.load()``.
             Evita travar o pipeline quando o alvo bloqueia a bridge.
+        runtime: Runtime JavaScript opcional (``"qjs"`` ou ``"v8"``).
+            ``None`` usa o padrão do Frida.
 
     Returns:
         O objeto ``frida.core.Script`` carregado.
@@ -221,7 +435,12 @@ def load_script(
         replacements=replacements,
         with_java_bridge=with_java_bridge,
     )
-    kwargs = {"name": name} if name else {}
+    kwargs: Dict[str, object] = {}
+    if name:
+        kwargs["name"] = name
+    effective_runtime = runtime or _JS_RUNTIME
+    if effective_runtime:
+        kwargs["runtime"] = effective_runtime
     started = time.monotonic()
     script = session.create_script(prepared, **kwargs)
     if on_message is not None:
@@ -242,14 +461,20 @@ def load_script(
         loader.start()
         loader.join(load_timeout)
         if loader.is_alive():
-            # Aborta em background; não bloqueia o pipeline.
-            def _abort() -> None:
+            # O load ainda está em curso. Descarregar em paralelo corrompe a
+            # sessão: o script é destruído no meio da execução e os hooks
+            # instalados até ali desaparecem. Aguarda a conclusão e só então
+            # descarta, em background, para não bloquear o pipeline.
+            def _discard() -> None:
+                loader.join()
                 try:
                     script.unload()
                 except Exception:
-                    logger.debug("Abort do script com timeout falhou", exc_info=True)
+                    logger.debug("Descarte do script com timeout falhou", exc_info=True)
 
-            threading.Thread(target=_abort, name="raspilot-script-abort", daemon=True).start()
+            threading.Thread(
+                target=_discard, name="raspilot-script-discard", daemon=True
+            ).start()
             raise TimeoutError(
                 f"script.load() excedeu {load_timeout}s"
                 + (f" ({name})" if name else "")
@@ -265,6 +490,54 @@ def load_script(
     return script
 
 
+def load_java_bundle(
+    session: object,
+    sources: Sequence[str],
+    on_message: Optional[Callable] = None,
+    name: Optional[str] = None,
+    replacements: Optional[Dict[str, str]] = None,
+    load_timeout: Optional[float] = None,
+    runtime: Optional[str] = None,
+) -> object:
+    """Carrega vários scripts Java em um único ``create_script``.
+
+    A bridge Java pré-compilada do frida-tools tem hundreds de KB e o
+    ``script.load()`` paga o custo de compilação a cada script. Como a
+    bridge é obrigatória para qualquer hook Java, ela é compilada uma vez
+    por sessão e os demais scripts são composed como IIFEs no mesmo
+    script — o que reduz o custo de carga de forma proporcional ao
+    número de scripts agrupados.
+
+    Args:
+        session: Sessão Frida ativa.
+        sources: Códigos JS a carregar (cada um em seu próprio escopo).
+        on_message: Callback de mensagens do script.
+        name: Nome opcional do script.
+        replacements: Mapa opcional de placeholders ``__RASPILOT_*__``.
+        load_timeout: Timeout opcional (segundos) para ``script.load()``.
+        runtime: Runtime JavaScript opcional (``"qjs"`` ou ``"v8"``).
+
+    Returns:
+        O objeto ``frida.core.Script`` carregado.
+
+    Raises:
+        Exception: erros do próprio Frida propagam ao chamador.
+    """
+    if not sources:
+        raise ValueError("load_java_bundle exige ao menos um source")
+    composed = "".join(iife(src) for src in sources)
+    return load_script(
+        session,
+        composed,
+        on_message=on_message,
+        name=name,
+        replacements=replacements,
+        with_java_bridge=True,
+        load_timeout=load_timeout,
+        runtime=runtime,
+    )
+
+
 def load_script_file(
     session: object,
     path: str,
@@ -273,6 +546,7 @@ def load_script_file(
     with_java_bridge: bool = True,
     name: Optional[str] = None,
     load_timeout: Optional[float] = None,
+    runtime: Optional[str] = None,
 ) -> object:
     """Lê um arquivo .js e o carrega via :func:`load_script`.
 
@@ -284,6 +558,7 @@ def load_script_file(
         with_java_bridge: Se False, não prepende a bridge Java.
         name: Nome opcional do script (default: basename do arquivo).
         load_timeout: Timeout opcional (segundos) para ``script.load()``.
+        runtime: Runtime JavaScript opcional (``"qjs"`` ou ``"v8"``).
 
     Returns:
         O ``Script`` carregado.
@@ -301,7 +576,73 @@ def load_script_file(
         replacements=replacements,
         with_java_bridge=with_java_bridge,
         load_timeout=load_timeout,
+        runtime=runtime,
     )
+
+
+def load_java_bundle_files(
+    session: object,
+    paths: Sequence[str],
+    on_message: Optional[Callable] = None,
+    name: Optional[str] = None,
+    replacements: Optional[Dict[str, str]] = None,
+    load_timeout: Optional[float] = None,
+    runtime: Optional[str] = None,
+) -> object:
+    """Carrega vários arquivos JS em um único script com a bridge Java.
+
+    Variante de :func:`load_java_bundle` que lê os scripts de disco.
+
+    Args:
+        session: Sessão Frida ativa.
+        paths: Caminhos dos arquivos JS a carregar.
+        on_message: Callback de mensagens do script.
+        name: Nome opcional do script.
+        replacements: Mapa opcional de placeholders ``__RASPILOT_*__``.
+        load_timeout: Timeout opcional (segundos) para ``script.load()``.
+        runtime: Runtime JavaScript opcional (``"qjs"`` ou ``"v8"``).
+
+    Returns:
+        O ``Script`` carregado.
+
+    Raises:
+        OSError: se algum arquivo não puder ser lido.
+        ValueError: se ``paths`` for vazio.
+    """
+    if not paths:
+        raise ValueError("load_java_bundle_files exige ao menos um path")
+    sources: List[str] = []
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as fh:
+            sources.append(fh.read())
+    return load_java_bundle(
+        session,
+        sources,
+        on_message=on_message,
+        name=name,
+        replacements=replacements,
+        load_timeout=load_timeout,
+        runtime=runtime,
+    )
+
+
+def wait_for_java_ready(ready: "threading.Event", timeout: float = 30.0) -> bool:
+    """Aguarda a camada Java ficar ativa na sessão.
+
+    A instalação dos hooks Java é adiada para depois do carregamento do
+    script, para que ``script.load()`` não fique bloqueado pelo tempo de
+    inicialização do runtime Java no processo alvo. O script sinaliza a
+    prontidão com a mensagem ``raspilot-java-ready``.
+
+    Args:
+        ready: Evento sinalizado pelo callback de mensagens quando a
+            camada Java fica pronta.
+        timeout: Tempo máximo de espera em segundos.
+
+    Returns:
+        True se a camada Java ficou pronta dentro do tempo limite.
+    """
+    return ready.wait(max(0.0, timeout))
 
 
 def safe_unload(script: Optional[object], timeout: float = 2.0) -> None:

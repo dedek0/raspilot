@@ -46,12 +46,6 @@ KILL_TRACE_SCRIPT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "kill_trace.js"
 )
 
-# Filtro de /proc (maps, TracerPid, /proc/net/tcp, comm de threads) —
-# esconde os artefatos do Frida durante o bypass.
-PROC_FILTER_SCRIPT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "proc_filter.js"
-)
-
 # Assinaturas estáticas: (tipo, [(needle_bytes, descrição), ...]).
 # Ordem define a prioridade na classificação do tipo.
 STATIC_SIGNATURES: List[Tuple[str, List[Tuple[bytes, str]]]] = [
@@ -575,15 +569,20 @@ class SSLPinningCheck:
             if precomputed_bypass is not None
             else self.attempt_bypass(package_name, window=window)
         )
+        bypass_error = bypass.get("error") if not bypass.get("success") else None
         result = {
             "pinning_detected": True,
             "pinning_type": detection.get("type", "none"),
-            "bypass_successful": bool(bypass.get("success")),
+            # Sem bypass avaliado o resultado é desconhecido, e não
+            # "resistiu ao bypass": o pinning detectado continua valendo.
+            "bypass_successful": (
+                None if bypass_error else bool(bypass.get("success"))
+            ),
             "evidence": detection.get("evidence", []),
             "bypass_details": bypass,
             "detection": detection,
             "timestamp": _now_iso(),
         }
-        if bypass.get("error") and not bypass.get("success"):
-            result["error"] = f"bypass: {bypass['error']}"
+        if bypass_error:
+            result["bypass_skipped_reason"] = f"bypass: {bypass_error}"
         return result

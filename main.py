@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import time
@@ -39,7 +40,7 @@ from device_manager import (
     FridaSetupError,
 )
 from reporter import Reporter
-from script_loader import safe_detach
+from script_loader import safe_detach, set_js_runtime
 
 # Console rich global — único ponto de saída visual do CLI.
 console = Console()
@@ -145,6 +146,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-java",
         action="store_true",
         help="Não carrega hooks Java (evita bridge em apps com RASP agressivo)",
+    )
+    parser.add_argument(
+        "--java-timeout",
+        type=float,
+        default=30.0,
+        metavar="SEG",
+        help=(
+            "Tempo máximo de carga dos scripts Java, em segundos. A carga "
+            "da bridge é dominada pela inicialização do runtime Java no "
+            "alvo e pela varredura de classloaders."
+        ),
+    )
+    parser.add_argument(
+        "--js-runtime",
+        choices=("qjs", "v8"),
+        default="qjs",
+        help="Runtime JavaScript usado pelo Frida para os scripts",
     )
     parser.add_argument(
         "--version",
@@ -263,6 +281,77 @@ def print_summary_table(reporter: Reporter) -> None:
     console.print(table)
 
 
+def _script_hashes() -> dict:
+    """Calcula o sha256 de cada script de injeção.
+
+    Os scripts JS definem a superfície de ataque efetiva da ferramenta:
+    um resultado só é reproduzível se os hooks aplicados forem os mesmos.
+
+    Returns:
+        Mapa ``nome do arquivo -> sha256``.
+    """
+    import hashlib
+
+    scripts_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "scripts"
+    )
+    hashes: dict = {}
+    try:
+        names = sorted(os.listdir(scripts_dir))
+    except OSError:
+        return hashes
+    for name in names:
+        if not name.endswith(".js"):
+            continue
+        path = os.path.join(scripts_dir, name)
+        try:
+            with open(path, "rb") as fh:
+                hashes[name] = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            continue
+    return hashes
+
+
+def _build_run_context(args: argparse.Namespace, dm: "DeviceManager") -> dict:
+    """Monta os metadados que permitem reproduzir a execução.
+
+    Args:
+        args: Argumentos já parseados.
+        dm: Gerenciador do dispositivo.
+
+    Returns:
+        Dict com os metadados da execução.
+    """
+    try:
+        import frida
+
+        frida_version = frida.__version__
+    except Exception:
+        frida_version = None
+
+    baseline = getattr(dm, "baseline", None)
+    return {
+        "cli_args": {
+            "mode": args.mode,
+            "no_java": bool(args.no_java),
+            "window": args.window,
+            "baseline_window": args.baseline_window,
+            "java_timeout": args.java_timeout,
+            "js_runtime": args.js_runtime,
+            "skip": list(args.skip or []),
+            "device_id": args.device_id,
+            "wifi": args.wifi,
+        },
+        "frida_client_version": frida_version,
+        "frida_port": getattr(dm, "frida_port", None),
+        "script_sha256": _script_hashes(),
+        "baseline": baseline if isinstance(baseline, dict) else None,
+        "logcat_capture": {
+            "available": bool(getattr(dm, "_logcat_available", False)),
+        },
+    }
+
+
 def run_pipeline(args: argparse.Namespace) -> int:
     """Executa o pipeline completo de auditoria RASP.
 
@@ -309,6 +398,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         device_info=info,
         package_name=args.package,
         output_dir=args.output_dir,
+        run_context=_build_run_context(args, dm),
     )
 
     session = None
@@ -368,6 +458,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 session = dm.spawn_app(args.package, resume=False)
             pid = dm.get_app_pid(args.package)
             console.print(f"[green]✓[/] App spawnado suspenso (pid={pid})")
+            reporter.run_context["target_pid"] = pid
             if pid is not None:
                 with console.status("[cyan]Observando camadas em sessão única...[/]"):
                     frida_detection, hook_detection = run_combined_observation(
@@ -380,6 +471,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                         dm.resume_app,
                         mode=args.mode,
                         no_java=args.no_java,
+                        java_timeout=args.java_timeout,
                     )
 
         # 8) Anti-Frida (usa a detecção combinada; vetores de dispositivo
@@ -416,6 +508,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 hooking_bypass, ssl_bypass = run_combined_bypass(
                     dm, args.package, args.window,
                     mode=args.mode, no_java=args.no_java,
+                    java_timeout=args.java_timeout,
                 )
 
         # 10) Anti-Hooking (usa detecção e bypass combinados quando houver).
@@ -487,6 +580,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     logger = logging.getLogger("raspilot")
     logger.debug("Args: %s", args)
+    set_js_runtime(args.js_runtime)
 
     # Garante cleanup (force-stop/remoção do frida-server) também quando
     # o processo recebe SIGTERM (ex: timeout do shell/CI).

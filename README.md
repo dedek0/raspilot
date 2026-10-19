@@ -18,11 +18,58 @@ coletadas.
 
 ## Requisitos
 
+### No host
+
 - Python 3.9+
 - `adb` (Android Platform Tools) no `PATH`
-- Dispositivo Android com **Depuração USB** ativada (físico ou emulador)
 - Frida — o `frida-server` compatível é baixado automaticamente na versão
   do pacote `frida` instalado localmente
+
+### No dispositivo Android
+
+O RASPilot roda em **dispositivo físico ou emulador**, com os requisitos
+abaixo. Quanto mais próximo do ambiente real de produção, mais útil é o
+resultado: emulador não reproduz as proteções de hardware.
+
+| Item | Requisito | Por quê |
+|---|---|---|
+| Versão do Android | API 24+ (Android 7.0) | o `frida-server` usado pela auditoria não suporta versões mais antigas |
+| Arquitetura | `arm64-v8a`, `armeabi-v7a`, `x86_64` ou `x86` | o `frida-server` é baixado para a ABI do aparelho; `riscv64` **não** é suportado |
+| Depuração USB | ativada nas Opções do desenvolvedor | o `adb` precisa conversar com o aparelho |
+| Autorização de depuração | o popup "Permitir depuração USB" precisa ser aceito | sem isso o aparelho aparece como `unauthorized` e não há conexão |
+| Root | **recomendado** (Magisk, KernelSU, APatch) | sem root o `frida-server` roda com o uid do `shell` e alguns vetores de detecção (TracerPid, portas, leitura de `/proc/<pid>/maps` de outros processos) ficam incompletos |
+| SELinux | `permissive` facilita; `enforcing` funciona | em modo enforcing o `frida-server` precisa de root para injetar em processos de apps |
+| Espaço livre | ~200 MB | `frida-server` (~60 MB) e o cache de APKs |
+| Bateria | o processo de auditoria consome CPU | uma janela de 20–30 s de observação já é suficiente |
+
+Preparação usual (todas opcionais, mas alteram o resultado):
+
+```bash
+# 1) depuração USB + aceitar o popup de autorização
+# 2) root (Magisk/KernelSU), se disponível
+# 3) ADB over Wi-Fi, para não depender do cabo
+adb tcpip 5555
+```
+
+**Cuidados com o ambiente de auditoria.** O RASPilot detecta o que está
+instalado no aparelho, e uma ferramenta de hooking ativa **contamina o
+resultado**: o log de um framework de hooking instalado é do operador, não
+da proteção do app auditado. O relatório separa essas duas coisas — mas
+para uma leitura limpa, audite em um aparelho sem frameworks de hooking
+instalados.
+
+### Permissões e artefatos usados
+
+O RASPilot é **não destrutivo**, mas usa o aparelho de forma observável:
+
+- `/data/local/tmp` — recebe o `frida-server` (com nome opaco) durante a
+  execução e é **removido ao final**
+- `adb forward` — um túnel local para o servidor do Frida, desfeito ao final
+- `logcat` — leitura contínua do buffer do sistema
+- O app alvo é **forçado a parar** (force-stop) ao final de cada execução
+
+O `frida-server` e o túnel são encerrados mesmo quando a auditoria falha
+no meio.
 
 ## Instalação
 
@@ -76,6 +123,8 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--no-baseline` | não | Não executa o baseline antes dos checks dinâmicos |
 | `--mode MODE` | não | Modo: `detect` (só observação), `bypass` (observação+bypass) ou `stealth` (bootstrap nativo antes do resume) |
 | `--no-java` | não | Não carrega hooks Java; útil em apps com RASP que bloqueia a bridge |
+| `--java-timeout SEG` | não | Tempo máximo de carga dos scripts Java (default `30`). A carga da bridge é dominada pela inicialização do runtime Java no alvo e pela varredura de classloaders |
+| `--js-runtime RUNTIME` | não | Runtime JavaScript do Frida: `qjs` (default) ou `v8` |
 | `--verbose` | não | Logging em nível DEBUG |
 | `--skip CHECK...` | não | Checks a pular (`anti_root`, `anti_frida`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
 
@@ -102,9 +151,16 @@ Semântica de status:
 |---|---|
 | `OK` | Ambiente/proteção OK (ex: dispositivo físico, SSL pinning resistiu ao bypass, app detectou e bloqueou o Frida/hooking) |
 | `FALHOU` | Ameaça presente ou bypass venceu (ex: root/emulador no ambiente, pinning contornado, app não detectou o Frida nem checagens anti-hook) |
-| `N/A` | Não aplicável (ex: sem SSL pinning — bypass não faz sentido) |
-| `SKIP` | Verificação pulada via `--skip` |
-| `ERROR` | A verificação não pôde executar (o pipeline continua) |
+| `N/A` | Não aplicável: não existe a proteção que se mediria (ex: sem SSL pinning) |
+| `SKIP` | Etapa que não rodou: pulada via `--skip`, ou bypass não avaliado apesar de a proteção existir (o motivo vai em `skip_reason`) |
+| `ERROR` | A verificação não pôde concluir (o pipeline continua) — inclui observação inconclusiva |
+
+> **Regra de ouro:** o RASPilot só afirma que uma proteção resistiu quando
+> houve evidência de confiança alta. Termos genéricos de logcat (`root`,
+> `hook`, `detected`, `checksum`), logs de frameworks de hooking
+> instalados no device e o crash do próprio agente de instrumentação são
+> contexto — nunca sustentam um veredito. Uma morte sem causa atribuível
+> resulta em inconclusivo, não em "o app detectou".
 
 > **Importante:** o RASPilot **não modifica permanentemente** o dispositivo.
 > Ao final de cada execução ele encerra o `frida-server`, remove
@@ -271,6 +327,10 @@ serem envolvidos como ferramentas MCP com `FastMCP`:
 
 O JSON emitido pelo RASPilot já segue um schema estável
 (`metadata` / `summary` / `details`) pensado para leitura direta por LLMs.
+`metadata.schema_version` permite detectar mudanças incompatíveis e
+`metadata.run` registra o contexto da execução (argumentos da CLI, versão
+do Frida, porta, hashes sha256 dos scripts de injeção, pid alvo e
+resultado do baseline) para que a execução possa ser reproduzida.
 
 ---
 
@@ -284,6 +344,30 @@ O JSON emitido pelo RASPilot já segue um schema estável
 | `Dispositivo não ficou pronto em 15s` | Offline/USB com problema | Confira cabo/`adb kill-server` |
 | App spawnado mas checks vazios | App protegido contra debugger | Use `--verbose` e inspecione `details` no JSON |
 | Verificação curta demais para apps lentos | Splash longa ou RASP tardio | Aumente com `--window 20` (ou mais) |
+| `SKIP` com `skip_reason` no bypass | A camada Java não ficou ativa a tempo | Aumente `--java-timeout`; veja *Limitações conhecidas* |
+| App morre logo após o resume | Auto-destruição do app ao detectar a instrumentação | A camada nativa neutraliza `abort`/sinais; as ações neutralizadas aparecem em `neutralized_actions` |
+
+---
+
+## Limitações conhecidas
+
+**A camada Java depende da anexação do agente à máquina virtual do app.**
+A bridge Java obtém o `JNIEnv` da thread do agente de instrumentação.
+Quando uma proteção aborta ou bloqueia essa anexação, a camada Java
+simplesmente não sobe: os checks que dependem dela ficam `SKIP` com o
+motivo em `skip_reason`, e a camada nativa continua valendo. Isso é
+comportamento por app e precisa de um contorno específico do SDK.
+
+**A neutralização de auto-destruição é ativa por padrão.** Vasos de RASP
+que abortam o processo ou o param com um sinal de parada são
+interceptados na camada nativa, para que a janela de observação não
+termine antes do fim. As ações neutralizadas ficam em
+`details.<check>.<fase>.neutralized_actions` — são evidência do que o app
+tentou fazer, e não uma detecção do app.
+
+**O logcat é evidência de apoio, não de veredito.** Termos genéricos
+(`root`, `hook`, `detected`) e logs de ferramentas do operador não
+sustentam nenhuma conclusão. Ver *Semântica de status*.
 
 ## Licença e uso
 

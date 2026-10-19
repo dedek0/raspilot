@@ -99,7 +99,10 @@ function installNative() {
 }
 
 function installJava() {
-    var ok = raspilotPerformJava(function () {
+    // A instalação é adiada: tocar em Java dispara a inicialização do
+    // runtime Java no processo alvo, que pode levar dezenas de segundos
+    // e bloquearia o carregamento do script.
+    raspilotDeferJava(function () {
         try {
             var Sys = Java.use('java.lang.System');
             Sys.exit.implementation = function (code) {
@@ -131,10 +134,7 @@ function installJava() {
                 this.killProcess(pid);
             };
         } catch (e) { /* best-effort */ }
-    });
-    if (!ok) {
-        report('kill-trace: Java indisponível — apenas nativo');
-    }
+    }, 'kill-trace');
 }
 
 function main() {

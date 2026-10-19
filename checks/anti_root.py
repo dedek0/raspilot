@@ -419,21 +419,39 @@ class AntiRootCheck:
         # Qualquer vetor positivo indica root; confiança vem da quantidade.
         positive = [name for name, res in checks.items() if res.get("detected")]
 
+        # Um vetor só é conclusivo se a coleta nele realmente funcionou.
+        # Sem essa contagem, um device inacessível produziria zero vetores
+        # positivos e o veredito seria "ambiente limpo" — a conclusao
+        # oposta do que a ausencia de dados permite afirmar.
+        evaluated = [
+            name for name, res in checks.items() if not res.get("error")
+        ]
+        failed = [name for name, res in checks.items() if res.get("error")]
+
         is_rooted = bool(positive)
         if len(positive) >= 2:
             confidence = "high"
         elif len(positive) == 1:
             confidence = "medium"
-        else:
+        elif evaluated:
             confidence = "low"
+        else:
+            confidence = "none"
 
         result = {
             "is_rooted": is_rooted,
             "confidence": confidence,
             "positive_vectors": positive,
+            "evaluated_vectors": evaluated,
+            "failed_vectors": failed,
             "checks": checks,
             "timestamp": _now_iso(),
         }
+        if not evaluated:
+            result["error"] = (
+                "nenhum vetor anti-root pôde ser avaliado: "
+                f"falhas em {', '.join(failed) or 'todos os vetores'}"
+            )
         logger.info(
             "Anti-Root: is_rooted=%s confidence=%s vetores=%s",
             is_rooted, confidence, positive,

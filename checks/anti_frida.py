@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 from checks.stealth import load_stealth, unload_stealth
 from logcat_analyzer import (
-    RASP_CATEGORIES,
+    HIGH_CONFIDENCE_CATEGORIES,
     analyze_since,
     classify_failure,
     format_detection_signals,
@@ -221,10 +221,18 @@ function installJavaHooks() {
     } catch (e) { /* Java indisponível */ }
 }
 
-if (typeof raspilotPerformJava === 'function') {
-    raspilotPerformJava(installJavaHooks);
-} else if (typeof Java !== 'undefined' && Java.available) {
-    Java.perform(installJavaHooks);
+// A instalação é adiada: o carregamento do script precisa retornar antes
+// que o agente limite o tempo de carga do script.
+// Na fase nativa a bridge Java não existe, então os hooks Java ficam
+// de fora.
+if (RASPILOT_JAVA_ONLY) {
+    if (typeof raspilotDeferJava === 'function') {
+        raspilotDeferJava(installJavaHooks, 'anti-frida-detect');
+    } else if (typeof raspilotPerformJava === 'function') {
+        raspilotPerformJava(installJavaHooks);
+    } else if (typeof Java !== 'undefined' && Java.available) {
+        Java.perform(installJavaHooks);
+    }
 }
 
 // Relata o snapshot final para o host quando solicitado.
@@ -766,16 +774,24 @@ class AntiFridaCheck:
             if entry not in found:
                 found.append(entry)
         if logcat.get("agent_terminated"):
-            # O agente Frida foi derrubado (stack em runtime.cc): é uma
-            # reação do alvo, mesmo que o processo principal sobreviva.
+            # O agente Frida foi derrubado dentro do processo (stack em
+            # runtime.cc). Isso é falha da instrumentação, não prova de
+            # que o app detectou o Frida: a observação fica inconclusiva.
+            agent_line = None
             for item in logcat.get("security_signals", []) or []:
                 if isinstance(item, dict) and item.get("category") == "frida_agent_crash":
-                    entry = f"frida_agent_crash: {item.get('line', '')}"
-                    if entry not in found:
-                        found.append(entry)
+                    agent_line = f"frida_agent_crash: {item.get('line', '')}"
                     break
-            if java_load_error:
-                observation_status = "rasp_agent_terminated"
+            if app_alive:
+                observation_status = "error"
+                error = (
+                    "o agente de instrumentação terminou dentro do processo "
+                    "alvo; a observação é inconclusiva"
+                )
+                if agent_line:
+                    found.append(agent_line)
+            elif agent_line:
+                found.append(agent_line)
 
         if app_alive and self.no_java and not found:
             observation_status = "native_only"
@@ -800,7 +816,7 @@ class AntiFridaCheck:
             logcat_death = logcat.get("death") or {}
             logcat_rasp = any(
                 category in (logcat.get("categories") or {})
-                for category in RASP_CATEGORIES
+                for category in HIGH_CONFIDENCE_CATEGORIES
             )
             kill_traced = any(item.startswith("app_kill") for item in found)
 

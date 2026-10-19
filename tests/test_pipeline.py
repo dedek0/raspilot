@@ -71,15 +71,21 @@ class FakeSession:
         return []
 
     def create_script(self, source, **kwargs):
+        messages = []
         if "CertificatePinner" in source or "ssl_verify_result" in source:
-            return FakeScript([
+            messages.extend([
                 {"type": "send", "payload": {
                     "type": "ssl-bypass",
                     "message": "OkHttp CertificatePinner.check bypass (api.x.com)",
                 }},
                 {"type": "send", "payload": {"type": "ssl-bypass-host", "host": "api.x.com"}},
             ])
-        return FakeScript([])
+        if "var Java = bridge;" in source:
+            # A camada Java e instalada de forma adiada: o script
+            # sinaliza a prontidao depois do carregamento.
+            messages.append({"type": "send", "payload": {
+                "type": "raspilot-java-ready", "label": "fake"}})
+        return FakeScript(messages)
 
     def detach(self):
         pass

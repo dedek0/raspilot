@@ -107,7 +107,9 @@ class TestFrida17Compat:
                 assert "raspilotFindExport" in source, f"{name} sem raspilotFindExport"
             if name not in ("anti_root_bypass.js", "proc_filter.js"):
                 # proc_filter.js é 100% nativo (sem hooks Java).
-                assert "raspilotPerformJava" in source, f"{name} sem raspilotPerformJava"
+                assert ("raspilotPerformJava" in source
+                        or "raspilotDeferJava" in source), \
+                    f"{name} sem helper de camada Java"
 
 
 class TestSafeUnload:

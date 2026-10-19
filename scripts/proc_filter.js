@@ -39,6 +39,15 @@ function report(msg) {
     } catch (e) { /* host indisponível */ }
 }
 
+// Evidência de bypass: o app leu o arquivo de /proc e alguma indicação
+// de framework foi de fato removida do conteúdo. Uma leitura sem
+// qualquer remoção não é evidência de nada.
+function reportEvidence(msg) {
+    try {
+        send({ type: 'bypass-evidence', message: msg });
+    } catch (e) { /* host indisponível */ }
+}
+
 function setErrno(value) {
     try {
         var errnoFn = raspilotFindExport('libc.so', '__errno');
@@ -193,6 +202,23 @@ function filterProc(kind, text) {
     return filterComm(text);
 }
 
+// Reencaixa o conteúdo filtrado no tamanho original.
+//
+// O offset do arquivo no kernel já avançou com a leitura: devolver menos
+// bytes do que o app pediu faz o app perder a diferença e enxergar um
+// /proc truncado no meio do registro, o que é um sinal de adulteração e
+// pode derrubar parsers que dependem da estrutura do arquivo.
+//
+// O preenchimento é feito com quebras de linha: a contagem de linhas do
+// arquivo permanece a mesma e o tamanho devolvido é idêntico ao original.
+// O cálculo é feito em bytes, e não em caracteres, para não estourar o
+// buffer quando o conteúdo tiver caracteres multibyte.
+function padToSize(text, size) {
+    var current = strToBytes(text).length;
+    if (current >= size) { return null; }
+    return text + '\n'.repeat(size - current);
+}
+
 // ----------------------------------------------------------------------
 // Rastreio de fds/FILE* de /proc
 // ----------------------------------------------------------------------
@@ -257,16 +283,12 @@ function hookProcReads() {
                         if (orig === null || orig.length === 0) { return; }
                         var res = filterProc(this._kind, orig);
                         if (!res.changed) { return; }
-                        var text = res.text;
-                        if (text.length < n) {
-                            this._buf.writeUtf8String(text);
-                            retval.replace(ptr(text.length));
-                        } else if (text.length === n) {
-                            this._buf.writeByteArray(strToBytes(text));
-                        } else {
-                            return; // não cabe no buffer — mantém original
-                        }
-                        report('neutralizado: ' + kindLabel(this._kind) + ' em read() → ' +
+                        // O tamanho devolvido ao app é preservado: só o
+                        // conteúdo muda.
+                        var text = padToSize(res.text, n);
+                        if (text === null) { return; }
+                        this._buf.writeByteArray(strToBytes(text));
+                        reportEvidence('neutralizado: ' + kindLabel(this._kind) + ' em read() → ' +
                                res.count + ' ' + res.label);
                     } catch (e) { /* best-effort */ }
                 }
@@ -290,10 +312,13 @@ function hookProcReads() {
                         if (orig === null || orig.length === 0) { return; }
                         var res = filterProc(this._kind, orig);
                         if (!res.changed) { return; }
-                        var text = res.text;
-                        if (text.length >= orig.length) { return; }
-                        this._buf.writeUtf8String(text);
-                        report('neutralizado: ' + kindLabel(this._kind) + ' em fgets() → ' +
+                        // O comprimento devolvido é preservado: o stdio já
+                        // avançou no arquivo e devolver menos caracteres
+                        // desalinharia as leituras seguintes.
+                        var text = padToSize(res.text, orig.length);
+                        if (text === null) { return; }
+                        this._buf.writeByteArray(strToBytes(text));
+                        reportEvidence('neutralizado: ' + kindLabel(this._kind) + ' em fgets() → ' +
                                res.count + ' ' + res.label);
                     } catch (e) { /* best-effort */ }
                 }
@@ -343,7 +368,7 @@ function hookThreadNames() {
                     if (matchesHookFramework(name)) {
                         // Nome benigno mais curto que o original (buffer seguro).
                         args[1].writeUtf8String('Jit worker');
-                        report('neutralizado: pthread_setname_np(' + name + ') oculto');
+                        reportEvidence('neutralizado: pthread_setname_np(' + name + ') oculto');
                     }
                 } catch (e) { /* best-effort */ }
             }
@@ -371,7 +396,7 @@ function hookReadlinkFamily() {
                     if (this._block) {
                         setErrno(2);
                         retval.replace(ptr(-1));
-                        report('neutralizado: ' + name + '(' + this._path + ') -> ENOENT');
+                        reportEvidence('neutralizado: ' + name + '(' + this._path + ') -> ENOENT');
                     }
                 }
             });
@@ -395,7 +420,7 @@ function hookPtrace() {
             onLeave: function (retval) {
                 if (this._traced) {
                     retval.replace(ptr(0));
-                    report('neutralizado: ptrace(PTRACE_TRACEME) -> 0');
+                    reportEvidence('neutralizado: ptrace(PTRACE_TRACEME) -> 0');
                 }
             }
         });
@@ -438,7 +463,7 @@ function hookRawSyscall() {
                         if (this._block) {
                             setErrno(2);
                             retval.replace(ptr(-1));
-                            report('neutralizado: syscall(openat,' + this._path + ') -> ENOENT');
+                            reportEvidence('neutralizado: syscall(openat,' + this._path + ') -> ENOENT');
                         } else if (this._kind !== null) {
                             var fd = retval.toInt32();
                             if (fd >= 0) { rawFdKind[fd] = this._kind; }
@@ -450,16 +475,10 @@ function hookRawSyscall() {
                             if (orig !== null && orig.length > 0) {
                                 var res = filterProc(this._kind, orig);
                                 if (res.changed) {
-                                    var text = res.text;
-                                    if (text.length < n) {
-                                        this._buf.writeUtf8String(text);
-                                        retval.replace(ptr(text.length));
-                                    } else if (text.length === n) {
-                                        this._buf.writeByteArray(strToBytes(text));
-                                    } else {
-                                        return;
-                                    }
-                                    report('neutralizado: ' + kindLabel(this._kind) +
+                                    var text = padToSize(res.text, n);
+                                    if (text === null) { return; }
+                                    this._buf.writeByteArray(strToBytes(text));
+                                    reportEvidence('neutralizado: ' + kindLabel(this._kind) +
                                            ' em syscall(read) → ' + res.count + ' ' + res.label);
                                 }
                             }
@@ -467,10 +486,10 @@ function hookRawSyscall() {
                     } else if (this._nr === SYSCALL_NR.readlinkat && this._block) {
                         setErrno(2);
                         retval.replace(ptr(-1));
-                        report('neutralizado: syscall(readlinkat,' + this._path + ') -> ENOENT');
+                        reportEvidence('neutralizado: syscall(readlinkat,' + this._path + ') -> ENOENT');
                     } else if (this._nr === SYSCALL_NR.ptrace && this._traced) {
                         retval.replace(ptr(0));
-                        report('neutralizado: syscall(ptrace) -> 0');
+                        reportEvidence('neutralizado: syscall(ptrace) -> 0');
                     }
                 } catch (e) { /* best-effort */ }
             }

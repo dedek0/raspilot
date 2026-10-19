@@ -55,6 +55,15 @@ function report(msg) {
     } catch (e) { /* host indisponível — ignora */ }
 }
 
+// Evidência de bypass: a checagem do app foi de fato exercitada e o
+// resultado foi neutralizado. Difere do simples "hook instalado", que
+// apenas indica que a instrumentação está ativa.
+function reportEvidence(msg) {
+    try {
+        send({ type: 'bypass-evidence', message: msg });
+    } catch (e) { /* host indisponível — ignora */ }
+}
+
 function matchesHookFramework(str) {
     try {
         if (str === null || str === undefined) { return false; }
@@ -97,7 +106,7 @@ function hookClassLookups() {
         forName1.implementation = function (name) {
             try {
                 if (matchesHookFramework(name)) {
-                    report("neutralizado: Class.forName('" + name + "') -> null");
+                    reportEvidence("neutralizado: Class.forName('" + name + "') -> null");
                     return null;
                 }
             } catch (e) { /* best-effort */ }
@@ -115,7 +124,7 @@ function hookClassLookups() {
         forName3.implementation = function (name, initialize, loader) {
             try {
                 if (matchesHookFramework(name)) {
-                    report("neutralizado: Class.forName('" + name + "', ...) -> null");
+                    reportEvidence("neutralizado: Class.forName('" + name + "', ...) -> null");
                     return null;
                 }
             } catch (e) { /* best-effort */ }
@@ -132,7 +141,7 @@ function hookClassLookups() {
             var shouldThrow = false;
             try { shouldThrow = matchesHookFramework(name); } catch (e) { shouldThrow = false; }
             if (shouldThrow) {
-                report("neutralizado: ClassLoader.loadClass('" + name + "') -> ClassNotFoundException");
+                reportEvidence("neutralizado: ClassLoader.loadClass('" + name + "') -> ClassNotFoundException");
                 throw CNFE.$new('' + name);
             }
             return this.loadClass(name);
@@ -152,7 +161,7 @@ function hookFileChecks() {
             var path = '' + this.getAbsolutePath();
             try {
                 if (matchesHookFramework(path)) {
-                    report('neutralizado: File.exists(' + path + ') -> false');
+                    reportEvidence('neutralizado: File.exists(' + path + ') -> false');
                     return false;
                 }
             } catch (e) { /* best-effort */ }
@@ -178,7 +187,7 @@ function hookFileChecks() {
                     kept.push(entry);
                 }
                 if (removed > 0) {
-                    report('neutralizado: File.list(' + dir + ') -> ' + removed +
+                    reportEvidence('neutralizado: File.list(' + dir + ') -> ' + removed +
                            ' entrada(s) removida(s)');
                     return Java.array('java.lang.String', kept);
                 }
@@ -205,7 +214,7 @@ function hookFileChecks() {
                     kept.push(orig[i]);
                 }
                 if (removed > 0) {
-                    report('neutralizado: File.listFiles(' + dir + ') -> ' + removed +
+                    reportEvidence('neutralizado: File.listFiles(' + dir + ') -> ' + removed +
                            ' entrada(s) removida(s)');
                     return Java.array('java.io.File', kept);
                 }
@@ -285,7 +294,7 @@ function filterFrames(frames, source) {
             kept.push(frames[i]);
         }
         if (removed > 0) {
-            report('neutralizado: ' + source + ' -> ' + removed +
+            reportEvidence('neutralizado: ' + source + ' -> ' + removed +
                    ' frame(s) de hook removido(s)');
             return Java.array('java.lang.StackTraceElement', kept);
         }
@@ -341,7 +350,7 @@ function hookLibcStringHooks() {
                     } else {
                         retval.replace(ptr(1)); // "diferente"
                     }
-                    report('neutralizado: libc.' + name + ' -> string de framework oculta');
+                    reportEvidence('neutralizado: libc.' + name + ' -> string de framework oculta');
                 }
             });
             report('libc.' + name + ' hookado');
@@ -372,7 +381,7 @@ function hookLibcStringHooks() {
                 onLeave: function (retval) {
                     if (this._hide) {
                         retval.replace(ptr(1)); // buffers diferentes
-                        report('neutralizado: libc.memcmp -> buffers considerados diferentes');
+                        reportEvidence('neutralizado: libc.memcmp -> buffers considerados diferentes');
                     }
                 }
             });
@@ -406,7 +415,7 @@ function hookOpenFamily() {
                     if (this._block) {
                         setErrno(2); // ENOENT
                         retval.replace(ptr(-1));
-                        report('neutralizado: ' + name + '(' + this._path + ') -> ENOENT');
+                        reportEvidence('neutralizado: ' + name + '(' + this._path + ') -> ENOENT');
                     }
                 }
             });
@@ -436,7 +445,7 @@ function hookFopenFamily() {
                     if (this._block) {
                         setErrno(2); // ENOENT
                         retval.replace(ptr(0)); // NULL
-                        report('neutralizado: ' + name + '(' + this._path + ') -> ENOENT');
+                        reportEvidence('neutralizado: ' + name + '(' + this._path + ') -> ENOENT');
                     }
                 }
             });
@@ -468,7 +477,7 @@ function hookAccessStatFamily() {
                         if (this._block) {
                             setErrno(2); // ENOENT
                             retval.replace(ptr(-1));
-                            report('neutralizado: ' + name + '(' + this._path + ') -> ENOENT');
+                            reportEvidence('neutralizado: ' + name + '(' + this._path + ') -> ENOENT');
                         }
                     }
                 });
@@ -495,15 +504,14 @@ function main() {
     }
 
     var attachJava = function () {
-        var ok = raspilotPerformJava(function () {
+        // A instalação Java é adiada: o carregamento do script precisa
+        // retornar antes que o agente limite o tempo de carga.
+        raspilotDeferJava(function () {
             hookClassLookups();
             hookFileChecks();
             hookRuntimeExec();
             hookStackTrace();
-        });
-        if (!ok) {
-            report('Java indisponível — hooks Java pulados');
-        }
+        }, 'anti-hooking-bypass');
     };
     attachJava();
 

@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 from checks.apk_utils import pull_apk, scan_apk
 from checks.stealth import PROC_FILTER_SCRIPT, load_stealth, unload_stealth
 from logcat_analyzer import (
-    RASP_CATEGORIES,
+    HIGH_CONFIDENCE_CATEGORIES,
     analyze_since,
     classify_failure,
     format_detection_signals,
@@ -64,12 +64,6 @@ HOOK_BYPASS_SCRIPT = os.path.join(
 # que pilha) — observado junto com o script anti-hook.
 KILL_TRACE_SCRIPT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "kill_trace.js"
-)
-
-# Filtro de /proc (maps, TracerPid, /proc/net/tcp, comm de threads) —
-# carregado junto com o bypass para esconder os artefatos do Frida.
-PROC_FILTER_SCRIPT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "proc_filter.js"
 )
 
 # Substrings que identificam frameworks de hooking nos packages instalados.
@@ -169,6 +163,10 @@ WEAK_DETECTION_METHODS = (
 
 # Trechos de log do anti_hooking_bypass.js que comprovam que uma checagem
 # anti-hook foi neutralizada em runtime (diferente de mero "hook instalado").
+# Tipo de mensagem que carrega evidência real de bypass: a checagem do
+# app foi exercitada e o resultado foi neutralizado. O simples "hook
+# instalado" é diagnóstico e não sustenta o veredito.
+BYPASS_EVIDENCE_TYPE = "bypass-evidence"
 BYPASS_EVIDENCE_MARKERS = ("neutralizado", "bloqueado", "removido")
 
 # Script de OBSERVAÇÃO (não bypass): registra as checagens anti-hook que o
@@ -451,10 +449,18 @@ function installJavaHooks() {
     } catch (e) { /* Java indisponível */ }
 }
 
-if (typeof raspilotPerformJava === 'function') {
-    raspilotPerformJava(installJavaHooks);
-} else if (typeof Java !== 'undefined' && Java.available) {
-    Java.perform(installJavaHooks);
+// A instalação é adiada: o carregamento do script precisa retornar antes
+// que o agente limite o tempo de carga do script.
+// Na fase nativa a bridge Java não existe, então os hooks Java ficam
+// de fora.
+if (RASPILOT_JAVA_ONLY) {
+    if (typeof raspilotDeferJava === 'function') {
+        raspilotDeferJava(installJavaHooks, 'anti-hooking-detect');
+    } else if (typeof raspilotPerformJava === 'function') {
+        raspilotPerformJava(installJavaHooks);
+    } else if (typeof Java !== 'undefined' && Java.available) {
+        Java.perform(installJavaHooks);
+    }
 }
 """
 
@@ -1047,9 +1053,14 @@ class AntiHookingCheck:
             method, _, detail = entry.partition(": ")
             add_signal(method, detail)
         if logcat.get("agent_terminated"):
+            # Falha da instrumentação (o agente quebrou dentro do
+            # processo): é contexto, não checagem anti-hook do app.
             for item in logcat.get("security_signals", []) or []:
                 if isinstance(item, dict) and item.get("category") == "frida_agent_crash":
-                    add_signal("frida_agent_crash", item.get("line", ""))
+                    entry = f"frida_agent_crash: {item.get('line', '')}"
+                    if entry not in found:
+                        found.append(entry)
+                        weak.append(entry)
                     break
 
         death_cause: Optional[dict] = None
@@ -1082,7 +1093,7 @@ class AntiHookingCheck:
             logcat_death = logcat.get("death") or {}
             logcat_rasp = any(
                 category in (logcat.get("categories") or {})
-                for category in RASP_CATEGORIES
+                for category in HIGH_CONFIDENCE_CATEGORIES
             )
             kill_traced = any(item.startswith("app_kill") for item in strong)
 
@@ -1181,6 +1192,7 @@ class AntiHookingCheck:
             ``app_alive_at_end`` (bool) e ``error`` (str|None).
         """
         bypass_logs: List[str] = []
+        bypass_evidence: List[str] = []
         session = None
         script = None
         java_script = None
@@ -1195,6 +1207,13 @@ class AntiHookingCheck:
                 payload = message.get("payload", {})
                 if payload.get("type") == "app-kill":
                     msg = "app-kill: " + payload.get("message", "")
+                    if msg and msg not in bypass_logs:
+                        bypass_logs.append(msg)
+                    return
+                if payload.get("type") == BYPASS_EVIDENCE_TYPE:
+                    msg = payload.get("message", "")
+                    if msg and msg not in bypass_evidence:
+                        bypass_evidence.append(msg)
                     if msg and msg not in bypass_logs:
                         bypass_logs.append(msg)
                     return
@@ -1364,9 +1383,15 @@ class AntiHookingCheck:
             death_cause = None
 
         # Evidência real: logs que comprovam checagem neutralizada.
-        effective = [
+        # Evidência de bypass exige que a checagem do app tenha sido de
+        # fato exercitada. O self-report do hook ("hookado", "carregado")
+        # prova apenas que a instrumentação está ativa — não que o app
+        # foi enganado.
+        effective = list(bypass_evidence) or [
             log for log in bypass_logs
             if any(marker in log for marker in BYPASS_EVIDENCE_MARKERS)
+            and "hookado" not in log
+            and not log.endswith("carregado")
         ]
         alive = died_after is None
         success = bool(effective) and alive
@@ -1521,7 +1546,11 @@ class AntiHookingCheck:
             else:
                 bypass_details = self.attempt_bypass(package_name, window=window)
             if bypass_details.get("error"):
-                phase_errors.append(f"bypass: {bypass_details['error']}")
+                # A proteção foi detectada, mas o bypass não pôde ser
+                # avaliado. Isso é uma etapa que não rodou, não uma
+                # conclusão sobre a proteção: o veredito da detecção
+                # continua válido.
+                bypass_skipped_reason = f"bypass: {bypass_details['error']}"
             else:
                 bypass_successful = bool(bypass_details.get("success"))
 

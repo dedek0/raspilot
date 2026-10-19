@@ -507,9 +507,12 @@ class TestAttemptBypass:
             "openat", "fopen", "access", "faccessat",
             "raspilot-hooking-bypass",
             # Compatibilidade Frida 16/17 (validada em dispositivo real):
-            "raspilotFindExport", "raspilotPerformJava",
+            "raspilotFindExport",
         ):
             assert marker in source, f"técnica ausente: {marker}"
+        # A camada Java é instalada por um dos helpers de compatibilidade.
+        assert ("raspilotPerformJava" in source
+                or "raspilotDeferJava" in source)
         assert "Module.findExportByName" not in source
 
     def test_proc_filter_script_exists(self):
@@ -590,8 +593,12 @@ class TestRunAll:
         assert res["bypass_successful"] is None
         dm.spawn_app.assert_called_once()
 
-    def test_bypass_failure_becomes_top_level_error(self, tmp_path):
-        """Bypass que não executa => error no topo (reporter vira ERROR)."""
+    def test_bypass_failure_keeps_protection_and_marks_step_not_run(self, tmp_path):
+        """Bypass que não executa não invalida a proteção detectada.
+
+        O que se sabe é que existe proteção anti-hook; o que não se sabe
+        é se ela resistiu ao bypass. O resultado reflete as duas coisas.
+        """
         apk = _make_apk(str(tmp_path / "x.apk"), {
             "classes.dex": b"de.robv.android.xposed.XposedBridge\x00",
         })
@@ -601,7 +608,7 @@ class TestRunAll:
             res = AntiHookingCheck(dm).run_all("com.app", apk_path=apk)
         assert res["protection_detected"] is True
         assert res["bypass_successful"] is None
-        assert "spawn falhou" in res["error"]
+        assert "spawn falhou" in res["bypass_skipped_reason"]
 
     def test_observation_failure_without_static_is_error(self, tmp_path):
         """Spawn da observação falha e sem APK => error (sem veredito)."""

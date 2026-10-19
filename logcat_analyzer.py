@@ -28,7 +28,9 @@ TOOL_KILL_PATTERNS = (
 DEATH_PATTERNS = (
     re.compile(r"Fatal signal \d+ \((?P<signal>SIG[A-Z]+)\)", re.I),
     re.compile(r"Process \d+ exited due to signal (?P<signal_nr>\d+)", re.I),
-    re.compile(r"has died:.*", re.I),
+    # A mensagem do ActivityManager não tem os dois-pontos:
+    # "Process <pkg> (pid 1234) has died"
+    re.compile(r"has died\b", re.I),
     re.compile(r"\bam_proc_died\b", re.I),
     re.compile(r"\bam_kill\b", re.I),
     re.compile(r"\bam_crash\b", re.I),
@@ -39,23 +41,60 @@ DEATH_PATTERNS = (
     re.compile(r"FATAL EXCEPTION", re.I),
 )
 
-# Categorias de evidência de segurança. A lista é intencionalmente
-# conservadora: termos genéricos só contam quando a linha também cita o
-# pacote/pid alvo (ver ``_line_matches_target``).
-SECURITY_PATTERNS = {
+# Evidência de segurança com confiança alta.
+#
+# Só estas linhas podem, sozinhas, sustentar a conclusão de que o app
+# reagiu à instrumentação. O critério é objetivo: a linha cita um
+# artefato de instrumentação, um sinal de morte rastreado, ou um
+# identificador de um SDK de RASP conhecido.
+#
+# Termos genéricos (root, hook, detected, checksum, emulator) ficam
+# fora: eles aparecem em logs comuns de aplicação e transformavam
+# qualquer log do app em "o app detectou a instrumentação".
+HIGH_CONFIDENCE_PATTERNS = {
+    "frida": re.compile(
+        r"\b(gum-js-loop|gum-js|linjector|frida-server|re\.frida\.server|"
+        r"frida-agent|libfrida|libloader64_v8|libloader32_v7)\b",
+        re.I,
+    ),
+    "hooking": re.compile(
+        r"\b(de\.robv\.android\.xposed|lsposed|edxposed|liblspd|"
+        r"xposedbridge|xc_methodhook|cydia.?substrate|libsubstrate|"
+        r"lsplant|libsandhook|libyahfa|libwhale|libdobby|libshadowhook)\b",
+        re.I,
+    ),
+    "debug": re.compile(
+        r"\b(tracerpid:\s*[1-9]|waiting for debugger|"
+        r"isdebuggerconnected\(\)\s*==\s*true)\b",
+        re.I,
+    ),
+    "tls": re.compile(
+        r"\b(certificatepinner|certificate pinning|certificatepinnerexception|"
+        r"sslhandshakeexception|sslpeerunverifiedexception|"
+        r"certificateverifyexception|sslpinning|pinning failed|"
+        r"pin mismatch|chain validation failed|"
+        r"unable to find valid certification path|hostname .* not verified|"
+        r"trust anchor|trust manager)\b",
+        re.I,
+    ),
+}
+
+# Evidência de segurança com confiança baixa: contexto, nunca veredito.
+#
+# São termos que aparecem em logs de aplicação sem qualquer relação com
+# instrumentação ("root cause", "lifecycle hook", "checksum mismatch",
+# "emulator detected" de um SDK de emulação). Aparecem no relatório como
+# contexto, mas não alteram o status de nenhum check.
+LOW_CONFIDENCE_PATTERNS = {
     "root": re.compile(
         r"\b(magisk|supersu|superuser|apatch|kernelsu|rootbeer|"
         r"root(?:ed|ing)?|/system/(?:x?bin)/su|su binary)\b",
         re.I,
     ),
-    "frida": re.compile(
-        r"\b(frida|gum-js|gum-js-loop|linjector|frida-server|libfrida|"
-        r"frida-agent|gadget)\b",
-        re.I,
-    ),
+    "frida": re.compile(r"\b(frida|gadget)\b", re.I),
     "hooking": re.compile(
-        r"\b(xposed|lsposed|edxposed|substrate|sandhook|yahfa|lsplant|"
-        r"whale|dobby|riru|zygisk|hook(?:ing|ed)?|inline hook)\b",
+        r"\b(xposed|substrate|sandhook|yahfa|lsplant|whale|dobby|riru|zygisk|"
+        r"hook(?:ing|ed)?|inline hook)\b",
         re.I,
     ),
     "emulator": re.compile(
@@ -66,12 +105,6 @@ SECURITY_PATTERNS = {
     "debug": re.compile(
         r"\b(ptrace|tracerpid|debugger|anti[- ]?debug|isdebuggerconnected|"
         r"jdwp|waiting for debugger)\b",
-        re.I,
-    ),
-    "tls": re.compile(
-        r"\b(certificatepinner|certificate pinning|sslhandshake|"
-        r"sslpeerunverified|trust anchor|certpathvalidator|"
-        r"certificateexception|ssl_verify|cert_verify|pin(?:ning)?)\b",
         re.I,
     ),
     "integrity": re.compile(
@@ -86,14 +119,108 @@ SECURITY_PATTERNS = {
     ),
 }
 
+# Identificadores de SDKs de RASP conhecidos. O log de um SDK costuma
+# vir na tag do próprio SDK, sem citar o pacote do app — por isso a
+# busca por tag é feita separadamente da exigência de citar o alvo.
+RASP_VENDOR_TAGS = (
+    "promon", "appsuit", "guardsquare", "approtect", "trustchecker",
+    "talsec", "inka", "nexign", "netskope", "bluepoint", "dexprotector",
+    "apkprotector", "apk-protector", "ijiami", "bangcle", "secshell",
+    "tesseract", "appsealing", "quarks", "avast", "nagain", "luciq",
+    "playintegrity", "play integrity", "safetynet", "appcheck",
+    "cloudflare", "turnstile", "nucleus", "appsealing",
+)
+
+# Tags cujo log pertence à ferramenta de instrumentação do operador
+# (framework de hooking instalado no device), e não ao app auditado.
+OPERATOR_FRAMEWORK_TAGS = (
+    "vector", "lsposed", "edxposed", "xposed", "epic", "yahfa", "sandhook",
+    "riru", "zygisk", "corepatch", "lspatch",
+)
+
+# Categorias de evidência de segurança. A lista é intencionalmente
+# conservadora: termos genéricos só contam quando a linha também cita o
+# pacote/pid alvo (ver ``_line_matches_target``).
+SECURITY_PATTERNS = {
+    **{f"low:{k}": v for k, v in LOW_CONFIDENCE_PATTERNS.items()},
+    **{f"high:{k}": v for k, v in HIGH_CONFIDENCE_PATTERNS.items()},
+}
+
 # Categorias que, isoladamente, indicam que o app reagiu a uma ameaça.
 # TLS é tratado separadamente (é sintoma de pinning, não necessariamente
 # reação do RASP).
 RASP_CATEGORIES = ("root", "frida", "hooking", "emulator", "debug", "integrity")
 
+# Categorias de confiança alta — as únicas que sustentam um veredito.
+HIGH_CONFIDENCE_CATEGORIES = tuple(
+    f"high:{name}" for name in HIGH_CONFIDENCE_PATTERNS
+)
+
 # Limites para manter o relatório enxuto e serializável.
 MAX_EVIDENCE_LINES = 40
 MAX_LINE_LEN = 500
+
+
+# Verbos que transformam um termo genérico em evidência de reação.
+#
+# "xposed" sozinho aparece em log de qualquer app que liste frameworks
+# conhecidos; "xposed detected" ou "xposed framework found" é o app
+# reagindo a uma ameaça. O verbo é o que dá o peso da evidência.
+DETECTION_VERB_PATTERN = re.compile(
+    r"\b(detect(?:ed|ion)?|detec(?:ção|cao|ou)|found|encontrado|"
+    r"identificad[oa]|block(?:ed|ing)?|bloquead[oa]|negad[oa]|"
+    r"rejected|recusad[oa]|violation|viola[çc][ãa]o|tamper|"
+    r"comprometid[oa]|suspicious|suspeit[oa])\b",
+    re.I,
+)
+
+
+def _is_operator_framework_line(line: str) -> bool:
+    """Indica se a linha pertence à tag de um framework de hooking.
+
+    Ferramentas de hooking instaladas no device escrevem no logcat com a
+    própria tag. Quando o alvo está no escopo delas, o log resultante
+    descreve a ferramenta de instrumentação do operador, não a proteção do
+    app auditado.
+
+    Args:
+        line: Linha do logcat.
+
+    Returns:
+        True se a linha pertence a um framework de hooking do operador.
+    """
+    low = (line or "").lower()
+    for tag in OPERATOR_FRAMEWORK_TAGS:
+        if re.search(rf"\b{re.escape(tag)}\b", low):
+            return True
+    return False
+
+
+def _vendor_signals(lines: List[str]) -> List[str]:
+    """Localiza linhas de log de SDKs de RASP conhecidos.
+
+    O log de um SDK de RASP costuma vir na tag do próprio SDK e não cita
+    o pacote do app — por isso a busca é feita por identificador de
+    vendor, sem exigir menção ao alvo.
+
+    Args:
+        lines: Linhas do logcat.
+
+    Returns:
+        Linhas que correspondem a um SDK de RASP conhecido.
+    """
+    found: List[str] = []
+    for raw in lines or []:
+        line = _clip(raw)
+        if not line:
+            continue
+        low = line.lower()
+        for vendor in RASP_VENDOR_TAGS:
+            if vendor in low:
+                if line not in found:
+                    found.append(line)
+                break
+    return found
 
 
 def _clip(line: str) -> str:
@@ -240,34 +367,56 @@ def analyze_logcat(
             if matches_target or (pid is None and package is None):
                 death_evidence.append(line)
 
+        is_operator_framework = _is_operator_framework_line(line)
+
         for category, pattern in SECURITY_PATTERNS.items():
             if not pattern.search(line):
                 continue
+            confidence = "high" if category.startswith("high:") else "low"
+            base = category.split(":", 1)[1] if ":" in category else category
+            # Termo genérico acompanhado de verbo de detecção sobe para
+            # confiança alta: "xposed detected" é reação do app, "xposed"
+            # sozinho é apenas um nome em um log.
+            if confidence == "low" and base not in (
+                "security_sdk", "integrity", "emulator", "debug",
+            ) and DETECTION_VERB_PATTERN.search(line):
+                confidence = "high"
             # Termos genéricos exigem o package na mesma linha (o pid
             # sozinho pode casar com timestamps/endereços). Termos muito
             # específicos (frida/xposed/qemu...) aceitam package ou pid.
-            if category in ("security_sdk", "tls") and not (
+            if base in ("security_sdk", "tls") and not (
                 package and package in line
             ):
                 continue
-            if category not in ("security_sdk", "tls") and not matches_target:
+            if base not in ("security_sdk", "tls") and not matches_target:
                 # Ainda assim, aceita linhas de sistema que mencionem o pid.
                 if pid is None or not re.search(rf"\b{int(pid)}\b", line):
                     continue
-            # Stack trace do agente Frida não é, por si só, detecção do
-            # RASP: é evidência da instrumentação. Mantém separado para
-            # não inflar o veredito; a morte do processo continua contando.
-            if category == "frida" and (
+            # Pilha de crash do agente Frida não é, por si só, detecção
+            # do RASP: é evidência da instrumentação. Mantém separado
+            # para não inflar o veredito; a morte do processo continua
+            # contando. Merece a categoria própria apenas quando a
+            # linha descreve um crash, e não a simples menção ao
+            # artefato.
+            if base == "frida" and (
                 "runtime.cc" in line
-                or "frida-agent" in line
                 or "frida_agent" in line
+                or re.search(
+                    r"frida[-_]agent.*(signal|crash|abort|segv|backtrace)",
+                    line, re.I,
+                )
             ):
-                category = "frida_agent_crash"
-            entry = {"category": category, "line": line}
+                base = "frida_agent_crash"
+                confidence = "low"
+            # Log de framework de hooking do operador não é evidência de
+            # proteção do app auditado: é contaminação do ambiente.
+            if is_operator_framework and confidence == "low":
+                base = f"operator:{base}"
+            entry = {"category": base, "confidence": confidence, "line": line}
             if entry not in security:
                 security.append(entry)
-            categories[category] = categories.get(category, 0) + 1
-            if category == "tls" and line not in tls_errors:
+            categories[base] = categories.get(base, 0) + 1
+            if base == "tls" and confidence == "high" and line not in tls_errors:
                 tls_errors.append(line)
 
     signal = None
@@ -280,8 +429,17 @@ def analyze_logcat(
     death_detected = bool(death_evidence)
     instrumentation_kill = death_kind == "start_timeout"
 
-    rasp_signals = [s for s in security if s["category"] in RASP_CATEGORIES]
-    has_rasp_evidence = bool(rasp_signals) or bool(tls_errors)
+    # Só a evidência de confiança alta sustenta a conclusão de que o app
+    # reagiu. Termos genéricos permanecem no relatório como contexto.
+    rasp_signals = [
+        s for s in security
+        if s["category"] in RASP_CATEGORIES and s.get("confidence") == "high"
+    ]
+    context_signals = [
+        s for s in security if s.get("confidence") != "high"
+    ]
+    vendor_signals = _vendor_signals(lines)
+    has_rasp_evidence = bool(rasp_signals) or bool(tls_errors) or bool(vendor_signals)
     agent_terminated = bool(categories.get("frida_agent_crash"))
 
     if death_detected:
@@ -289,7 +447,7 @@ def analyze_logcat(
         if signal:
             detail += f", {signal}"
         detail += ")"
-    elif rasp_signals:
+    elif rasp_signals or vendor_signals:
         detail = "sinais de segurança sem morte do processo"
     elif tls_errors:
         detail = "erros de TLS/pinning sem morte do processo"
@@ -333,6 +491,8 @@ def analyze_logcat(
             "evidence": death_evidence[-MAX_EVIDENCE_LINES:],
         },
         "security_signals": security[-MAX_EVIDENCE_LINES:],
+        "context_signals": context_signals[-MAX_EVIDENCE_LINES:],
+        "vendor_signals": vendor_signals[-MAX_EVIDENCE_LINES:],
         "tls_errors": tls_errors[-MAX_EVIDENCE_LINES:],
         "target_lines": target_lines[-MAX_EVIDENCE_LINES:],
         "tool_kill_lines": tool_kill_lines[-MAX_EVIDENCE_LINES:],
@@ -424,11 +584,24 @@ def format_detection_signals(
     for item in analysis.get("security_signals", []) or []:
         if not isinstance(item, dict):
             continue
+        # Somente evidência de confiança alta sustenta um veredito: termos
+        # genéricos (root, hook, detected) aparecem em logs comuns e
+        # transformavam qualquer log do app em reação à instrumentação.
+        if item.get("confidence") != "high":
+            continue
         category = item.get("category", "security")
         if category not in allowed or category in seen:
             continue
         seen.add(category)
         output.append(f"logcat_{category}: {item.get('line', '')}")
+        if len(output) >= limit:
+            break
+    # Sinais de vendor de RASP entram como evidência direta: o log do SDK
+    # é a reação do app, mesmo sem citar o pacote na mesma linha.
+    for line in analysis.get("vendor_signals", []) or []:
+        entry = f"logcat_vendor: {line}"
+        if entry not in output:
+            output.append(entry)
         if len(output) >= limit:
             break
     return output
@@ -449,7 +622,9 @@ def classify_failure(
         ``is_rasp``, ``is_instrumentation`` e ``summary``.
     """
     categories = analysis.get("categories") or {}
-    rasp = any(category in (categories or {}) for category in RASP_CATEGORIES)
+    rasp = any(
+        category in (categories or {}) for category in HIGH_CONFIDENCE_CATEGORIES
+    ) or bool(analysis.get("vendor_signals"))
     death = analysis.get("death") or {}
     baseline_died = bool(
         baseline and baseline.get("available") and baseline.get("alive_at_end") is False

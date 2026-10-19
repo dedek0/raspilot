@@ -36,6 +36,7 @@ def load_stealth(
     on_message: Optional[Callable] = None,
     replacements: Optional[Dict[str, str]] = None,
     include_proc_filter: bool = True,
+    load_native_frida: bool = True,
     load_timeout: float = 5.0,
 ) -> List[Tuple[str, object]]:
     """Instala o bootstrap nativo de stealth na sessão.
@@ -47,7 +48,10 @@ def load_stealth(
         session: Sessão Frida ativa.
         on_message: Callback de mensagens dos scripts.
         replacements: Placeholders (porta real etc.).
-        include_proc_filter: Se False, carrega apenas o bypass nativo.
+        include_proc_filter: Se False, não carrega o filtro de ``/proc``.
+        load_native_frida: Se False, não carrega a evasão anti-Frida
+            nativa. Desligar mantém a reação do app visível, que é o
+            comportamento desejado na modo de observação pura.
         load_timeout: Timeout por script.
 
     Returns:
@@ -57,7 +61,8 @@ def load_stealth(
     scripts: List[tuple] = []
     if include_proc_filter:
         scripts.append((PROC_FILTER_SCRIPT, "raspilot-stealth-proc"))
-    scripts.append((ANTI_FRIDA_BYPASS_SCRIPT, "raspilot-stealth-frida"))
+    if load_native_frida:
+        scripts.append((ANTI_FRIDA_BYPASS_SCRIPT, "raspilot-stealth-frida"))
 
     for path, name in scripts:
         reps = dict(replacements or {})

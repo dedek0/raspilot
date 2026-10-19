@@ -42,6 +42,15 @@ function report(msg) {
     } catch (e) { /* host indisponível — ignora */ }
 }
 
+// Ação do app que foi de fato impedida. Distinto do relato de
+// instalação do hook: aqui o app tentou algo e a instrumentação
+// impediu — é a evidência do que a proteção tentou fazer.
+function reportNeutralized(msg) {
+    try {
+        send({ type: 'raspilot-neutralized', message: msg });
+    } catch (e) { /* host indisponível — ignora */ }
+}
+
 // True se a string contém 'frida' (case-insensitive).
 function looksLikeFrida(str) {
     try {
@@ -256,21 +265,228 @@ function hookThreadNames() {
 }
 
 // ----------------------------------------------------------------------
+// 4) Auto-destruição — impede que o app se mate
+// ----------------------------------------------------------------------
+//
+// Vasos de RASP que abortam o próprio processo no instante em que
+// detectam a instrumentação: o alvo envia um sinal de parada para si
+// mesmo, observa o quanto tempo levou para voltar e, se o tempo não
+// bater com o esperado, aborta.
+//
+// O sinal de parada é o caso mais perigoso: ele congela a thread do
+// próprio processo — e, se a thread afetada for a do agente de
+// instrumentação, a sessão inteira deixa de responder, sem que o
+// processo necessariamente morra. O sintoma é uma instrumentação que
+// "trava" sem erro.
+//
+// Os sinais são neutralizados apenas quando o alvo é o próprio processo:
+// kill para outros processos continua intacto.
+var SELF_SIGNALS = {
+    6: 'SIGABRT',
+    9: 'SIGKILL',
+    19: 'SIGSTOP',
+    24: 'SIGXCPU',
+    25: 'SIGXFSZ'
+};
+
+function signalName(sig) {
+    return SELF_SIGNALS[sig] || ('SIG' + sig);
+}
+
+function isSelfPid(pid) {
+    try {
+        return pid === Process.id || pid === 0;
+    } catch (e) {
+        return false;
+    }
+}
+
+// Números de syscall de sinal por arquitetura. O alvo pode chamá-los
+// direto, por dentro do wrapper syscall(), para não passar pelos
+// ganchos de libc.
+//
+// Os índices são relativos aos argumentos da chamada, sem contar o
+// número do syscall: selfIndex aponta o alvo e sigIndex o sinal.
+var SIGNAL_SYSCALLS = {
+    arm64: [
+        { nr: 129, selfIndex: 0, sigIndex: 1, name: 'kill' },
+        { nr: 130, selfIndex: 0, sigIndex: 1, name: 'tkill' },
+        { nr: 131, selfIndex: 0, sigIndex: 2, name: 'tgkill' },
+        { nr: 307, selfIndex: 0, sigIndex: 1, name: 'rt_sigqueueinfo' },
+        { nr: 314, selfIndex: 0, sigIndex: 2, name: 'rt_tgsigqueueinfo' }
+    ],
+    x64: [
+        { nr: 62, selfIndex: 0, sigIndex: 1, name: 'kill' },
+        { nr: 200, selfIndex: 0, sigIndex: 1, name: 'tkill' },
+        { nr: 234, selfIndex: 0, sigIndex: 2, name: 'tgkill' },
+        { nr: 307, selfIndex: 0, sigIndex: 1, name: 'rt_sigqueueinfo' },
+        { nr: 314, selfIndex: 0, sigIndex: 2, name: 'rt_tgsigqueueinfo' }
+    ]
+};
+
+function hookSelfTermination() {
+    // raise(sig): o app sinaliza a si mesmo.
+    //
+    // A substituição é total (Interceptor.replace) em vez de um gancho
+    // que apenas observa: o sinal é entregue durante a chamada, então
+    // ajustar o valor de retorno não impede a entrega — é preciso
+    // outright não chamar a função original.
+    try {
+        var raiseAddr = raspilotFindExport('libc.so', 'raise');
+        if (raiseAddr !== null) {
+            var origRaise = new NativeFunction(raiseAddr, 'int', ['int']);
+            Interceptor.replace(raiseAddr, new NativeCallback(function (sig) {
+                try {
+                    if (SELF_SIGNALS[sig] !== undefined) {
+                        reportNeutralized('auto-destruição neutralizada: raise(' +
+                               signalName(sig) + ')');
+                        return 0;
+                    }
+                } catch (e) { /* best-effort */ }
+                return origRaise(sig);
+            }, 'int', ['int']));
+            report('libc.raise substituído (auto-destruição)');
+        }
+    } catch (e) {
+        report('falha ao substituir raise: ' + e);
+    }
+
+    // kill(pid, sig) / tgkill(tgid, tid, sig) / killpg(pgrp, sig) /
+    // pthread_kill(thread, sig).
+    //
+    // Em tgkill o alvo do sinal é a thread, mas o grupo de threads é o
+    // que identifica o processo: um SIGSTOP em uma thread do processo
+    // congela a instrumentação tanto quanto um SIGSTOP no processo
+    // inteiro.
+    var killers = [
+        { name: 'kill', types: ['int', 'int'], selfIndex: 0, sigIndex: 1 },
+        { name: 'tgkill', types: ['int', 'int', 'int'], selfIndex: 0, sigIndex: 2 },
+        { name: 'killpg', types: ['int', 'int'], selfIndex: 0, sigIndex: 1 },
+        { name: 'pthread_kill', types: ['pointer', 'int'], selfIndex: -1, sigIndex: 1 }
+    ];
+    killers.forEach(function (spec) {
+        try {
+            var addr = raspilotFindExport('libc.so', spec.name);
+            if (addr === null) { return; }
+            var orig = new NativeFunction(addr, 'int', spec.types);
+            var args = spec.types.slice();
+            var callback = new NativeCallback(function () {
+                var a = Array.prototype.slice.call(arguments);
+                try {
+                    var sig = a[spec.sigIndex] | 0;
+                    // pthread_kill só pode mirar threads do próprio
+                    // processo, então não há alvo a verificar.
+                    var target = spec.selfIndex < 0
+                        ? Process.id
+                        : (a[spec.selfIndex] | 0);
+                    if (SELF_SIGNALS[sig] !== undefined && isSelfPid(target)) {
+                        reportNeutralized('auto-destruição neutralizada: ' + spec.name +
+                               '(' + signalName(sig) + ')');
+                        return 0;
+                    }
+                } catch (e) { /* best-effort */ }
+                return orig.apply(null, a);
+            }, 'int', spec.types);
+            Interceptor.replace(addr, callback);
+            report('libc.' + spec.name + ' substituído (auto-destruição)');
+        } catch (e) {
+            report('falha ao substituir ' + spec.name + ': ' + e);
+        }
+    });
+
+    // abort(): encerra o processo com SIGABRT. A detecção de RASP
+    // normalmente chega até aqui depois de identificar a instrumentação
+    // — e o runtime do app aborta quando uma thread externa se anexa
+    // à máquina virtual, o que derruba a sessão de instrumentação
+    // inteira sem que o processo precise morrer.
+    try {
+        var abortAddr = raspilotFindExport('libc.so', 'abort');
+        if (abortAddr !== null) {
+            var origAbort = new NativeFunction(abortAddr, 'void', []);
+            Interceptor.replace(abortAddr, new NativeCallback(function () {
+                reportNeutralized('auto-destruição neutralizada: abort()');
+            }, 'void', []));
+            report('libc.abort substituído (auto-destruição)');
+        }
+    } catch (e) {
+        report('falha ao substituir abort: ' + e);
+    }
+
+    hookRawSignalSyscalls();
+}
+
+// Chamadas diretas a syscall() para entrega de sinal.
+//
+// Um alvo que quer evitar os ganchos de libc chama a syscall direto.
+// É por isso que a neutralização do sinal de parada precisa existir
+// também nesse caminho: sem ele, o processo inteiro (e a thread do
+// agente de instrumentação) congela sem que nada seja registrado.
+//
+// A substituição repassa os argumentos com 64 bits, preservando o
+// retorno de syscalls que devolvem ponteiros.
+function hookRawSignalSyscalls() {
+    var specs = SIGNAL_SYSCALLS[Process.arch];
+    if (!specs) { return; }
+    try {
+        var addr = raspilotFindExport('libc.so', 'syscall');
+        if (addr === null) { return; }
+        var orig = new NativeFunction(addr, 'long',
+            ['long', 'long', 'long', 'long', 'long', 'long', 'long']);
+        var callback = new NativeCallback(function (nr, a1, a2, a3, a4, a5, a6) {
+            try {
+                var n = nr | 0;
+                for (var i = 0; i < specs.length; i++) {
+                    var spec = specs[i];
+                    if (spec.nr !== n) { continue; }
+                    // O número do syscall é o primeiro argumento; os
+                    // demais são os do sinal, conforme a chamada.
+                    var callArgs = [a1, a2, a3, a4, a5, a6];
+                    var target = callArgs[spec.selfIndex] | 0;
+                    var sig = callArgs[spec.sigIndex] | 0;
+                    if (SELF_SIGNALS[sig] !== undefined && isSelfPid(target)) {
+                        reportNeutralized('auto-destruição neutralizada: syscall(' +
+                               spec.name + ', ' + signalName(sig) + ')');
+                        return 0;
+                    }
+                    break;
+                }
+            } catch (e) { /* best-effort */ }
+            return orig(nr, a1, a2, a3, a4, a5, a6);
+        }, 'long', ['long', 'long', 'long', 'long', 'long', 'long', 'long']);
+        Interceptor.replace(addr, callback);
+        report('libc.syscall substituído (auto-destruição)');
+    } catch (e) {
+        report('falha ao substituir syscall: ' + e);
+    }
+}
+
+// ----------------------------------------------------------------------
 // Bootstrap — idempotente
 // ----------------------------------------------------------------------
+
+// Indica que o script foi carregado apenas com a camada nativa (sem
+// bridge Java). Nesse caso os hooks Java são omitidos: a bridge é o
+// que torna a injeção visível para o app.
+var RASPILOT_JAVA_ONLY = (typeof __RASPILOT_JAVA_ONLY__ !== 'undefined')
+    ? __RASPILOT_JAVA_ONLY__
+    : false;
+
 function main() {
     hookLibcStringHooks();
     hookConnectPorts();
+    hookSelfTermination();
+
+    if (RASPILOT_JAVA_ONLY) {
+        report('anti_frida_bypass.js carregado (somente nativo)');
+        return;
+    }
 
     var attachJava = function () {
-        var ok = raspilotPerformJava(function () {
+        raspilotDeferJava(function () {
             hookFileExists();
             hookRuntimeExec();
             hookThreadNames();
-        });
-        if (!ok) {
-            report('Java indisponível — hooks Java pulados');
-        }
+        }, 'anti-frida-bypass');
     };
     attachJava();
 

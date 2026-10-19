@@ -681,14 +681,18 @@ function main() {
     // Instalação SÍNCRONA: o host faz resume logo após script.load(). Se
     // os hooks fossem adiados com setImmediate, validações de certificado
     // da inicialização poderiam rodar antes deles.
-    var javaOk = raspilotPerformJava(function () {
+    //
+    // A camada Java, porém, é adiada: instalá-la durante o carregamento
+    // bloqueia o load pelo tempo de inicialização do runtime Java no
+    // processo alvo, e o agente descarta o script ao atingir o limite.
+    var javaOk = raspilotDeferJava(function () {
         hookTrustManager();
         hookHostnameVerifier();
         hookOkHttpOnce(0);
         hookNetworkSecurityConfig();
         hookConscrypt();
         hookWebView();
-    });
+    }, 'ssl-bypass');
     if (!javaOk) {
         log('Java indisponível — apenas hooks nativos instalados');
     }

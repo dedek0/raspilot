@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import pytest
 
 from device_manager import TOOL_NAME, TOOL_VERSION
-from reporter import Reporter
+from reporter import SCHEMA_VERSION, Reporter
 
 DEVICE = {
     "serial": "EMULATOR01",
@@ -82,6 +82,7 @@ class TestGenerateJson:
         doc = _reporter().generate_json()
         expected = {
             "metadata": {
+                "schema_version": SCHEMA_VERSION,
                 "tool_name": TOOL_NAME,
                 "tool_version": TOOL_VERSION,
                 "timestamp": "2026-10-14T12:00:00+00:00",
@@ -176,11 +177,15 @@ class TestGenerateJson:
         })
         assert rep3.generate_json()["summary"]["anti_hooking"]["status"] == "FALHOU"
 
+        # Proteção presente com bypass não avaliado é etapa que não rodou
+        # (SKIP), e não ausência de aplicabilidade (N/A).
         rep4 = Reporter(device_info=DEVICE, package_name="pkg")
         rep4.collect("anti_hooking", {
             "protection_detected": True, "bypass_successful": None,
         })
-        assert rep4.generate_json()["summary"]["anti_hooking"]["status"] == "N/A"
+        summary4 = rep4.generate_json()["summary"]["anti_hooking"]
+        assert summary4["status"] == "SKIP"
+        assert summary4["skip_reason"]
 
     def test_status_anti_hooking_error(self):
         """Anti-hooking com error no topo => ERROR (bypass/observação falhou)."""

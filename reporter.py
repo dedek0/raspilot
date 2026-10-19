@@ -15,11 +15,16 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from device_manager import TOOL_NAME, TOOL_VERSION
+
+# Versão do schema do documento JSON. Incrementada quando a forma do
+# relatório muda de modo incompatível, para que um consumidor possa
+# detectar a mudança em vez de interpretar campos ausentes.
+SCHEMA_VERSION = 2
 
 logger = logging.getLogger("raspilot.reporter")
 
@@ -42,6 +47,7 @@ class Reporter:
         device_info: dict,
         package_name: str,
         output_dir: str = "reports/",
+        run_context: Optional[dict] = None,
     ) -> None:
         """Inicializa o relatório com metadados do dispositivo e alvo.
 
@@ -49,11 +55,15 @@ class Reporter:
             device_info: Dict retornado por ``DeviceManager.get_device_info()``.
             package_name: Package name do app auditado.
             output_dir: Diretório de saída dos relatórios.
+            run_context: Metadados da execução (argumentos da CLI, versão
+                do Frida, hashes dos scripts, pid alvo, resultado do
+                baseline). Tornam a execução reproduzível por terceiros.
         """
         self.device_info = dict(device_info or {})
         self.package_name = package_name
         self.output_dir = output_dir
         self.timestamp = datetime.now(timezone.utc)
+        self.run_context: Dict[str, Any] = dict(run_context or {})
         self._results: Dict[str, dict] = {}
 
     # ------------------------------------------------------------------
@@ -106,21 +116,20 @@ class Reporter:
 
         if check_name == "anti_frida":
             raw_vulnerable = result.get("vulnerable")
+            # O conjunto de chaves do resumo é o mesmo em todos os status:
+            # um consumidor não pode falhar com KeyError justamente nos
+            # casos inconclusivos.
+            summary = {
+                "vulnerable": None if raw_vulnerable is None else bool(raw_vulnerable),
+                "frida_present": bool(result.get("frida_present")),
+            }
             if raw_vulnerable is None:
                 # Observação inconclusiva (crash da instrumentação, morte no
                 # baseline, script que não carregou) não é OK nem FALHOU.
-                return "ERROR", {
-                    "error": result.get("error") or "observação inconclusiva",
-                    "frida_present": bool(result.get("frida_present")),
-                }
+                summary["error"] = result.get("error") or "observação inconclusiva"
+                return "ERROR", summary
             vulnerable = bool(raw_vulnerable)
-            return (
-                "FALHOU" if vulnerable else "OK",
-                {
-                    "vulnerable": vulnerable,
-                    "frida_present": bool(result.get("frida_present")),
-                },
-            )
+            return ("FALHOU" if vulnerable else "OK"), summary
 
         if check_name == "anti_emulator":
             is_emulator = bool(result.get("is_emulator"))
@@ -138,35 +147,55 @@ class Reporter:
             # anti_frida: app que não detecta a ameaça = FALHOU).
             protected = bool(result.get("protection_detected"))
             bypass = result.get("bypass_successful")
+            summary = {
+                "protection_detected": protected,
+                "bypass_successful": bypass,
+                "hook_frameworks_present": bool(result.get("hook_frameworks_present")),
+            }
             if not protected:
                 status = "FALHOU"
             elif bypass is True:
                 status = "FALHOU"  # proteção existe, mas o bypass venceu
             elif bypass is False:
                 status = "OK"  # proteção resistiu ao bypass
+            elif protected:
+                # A proteção existe mas o bypass não foi avaliado: isso
+                # não é "não aplicável", é uma etapa que não rodou.
+                status = "SKIP"
+                summary["skip_reason"] = (
+                    result.get("bypass_skipped_reason")
+                    or "bypass não avaliado"
+                )
             else:
-                status = "N/A"  # bypass não avaliado (caso residual)
-            return status, {
-                "protection_detected": protected,
-                "bypass_successful": bypass,
-                "hook_frameworks_present": bool(result.get("hook_frameworks_present")),
-            }
+                status = "N/A"
+            return status, summary
 
         if check_name == "ssl_pinning":
             bypass = result.get("bypass_successful")
+            pinned = bool(result.get("pinning_detected"))
+            summary = {
+                "pinning_detected": pinned,
+                "pinning_type": result.get("pinning_type"),
+                "bypass_successful": bypass,
+            }
             if bypass is True:
                 status = "FALHOU"
+            elif bypass is None and pinned:
+                # Havia pinning e o bypass não rodou: etapa não executada,
+                # não ausência de aplicabilidade.
+                status = "SKIP"
+                summary["skip_reason"] = (
+                    result.get("bypass_skipped_reason")
+                    or "bypass não avaliado"
+                )
             elif bypass is None:
                 status = "N/A"  # sem pinning — bypass não aplicável
             else:
                 status = "OK"
-            return status, {
-                "pinning_detected": bool(result.get("pinning_detected")),
-                "pinning_type": result.get("pinning_type"),
-                "bypass_successful": bypass,
-            }
+            return status, summary
 
-        return "OK", {}
+        # Check desconhecido não pode ser reportado como sucesso.
+        return "ERROR", {"error": f"check desconhecido: {check_name}"}
 
     # ------------------------------------------------------------------
     # JSON
@@ -185,14 +214,19 @@ class Reporter:
             resumo["status"] = status
             summary[check_name] = resumo
 
+        metadata: Dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
+            "tool_name": TOOL_NAME,
+            "tool_version": TOOL_VERSION,
+            "timestamp": self.timestamp.isoformat(),
+            "device": self.device_info,
+            "package": self.package_name,
+        }
+        if self.run_context:
+            metadata["run"] = self.run_context
+
         return {
-            "metadata": {
-                "tool_name": TOOL_NAME,
-                "tool_version": TOOL_VERSION,
-                "timestamp": self.timestamp.isoformat(),
-                "device": self.device_info,
-                "package": self.package_name,
-            },
+            "metadata": metadata,
             "summary": summary,
             "details": self._results,
         }
