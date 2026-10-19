@@ -38,6 +38,7 @@ from script_loader import (
     safe_unload,
     wait_for_java_ready,
 )
+from verdict_hook import load_verdict_hook
 
 if TYPE_CHECKING:  # evita import circular em tempo de importação
     from device_manager import DeviceManager
@@ -668,6 +669,7 @@ def run_combined_bypass(
     native_ssl = None
     proc_script = None
     java_hook = None
+    verdict_script = None
     died_after: Optional[int] = None
     pid: Optional[int] = None
     logcat_mark = get_logcat_mark(dm)
@@ -723,6 +725,13 @@ def run_combined_bypass(
                 msg = payload.get("message", "")
                 if msg and msg not in neutralized_actions:
                     neutralized_actions.append(msg)
+                if msg and msg not in hook_logs:
+                    hook_logs.append(msg)
+                return
+            if ptype == "raspilot-verdict":
+                # Diagnóstico do hook de veredito (qual classe foi
+                # varrida, quantos métodos foram encontrados).
+                msg = payload.get("message", "")
                 if msg and msg not in hook_logs:
                     hook_logs.append(msg)
                 return
@@ -793,6 +802,13 @@ def run_combined_bypass(
                     replacements=_replacements(dm, java_only=True),
                     load_timeout=java_timeout,
                 )
+                # Neutraliza a comunicação de violação dos SDKs de RASP:
+                # as primitivas são enganadas, mas o SDK ainda reporta
+                # a ameaça ao app.
+                verdict_script = load_verdict_hook(
+                    session, on_message=on_message,
+                    load_timeout=java_timeout,
+                )
             except Exception as exc:
                 hook_java_error = str(exc)
                 ssl_java_error = ssl_java_error or str(exc)
@@ -817,7 +833,8 @@ def run_combined_bypass(
         for target in (hook_logs, ssl_logs):
             target.append(f"[script-error] {exc}")
     finally:
-        for script in (native_hook, native_ssl, proc_script, java_hook):
+        for script in (native_hook, native_ssl, proc_script, java_hook,
+                       verdict_script):
             safe_unload(script)
         unload_stealth(stealth_loaded)
         if session is not None:

@@ -33,10 +33,28 @@ var RASPILOT_JAVA_ONLY = (typeof __RASPILOT_JAVA_ONLY__ !== 'undefined')
     : false;
 
 // Strings que apps anti-hook procuram (frameworks + instrumentação).
+//
+// A lista é separada em duas tieres de propósito. A busca por strings é
+// um gancho global: qualquer strstr/strcmp do app passa por ela. Um
+// termo que também é palavra comum em português e inglês ("gadget",
+// "whale", "epic") transformaria uma busca legítima do app em
+// detecção de hooking — e faria o bypass bloquear o app sem motivo.
+//
+// O tier forte é o que identifica um framework sem ambiguidade.
 var HOOK_KEYWORDS = [
-    'frida', 'xposed', 'lsposed', 'lspd', 'edxposed', 'substrate',
-    'sandhook', 'yahfa', 'lsplant', 'whale', 'dobby', 'riru', 'zygisk',
-    'gadget', 'gum-js', 'linjector', 'andhook', 'shadowhook'
+    'de.robv.android.xposed', 'xposedbridge', 'xposed.bridge',
+    'lsposed', 'lspd', 'edxposed', 'epic.xposed',
+    'cydia.substrate', 'com.saurik.substrate',
+    'sandhook', 'yahfa', 'lsplant', 'dobby', 'riru', 'zygisk',
+    'frida', 'gum-js', 'linjector', 'andhook', 'shadowhook',
+    'libloader64_v8', 'libloader32_v7'
+];
+
+// Termos ambíguos: usados apenas na verificação de caminhos e nomes de
+// arquivo, onde a chance de colisão é baixa e o custo de deixar passar
+// é maior que o de bloquear indevidamente.
+var HOOK_PATH_KEYWORDS = [
+    'xposed', 'whale', 'epic', 'gadget', 'sandhook', 'shadowhook'
 ];
 
 // Paths exatos adicionais (além do matcher por palavra-chave).
@@ -62,6 +80,40 @@ function reportEvidence(msg) {
     try {
         send({ type: 'bypass-evidence', message: msg });
     } catch (e) { /* host indisponível — ignora */ }
+}
+
+// Exceção de "classe não encontrada" usada para simular a ausência de
+// um framework de hooking.
+//
+// A marca própria permite distinguir a exceção que o script lançou de
+// uma exceção qualquer surgida no gancho — no primeiro caso a
+// substituição deve ser re-lançada ao app, no segundo o gancho deve
+// apenas seguir em silêncio.
+function notFoundException(className) {
+    var exc = null;
+    try {
+        var CNFE = Java.use('java.lang.ClassNotFoundException');
+        exc = CNFE.$new('' + className);
+    } catch (e) {
+        exc = new Error('' + className);
+    }
+    try {
+        exc.__raspilot = true;
+    } catch (e) { /* best-effort */ }
+    return exc;
+}
+
+// Verifica se um caminho/nome de arquivo referencia um framework.
+function matchesHookPath(str) {
+    try {
+        if (str === null || str === undefined) { return false; }
+        var lower = ('' + str).toLowerCase();
+        if (matchesHookFramework(lower)) { return true; }
+        for (var i = 0; i < HOOK_PATH_KEYWORDS.length; i++) {
+            if (lower.indexOf(HOOK_PATH_KEYWORDS[i]) !== -1) { return true; }
+        }
+        return false;
+    } catch (e) { return false; }
 }
 
 function matchesHookFramework(str) {
@@ -106,10 +158,20 @@ function hookClassLookups() {
         forName1.implementation = function (name) {
             try {
                 if (matchesHookFramework(name)) {
-                    reportEvidence("neutralizado: Class.forName('" + name + "') -> null");
-                    return null;
+                    // O app costuma detectar o framework pelo padrão
+                    // try/catch: procura a classe e considera o
+                    // framework presente quando a busca tem sucesso.
+                    // Devolver null faria a exceção de "classe não
+                    // encontrada" nunca acontecer, e o app concluiria
+                    // que o framework ESTÁ presente. O comportamento
+                    // correto é simular a ausência da classe.
+                    reportEvidence("neutralizado: Class.forName('" + name +
+                        "') -> ClassNotFoundException");
+                    throw notFoundException(name);
                 }
-            } catch (e) { /* best-effort */ }
+            } catch (e) {
+                if (e && e.__raspilot) { throw e; }
+            }
             return forName1.call(this, name);
         };
     } catch (e) {
@@ -124,10 +186,13 @@ function hookClassLookups() {
         forName3.implementation = function (name, initialize, loader) {
             try {
                 if (matchesHookFramework(name)) {
-                    reportEvidence("neutralizado: Class.forName('" + name + "', ...) -> null");
-                    return null;
+                    reportEvidence("neutralizado: Class.forName('" + name +
+                        "', ...) -> ClassNotFoundException");
+                    throw notFoundException(name);
                 }
-            } catch (e) { /* best-effort */ }
+            } catch (e) {
+                if (e && e.__raspilot) { throw e; }
+            }
             return forName3.call(this, name, initialize, loader);
         };
     } catch (e) {
@@ -160,7 +225,7 @@ function hookFileChecks() {
         File.exists.implementation = function () {
             var path = '' + this.getAbsolutePath();
             try {
-                if (matchesHookFramework(path)) {
+                if (matchesHookPath(path)) {
                     reportEvidence('neutralizado: File.exists(' + path + ') -> false');
                     return false;
                 }
@@ -183,7 +248,7 @@ function hookFileChecks() {
                 var removed = 0;
                 for (var i = 0; i < orig.length; i++) {
                     var entry = '' + orig[i];
-                    if (matchesHookFramework(entry)) { removed++; continue; }
+                    if (matchesHookPath(entry)) { removed++; continue; }
                     kept.push(entry);
                 }
                 if (removed > 0) {
@@ -210,7 +275,7 @@ function hookFileChecks() {
                 var removed = 0;
                 for (var i = 0; i < orig.length; i++) {
                     var entry = '' + orig[i].getName();
-                    if (matchesHookFramework(entry)) { removed++; continue; }
+                    if (matchesHookPath(entry)) { removed++; continue; }
                     kept.push(orig[i]);
                 }
                 if (removed > 0) {
@@ -327,6 +392,35 @@ function hookStackTrace() {
 // ----------------------------------------------------------------------
 // 5) Native — libc: strstr / strcmp / strcasestr / memcmp
 // ----------------------------------------------------------------------
+// Busca por palavra-chave diretamente nos bytes do buffer.
+//
+// Evita materializar a string caractere a caractere: em função muito
+// chamada o custo quadrático dessa conversão é o que trava o app.
+function bytesContainKeyword(buffer, keywords) {
+    if (buffer === null || buffer === undefined) { return false; }
+    var bytes = new Uint8Array(buffer);
+    var chunk = new Array(bytes.length);
+    for (var i = 0; i < bytes.length; i++) {
+        var c = bytes[i];
+        chunk[i] = (c >= 65 && c <= 90) ? (c + 32) : c;
+    }
+    var text = String.fromCharCode.apply(null, chunk);
+    for (var k = 0; k < keywords.length; k++) {
+        if (text.indexOf(keywords[k]) !== -1) { return true; }
+    }
+    return false;
+}
+
+// Busca por palavra-chave numa string.
+function containsKeyword(cstr, keywords) {
+    if (cstr === null || cstr === undefined) { return false; }
+    var lower = ('' + cstr).toLowerCase();
+    for (var i = 0; i < keywords.length; i++) {
+        if (lower.indexOf(keywords[i]) !== -1) { return true; }
+    }
+    return false;
+}
+
 function hookLibcStringHooks() {
     ['strstr', 'strcmp', 'strcasestr'].forEach(function (name) {
         try {
@@ -336,11 +430,17 @@ function hookLibcStringHooks() {
                 onEnter: function (args) {
                     this._hide = false;
                     try {
+                        // strstr(haystack, needle): o que interessa é o
+                        // needle — é o nome que o app procura. Esconder
+                        // o haystack quebraria buscas legítimas do app
+                        // por um termo qualquer.
                         var a = args[0].readCString();
                         var b = args[1].readCString();
-                        if (matchesHookFramework(a) || matchesHookFramework(b)) {
-                            this._hide = true;
-                        }
+                        var hit = (name === 'strstr' || name === 'strcasestr')
+                            ? containsKeyword(b, HOOK_KEYWORDS)
+                            : (containsKeyword(a, HOOK_KEYWORDS) ||
+                               containsKeyword(b, HOOK_KEYWORDS));
+                        if (hit) { this._hide = true; }
                     } catch (e) { /* best-effort */ }
                 },
                 onLeave: function (retval) {
@@ -367,14 +467,14 @@ function hookLibcStringHooks() {
                     this._hide = false;
                     try {
                         var n = args[2].toInt32();
-                        if (n > 0 && n < 4096) {
-                            var bytes = new Uint8Array(args[0].readByteArray(n));
-                            var s = '';
-                            for (var i = 0; i < bytes.length; i++) {
-                                var c = bytes[i];
-                                s += (c >= 32 && c < 127) ? String.fromCharCode(c) : ' ';
+                        // Buffers grandes são o caso comum (comparação de
+                        // blocos inteiros) e não é neles que mora o nome
+                        // de um framework.
+                        if (n > 0 && n <= 512) {
+                            if (bytesContainKeyword(args[0].readByteArray(n), HOOK_KEYWORDS) ||
+                                    bytesContainKeyword(args[1].readByteArray(n), HOOK_KEYWORDS)) {
+                                this._hide = true;
                             }
-                            if (matchesHookFramework(s)) { this._hide = true; }
                         }
                     } catch (e) { /* best-effort */ }
                 },

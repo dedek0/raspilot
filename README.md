@@ -264,6 +264,47 @@ mas o bypass venceu.
   de hooks ou de configuração nativa são apenas diagnóstico. O logcat é
   anexado ao resultado para corroborar erros de TLS/pinning.
 
+  Detalhes que fazem a diferença na prática:
+
+  - **Tipo de retorno**: os métodos de validação declaram tipos
+    diferentes entre si — a mesma assinatura existe numa variante que
+    devolve a cadeia (`List`) e numa que não devolve nada. Devolver o
+    tipo errado faz a ponte lançar uma exceção, o que entrega um `null`
+    ao app e **quebra o handshake** em vez de remover a validação. Todos
+    os overloads são hookados e o valor devolvido acompanha o tipo
+    declarado.
+  - **Classe temporária**: a bridge grava as classes que cria em um
+    diretório fora do sandbox do app, o que impede `registerClass` de
+    funcionar. O bootstrap redireciona esse cache para o diretório
+    gravável do próprio app.
+  - **Verificação de nome**: é um passo separado da verificação da
+    cadeia. O verificador padrão da plataforma é substituído de fato
+    (não só quando o app chama o setter) e os verificadores da plataforma
+    e do OkHttp são hookados.
+  - **Nativo**: `SSL_set_verify` (a variante por conexão, a mais usada),
+    `SSL_CTX_set_verify`, `X509_verify_cert` e o verificador customizado
+    do BoringSSL.
+
+  O comportamento é verificado ponta a ponta por
+  `tests/device_smoke.py`, que exige que a requisição **falhe** sem o
+  bypass e **passe** com ele.
+
+### 6. Hook de veredito (`scripts/verdict_hook.js`)
+
+Enganar as primitivas de detecção não é o bastante: o SDK ainda
+comunica a decisão ao app — por um callback de ameaça ou por um método
+que devolve um veredito — e o app reage a partir dali.
+
+O hook de veredito neutraliza essa comunicação. A varredura é feita pelo
+**nome do método** (`onThreatDetected`, `terminateApp`, `isCompromised`,
+…), que descreve a ação e se mantém estável mesmo quando o SDK muda de
+pacote ou de classe. Métodos sem retorno deixam de reportar; métodos
+booleanos devolvem "nada errado".
+
+O catálogo de SDKs conhecidos fica em `rasp_vendors.py` — é dado, não
+código: tokens de logcat, pacotes e classes de cada SDK. O mesmo
+catálogo alimenta a detecção estática no APK e a correlação de logcat.
+
 ---
 
 ## Estrutura do repositório
@@ -287,7 +328,9 @@ raspilot/
 │   ├── ssl_bypass.js           # Bypass universal de SSL pinning (Frida)
 │   ├── anti_frida_bypass.js    # Bypass de detecção de Frida (Frida)
 │   ├── anti_hooking_bypass.js  # Bypass de detecção de hooking (Frida)
+│   ├── verdict_hook.js         # Neutraliza o callback de ameaça do RASP
 │   └── anti_root_bypass.js     # Bypass de detecção de root (Frida)
+├── rasp_vendors.py             # Catálogo de SDKs de RASP conhecidos
 ├── templates/report.html.j2    # Template do relatório HTML
 ├── reports/                    # Saída dos relatórios
 └── tests/                      # Suíte pytest (100% mockada, sem dispositivo)
@@ -303,9 +346,22 @@ pytest -v
 A suíte cobre: parsing de output do ADB (mock de `subprocess.run`),
 consolidação (`run_all`) de cada check com dados mockados, geração do
 relatório JSON contra um snapshot de schema, detecção de pinning e
-anti-hooking em APKs sintéticos e o pipeline completo de ponta a ponta
-(com `DeviceManager` mockado). Nenhum dispositivo físico é necessário para
-os testes.
+anti-hooking em APKs sintéticos, o modelo de evidência (confiança alta
+vs contexto), a camada de bypass e o pipeline completo de ponta a ponta
+(com `DeviceManager` mockado). Nenhum dispositivo físico é necessário
+para os testes.
+
+Há também um **teste de device** para o bypass de SSL pinning, que exige
+aparelho conectado e um app instalado:
+
+```bash
+python tests/device_smoke.py --package <package>
+```
+
+Ele sobe um servidor HTTPS com certificado auto-assinado no host e faz
+uma requisição pelo JVM do app. O teste exige que a requisição **falhe**
+sem o bypass e **passe** com ele — o controle negativo é o que prova que
+o bypass é o motivo.
 
 ---
 

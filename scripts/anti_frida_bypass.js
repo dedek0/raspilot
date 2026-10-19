@@ -27,6 +27,16 @@ var FRIDA_PATHS = [
     're.frida.server'
 ];
 
+// Strings que identificam a instrumentação em memória.
+//
+// O nome do agente é ofuscado pela ferramenta (o nome do memfd não
+// aparece como "frida"), então a lista precisa cobrir tanto o nome
+// original quanto o ofuscado.
+var FRIDA_MARKERS = [
+    'frida', 'gum-js', 'linjector', 'frida-agent', 'libfrida',
+    'libloader64_v8', 'libloader32_v7'
+];
+
 var FRIDA_THREADS = ['gum-js-loop', 'gmain', 'pool-frida', 'frida'];
 
 // Porta stealth configurada no host (substituída antes da injeção).
@@ -55,7 +65,11 @@ function reportNeutralized(msg) {
 function looksLikeFrida(str) {
     try {
         if (str === null || str === undefined) { return false; }
-        return ('' + str).toLowerCase().indexOf('frida') !== -1;
+        var lower = ('' + str).toLowerCase();
+        for (var i = 0; i < FRIDA_MARKERS.length; i++) {
+            if (lower.indexOf(FRIDA_MARKERS[i]) !== -1) { return true; }
+        }
+        return false;
     } catch (e) { return false; }
 }
 

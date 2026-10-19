@@ -77,6 +77,105 @@ function hostFromTlsObject(obj) {
 }
 
 // ----------------------------------------------------------------------
+// Helpers de tipo
+// ----------------------------------------------------------------------
+
+// Converte a cadeia de certificados em java.util.List.
+//
+// A cadeia recebida é um array Java (X509Certificate[]); os métodos que
+// devolvem List esperam um List de verdade. Devolver o array faz a
+// ponte lançar uma exceção de incompatibilidade, o que entrega um null
+// ao app e quebra o handshake em vez de remover a validação.
+function chainToList(chain) {
+    try {
+        // Alguns métodos já recebem uma List (em vez de array) e a
+        // devolvem. Converter a lista em uma nova lista vazia apagaria
+        // a cadeia e o handshake passaria a falhar por falta de
+        // certificados confiáveis.
+        if (chain !== null && chain !== undefined &&
+                typeof chain.add === 'function') {
+            return chain;
+        }
+        var ArrayList = Java.use('java.util.ArrayList');
+        var list = ArrayList.$new();
+        if (chain !== null && chain !== undefined) {
+            var n = chain.length;
+            for (var i = 0; i < n; i++) { list.add(chain[i]); }
+        }
+        return list;
+    } catch (e) {
+        return null;
+    }
+}
+
+// Extrai o host dos argumentos de um método de validação.
+//
+// O nome do host aparece em argumentos diferentes conforme a
+// implementação: em alguns é o terceiro parâmetro (String), em outros
+// vem logo depois do authType.
+function hostFromChainArgs(args) {
+    try {
+        for (var i = 1; i < args.length && i < 4; i++) {
+            var v = args[i];
+            if (v === null || v === undefined) { continue; }
+            if (typeof v === 'string' || v instanceof String) {
+                var s = '' + v;
+                if (s.indexOf('.') !== -1 && s.indexOf('/') === -1 &&
+                        s.indexOf(' ') === -1) {
+                    return s;
+                }
+            }
+        }
+    } catch (e) { /* best-effort */ }
+    return '';
+}
+
+// Hooka todos os overloads de um método.
+//
+// O mesmo nome pode existir em várias variantes — a mesma assinatura
+// com tipos de retorno diferentes (a variante que devolve a cadeia e a
+// que não devolve nada). Hookar apenas uma delas deixa o caminho real
+// de pé, e devolver o tipo errado para a variante escolhida quebra a
+// chamada. Cada overload recebe a implementação de acordo com o tipo
+// de retorno declarado.
+function hookAllOverloads(cls, methodName, impl) {
+    var hooked = 0;
+    try {
+        var method = cls[methodName];
+        var overloads = method.overloads;
+        for (var i = 0; i < overloads.length; i++) {
+            (function (ov) {
+                var wantsList = ov.returnType === 'Ljava/util/List;' ||
+                    ov.returnType === 'Ljava/util/ArrayList;';
+                var isVoid = ov.returnType === 'V' || ov.returnType === 'void';
+                ov.implementation = function () {
+                    var args = Array.prototype.slice.call(arguments);
+                    if (isVoid) {
+                        // Método sem retorno: o valor devolvido é
+                        // descartado pela ponte, e devolver a cadeia
+                        // seria um descompasso entre o que o método
+                        // promete e o que entrega.
+                        impl(args);
+                        return undefined;
+                    }
+                    var out = impl(args);
+                    if (wantsList) {
+                        var list = (out !== null && out !== undefined &&
+                            typeof out.add === 'function') ? out : chainToList(args[0]);
+                        return list;
+                    }
+                    return (out === undefined || out === null) ? undefined : out;
+                };
+                hooked++;
+            })(overloads[i]);
+        }
+    } catch (e) {
+        log('hookAllOverloads(' + methodName + ') falhou: ' + e);
+    }
+    return hooked;
+}
+
+// ----------------------------------------------------------------------
 // 1) Java — X509TrustManager (checkServerTrusted / checkClientTrusted)
 // ----------------------------------------------------------------------
 function registerNoopTrustManager(TrustManager) {
@@ -200,15 +299,39 @@ function hookTrustManager() {
         log('TrustManager hook falhou: ' + e);
     }
 
-    // TrustManagerImpl (Android/OpenSSL): verifyChain -> no-op.
+    // TrustManagerImpl (Conscrypt): todos os overloads de
+    // checkServerTrusted e o verifyChain.
+    //
+    // A implementação precisa devolver exatamente o tipo declarado pelo
+    // método. Os overloads de checkServerTrusted existem em duas
+    // variantes com a mesma assinatura — uma que devolve a cadeia
+    // (List) e uma void — e devolver o tipo errado faz a ponte lançar
+    // uma exceção, o que entrega um null ao app e quebra o handshake
+    // em vez de remover a validação.
     try {
         var TrustManagerImpl = Java.use('com.android.org.conscrypt.TrustManagerImpl');
-        TrustManagerImpl.verifyChain.implementation = function (
+
+        var hooked = hookAllOverloads(
+            TrustManagerImpl, 'checkServerTrusted', function (args) {
+                var authType = '';
+                try { authType = '' + args[1]; } catch (e) { }
+                var host = hostFromChainArgs(args);
+                markHost(host);
+                log('TrustManagerImpl.checkServerTrusted bypass (' +
+                    (host || 'authType=' + authType) + ')');
+                return chainToList(args[0]);
+            }
+        );
+        log('TrustManagerImpl.checkServerTrusted hookado (' + hooked +
+            ' overloads)');
+
+        var verifyChain = TrustManagerImpl.verifyChain;
+        verifyChain.implementation = function (
             untrustedChain, trustAnchorChain, host, clientAuth, ocspData, tlsSctData
         ) {
             markHost(host);
             log('TrustManagerImpl.verifyChain bypass (' + host + ')');
-            return untrustedChain;
+            return chainToList(untrustedChain);
         };
         log('TrustManagerImpl.verifyChain hookado');
     } catch (e) {
@@ -307,6 +430,19 @@ function hookHostnameVerifier() {
             return this.setHostnameVerifier(v);
         };
         log('HttpsURLConnection.setHostnameVerifier hookado');
+
+        // O verificador padrão só é trocado se o app chamar o setter.
+        // Trocando-o de fato, toda conexão criada depois passa a usar o
+        // verificador permissivo — é o que cobre os apps que não
+        // configuram verificador nenhum.
+        if (allowAll !== null) {
+            try {
+                HttpsURLConnection.setDefaultHostnameVerifier(allowAll);
+                log('HttpsURLConnection.setDefaultHostnameVerifier -> allow-all');
+            } catch (e) {
+                log('setDefaultHostnameVerifier falhou: ' + e);
+            }
+        }
     } catch (e) {
         log('HostnameVerifier hook falhou: ' + e);
     }
@@ -330,7 +466,7 @@ function hookHostnameVerifier() {
 // (com retry: em apps com dex secundário a classe só existe depois do spawn)
 // ----------------------------------------------------------------------
 var OKHTTP_RETRIES = [1000, 3000, 6000, 10000];
-var okhttpState = { check: false, checkVar: false, chain: false };
+var okhttpState = { check: false, checkVar: false, chain: false, hostname: false };
 
 // Procura a classe no classloader padrão e, se ausente, nos classloaders
 // enumerados (dex secundário / classloader do RASP).
@@ -357,32 +493,53 @@ function retrySuffix(attempt) {
     return attempt > 0 ? ' (retry ' + attempt + ')' : '';
 }
 
+// Verificadores de host da plataforma.
+//
+// A verificação de nome é um passo separado da verificação da cadeia:
+// um certificado válido para outro host passa pela cadeia e é recusado
+// aqui. O verificador da plataforma é o que a JVM usa por padrão.
+function hookPlatformHostnameVerifiers() {
+    var candidates = [
+        'com.android.org.conscrypt.ConscryptHostnameVerifier',
+        'com.android.org.conscrypt.CompactHostnameVerifier'
+    ];
+    candidates.forEach(function (name) {
+        try {
+            var cls = Java.use(name);
+            var n = hookAllOverloads(cls, 'verify', function (args) {
+                var host = '';
+                try { host = '' + args[0]; } catch (e) { }
+                markHost(host);
+                log(name + '.verify bypass (' + host + ')');
+                return true;
+            });
+            if (n > 0) {
+                log(name + ' hookado (' + n + ' overloads)');
+            }
+        } catch (e) { /* verificador ausente */ }
+    });
+}
+
 function hookOkHttpOnce(attempt) {
     if (!okhttpState.check) {
         var CertificatePinner = useClassAnywhere('okhttp3.CertificatePinner');
         if (CertificatePinner !== null) {
-            try {
-                CertificatePinner.check.overload(
-                    'java.lang.String', 'java.util.List'
-                ).implementation = function (host, peerCerts) {
+            // Todas as assinaturas: a versão do OkHttp define a forma
+            // (List, array ou varargs) e hookar só uma delas deixa o
+            // caminho real de pé.
+            var n = hookAllOverloads(
+                CertificatePinner, 'check', function (args) {
+                    var host = '';
+                    try { host = '' + args[0]; } catch (e) { }
                     markHost(host);
                     log('OkHttp CertificatePinner.check bypass (' + host + ')');
-                    return;
-                };
+                }
+            );
+            if (n > 0) {
                 okhttpState.check = true;
-                log('OkHttp CertificatePinner.check(String, List) hookado' + retrySuffix(attempt));
-            } catch (e) {
-                log('OkHttp CertificatePinner.check hook falhou: ' + e);
+                log('OkHttp CertificatePinner.check hookado (' + n +
+                    ' overloads)' + retrySuffix(attempt));
             }
-            try {
-                CertificatePinner.check.overload(
-                    'java.lang.String', '[Ljava.security.cert.Certificate;'
-                ).implementation = function (host, certs) {
-                    markHost(host);
-                    log('OkHttp CertificatePinner.check(String, Certificate[]) bypass (' + host + ')');
-                    return;
-                };
-            } catch (e) { /* sem overload varargs */ }
         } else if (attempt === OKHTTP_RETRIES.length) {
             log('OkHttp CertificatePinner indisponível após retries');
         }
@@ -401,6 +558,30 @@ function hookOkHttpOnce(attempt) {
                 okhttpState.checkVar = true;
                 log('OkHttp CertificatePinner.check$okhttp hookado' + retrySuffix(attempt));
             } catch (e) { /* sem overload $okhttp nesta versão */ }
+        }
+    }
+
+    if (!okhttpState.hostname) {
+        // O verificador de host do OkHttp é o que rejeita o certificado
+        // quando o nome não casa, mesmo sem pinning.
+        var OkVerifier = useClassAnywhere('okhttp3.internal.tls.OkHostnameVerifier');
+        if (OkVerifier !== null) {
+            try {
+                var n = hookAllOverloads(OkVerifier, 'verify', function (args) {
+                    var host = '';
+                    try { host = '' + args[0]; } catch (e) { }
+                    markHost(host);
+                    log('OkHttp OkHostnameVerifier.verify bypass (' + host + ')');
+                    return true;
+                });
+                if (n > 0) {
+                    okhttpState.hostname = true;
+                    log('OkHttp OkHostnameVerifier hookado (' + n +
+                        ' overloads)' + retrySuffix(attempt));
+                }
+            } catch (e) {
+                log('OkHttp OkHostnameVerifier hook falhou: ' + e);
+            }
         }
     }
 
@@ -438,31 +619,37 @@ function scheduleOkHttpRetries() {
 // 5) NetworkSecurityConfig (Android 7+)
 // ----------------------------------------------------------------------
 function hookNetworkSecurityConfig() {
+    // Todos os overloads: a mesma assinatura aparece em variantes que
+    // devolvem a cadeia e variantes void, e a variante com o host
+    // explícito só existe em versões mais novas do Android.
     try {
         var NSTM = Java.use('android.security.net.config.NetworkSecurityTrustManager');
-        NSTM.checkServerTrusted.overload(
-            '[Ljava.security.cert.X509Certificate;', 'java.lang.String'
-        ).implementation = function (chain, authType) {
-            // 2º argumento é authType, não host.
-            log('NetworkSecurityTrustManager.checkServerTrusted bypass (authType=' +
-                authType + ')');
-        };
-        log('NetworkSecurityTrustManager hookado');
+        var n = hookAllOverloads(NSTM, 'checkServerTrusted', function (args) {
+            var authType = '';
+            try { authType = '' + args[1]; } catch (e) { }
+            var host = hostFromChainArgs(args);
+            markHost(host);
+            log('NetworkSecurityTrustManager.checkServerTrusted bypass (' +
+                (host || 'authType=' + authType) + ')');
+            return chainToList(args[0]);
+        });
+        log('NetworkSecurityTrustManager hookado (' + n + ' overloads)');
     } catch (e) {
         log('NetworkSecurityTrustManager indisponível: ' + e);
     }
 
     try {
         var RootTrustManager = Java.use('android.security.net.config.RootTrustManager');
-        RootTrustManager.checkServerTrusted.overload(
-            '[Ljava.security.cert.X509Certificate;', 'java.lang.String'
-        ).implementation = function (chain, authType) {
-            // 2º argumento é authType, não host. O host real é capturado
-            // em TrustManagerImpl.verifyChain/socket.
-            log('RootTrustManager.checkServerTrusted bypass (authType=' +
-                authType + ')');
-        };
-        log('RootTrustManager hookado');
+        var m = hookAllOverloads(RootTrustManager, 'checkServerTrusted', function (args) {
+            var authType = '';
+            try { authType = '' + args[1]; } catch (e) { }
+            var host = hostFromChainArgs(args);
+            markHost(host);
+            log('RootTrustManager.checkServerTrusted bypass (' +
+                (host || 'authType=' + authType) + ')');
+            return chainToList(args[0]);
+        });
+        log('RootTrustManager hookado (' + m + ' overloads)');
     } catch (e) {
         log('RootTrustManager indisponível: ' + e);
     }
@@ -472,35 +659,27 @@ function hookNetworkSecurityConfig() {
 // 6) Conscrypt Platform
 // ----------------------------------------------------------------------
 function hookConscrypt() {
+    // A assinatura mudou entre versões do Conscrypt: as mais antigas
+    // recebem o socket ou o engine, as mais recentes recebem o host.
+    // Hookar todas as variantes cobre as duas.
     try {
         var Platform = Java.use('com.android.org.conscrypt.Platform');
-        try {
-            Platform.checkServerTrusted.overload(
-                'javax.net.ssl.X509TrustManager',
-                '[Ljava.security.cert.X509Certificate;',
-                'java.lang.String',
-                'com.android.org.conscrypt.AbstractConscryptSocket'
-            ).implementation = function (tm, chain, authType, socket) {
-                var host = hostFromTlsObject(socket);
-                markHost(host);
-                log('Conscrypt Platform.checkServerTrusted bypass (' +
-                    (host || 'authType=' + authType) + ')');
-            };
-            log('Conscrypt Platform.checkServerTrusted hookado');
-        } catch (e1) {
-            Platform.checkServerTrusted.overload(
-                'javax.net.ssl.X509TrustManager',
-                '[Ljava.security.cert.X509Certificate;',
-                'java.lang.String',
-                'com.android.org.conscrypt.ConscryptEngine'
-            ).implementation = function (tm, chain, authType, engine) {
-                var host = hostFromTlsObject(engine);
-                markHost(host);
-                log('Conscrypt Platform.checkServerTrusted bypass (' +
-                    (host || 'authType=' + authType) + ')');
-            };
-            log('Conscrypt Platform.checkServerTrusted hookado (engine)');
-        }
+        var n = hookAllOverloads(Platform, 'checkServerTrusted', function (args) {
+            var authType = '';
+            try { authType = '' + args[2]; } catch (e) { }
+            var host = '';
+            for (var i = 1; i < args.length; i++) {
+                var h = hostFromTlsObject(args[i]);
+                if (h !== '') { host = h; break; }
+            }
+            if (host === '') { host = hostFromChainArgs(args); }
+            markHost(host);
+            log('Conscrypt Platform.checkServerTrusted bypass (' +
+                (host || 'authType=' + authType) + ')');
+            return chainToList(args[1]);
+        });
+        log('Conscrypt Platform.checkServerTrusted hookado (' + n +
+            ' overloads)');
     } catch (e) {
         log('Conscrypt Platform indisponível: ' + e);
     }
@@ -510,15 +689,46 @@ function hookConscrypt() {
 // 8) WebView — onReceivedSslError -> proceed()
 // ----------------------------------------------------------------------
 function hookWebView() {
+    // A classe base não basta: o app quase sempre sobrescreve
+    // onReceivedSslError, e a sobrescrita tem o próprio ArtMethod — o
+    // gancho na base não é chamado.
     try {
         var WebViewClient = Java.use('android.webkit.WebViewClient');
         WebViewClient.onReceivedSslError.implementation = function (view, handler, error) {
             log('WebViewClient.onReceivedSslError -> proceed()');
             handler.proceed();
         };
-        log('WebViewClient.onReceivedSslError hookado');
+        log('WebViewClient.onReceivedSslError hookado (classe base)');
     } catch (e) {
         log('WebViewClient indisponível: ' + e);
+    }
+
+    // Procura as instâncias vivas e hooka a classe concreta de cada
+    // uma, que é a que o WebView realmente invoca.
+    try {
+        var hookedClasses = {};
+        Java.choose('android.webkit.WebViewClient', {
+            onMatch: function (instance) {
+                try {
+                    var cls = instance.getClass();
+                    var name = '' + cls.getName();
+                    if (hookedClasses[name]) { return; }
+                    hookedClasses[name] = true;
+                    var concrete = Java.use(name);
+                    concrete.onReceivedSslError.implementation = function (view, handler, error) {
+                        log('WebViewClient[' + name + '].onReceivedSslError -> proceed()');
+                        handler.proceed();
+                    };
+                    log('WebViewClient concreto hookado: ' + name);
+                } catch (e) { /* classe sem o método */ }
+            },
+            onComplete: function () {
+                log('varredura de WebViewClient concluída (' +
+                    Object.keys(hookedClasses).length + ' classes)');
+            }
+        });
+    } catch (e) {
+        log('varredura de WebViewClient indisponível: ' + e);
     }
 }
 
@@ -551,15 +761,25 @@ function hostFromSsl(lib, ssl) {
     } catch (e) { return ''; }
 }
 
+// Callbacks nativos que precisam sobreviver à chamada que os criou.
+var nativeCallbacks = [];
+
 function hookNativeSsl() {
     var libs = ['libssl.so', 'libboringssl.so', 'libconscrypt_jni.so'];
+    // A mesma função pode estar exportada por mais de uma biblioteca.
+    // Hooká-la duas vezes cria dois interceptors para o mesmo endereço
+    // e, no caso do verificador customizado, dois callbacks — o
+    // segundo substitui o primeiro, que fica apontando para memória
+    // liberada.
+    var hookedAddresses = {};
     libs.forEach(function (lib) {
         // SSL_CTX_set_custom_verify (BoringSSL): callback sempre X509_V_OK.
         // Nota: args[0] é SSL_CTX* (não SSL*) — o host/SNI só é possível
         // dentro do callback, que recebe o SSL* real.
         try {
             var customVerify = raspilotFindExport(lib, 'SSL_CTX_set_custom_verify');
-            if (customVerify !== null) {
+            if (customVerify !== null && !hookedAddresses[customVerify]) {
+                hookedAddresses[customVerify] = true;
                 Interceptor.attach(customVerify, {
                     onEnter: function (args) {
                         this._ctx = args[0];
@@ -577,7 +797,13 @@ function hookNativeSsl() {
                                 return 0; // ssl_verify_ok
                             }, 'int', ['pointer', 'pointer']);
                             args[3] = callback;
-                            this._keepalive = callback;
+                            // O callback precisa sobreviver à chamada: a
+                            // biblioteca guarda o ponteiro e o invoca no
+                            // próximo handshake. Mantido em uma lista do
+                            // módulo, um callback preso apenas ao
+                            // contexto da chamada seria liberado e o
+                            // contexto ficaria com um ponteiro inválido.
+                            nativeCallbacks.push(callback);
                         } catch (e) {
                             log(lib + ': custom_verify hook falhou: ' + e);
                         }
@@ -590,7 +816,8 @@ function hookNativeSsl() {
         // SSL_get_verify_result -> X509_V_OK (0) — loga só o primeiro disparo.
         try {
             var getVerifyResult = raspilotFindExport(lib, 'SSL_get_verify_result');
-            if (getVerifyResult !== null) {
+            if (getVerifyResult !== null && !hookedAddresses[getVerifyResult]) {
+                hookedAddresses[getVerifyResult] = true;
                 Interceptor.attach(getVerifyResult, {
                     onEnter: function (args) {
                         this._host = hostFromSsl(lib, args[0]);
@@ -610,7 +837,8 @@ function hookNativeSsl() {
         // SSL_CTX_set_verify -> SSL_VERIFY_NONE — loga só o primeiro disparo.
         try {
             var setVerify = raspilotFindExport(lib, 'SSL_CTX_set_verify');
-            if (setVerify !== null) {
+            if (setVerify !== null && !hookedAddresses[setVerify]) {
+                hookedAddresses[setVerify] = true;
                 Interceptor.attach(setVerify, {
                     onEnter: function (args) {
                         args[1] = ptr(0); // SSL_VERIFY_NONE
@@ -619,6 +847,41 @@ function hookNativeSsl() {
                     }
                 });
                 log(lib + ': SSL_CTX_set_verify hookado');
+            }
+        } catch (e) { /* sem export */ }
+
+        // SSL_set_verify: variante por conexão. É a que as bibliotecas
+        // nativas usam; sem ela a validação continua valendo mesmo com
+        // o contexto neutralizado.
+        try {
+            var sslSetVerify = raspilotFindExport(lib, 'SSL_set_verify');
+            if (sslSetVerify !== null && !hookedAddresses[sslSetVerify]) {
+                hookedAddresses[sslSetVerify] = true;
+                Interceptor.attach(sslSetVerify, {
+                    onEnter: function (args) {
+                        args[1] = ptr(0); // SSL_VERIFY_NONE
+                        logOnce(lib + '.ssl_set_verify',
+                            lib + ': SSL_set_verify -> SSL_VERIFY_NONE');
+                    }
+                });
+                log(lib + ': SSL_set_verify hookado');
+            }
+        } catch (e) { /* sem export */ }
+
+        // X509_verify_cert: verificação direta da cadeia, usada por
+        // quem faz a validação por conta própria.
+        try {
+            var x509Verify = raspilotFindExport(lib, 'X509_verify_cert');
+            if (x509Verify !== null && !hookedAddresses[x509Verify]) {
+                hookedAddresses[x509Verify] = true;
+                Interceptor.attach(x509Verify, {
+                    onLeave: function (retval) {
+                        retval.replace(ptr(1)); // X509_V_OK
+                        logOnce(lib + '.x509_verify_cert',
+                            lib + ': X509_verify_cert -> X509_V_OK');
+                    }
+                });
+                log(lib + ': X509_verify_cert hookado');
             }
         } catch (e) { /* sem export */ }
     });
@@ -638,6 +901,23 @@ function hookFlutter() {
     }
     flutterState.done = true;
     try {
+        // A BoringSSL costuma estar linkada estaticamente na
+        // biblioteca do Flutter, com os símbolos sem visibilidade. O
+        // caminho que resolve é o do verificador exportado.
+        try {
+            var verifyResult = flutter.findExportByName('SSL_get_verify_result');
+            if (verifyResult !== null) {
+                Interceptor.attach(verifyResult, {
+                    onLeave: function (retval) {
+                        retval.replace(ptr(0)); // X509_V_OK
+                        logOnce('flutter.SSL_get_verify_result',
+                            'Flutter SSL_get_verify_result -> X509_V_OK');
+                    }
+                });
+                log('Flutter SSL_get_verify_result hookado');
+            }
+        } catch (e) { /* sem export */ }
+
         // ssl_verify_result: força o valor de retorno para 'ok'.
         var exports = flutter.enumerateExports();
         exports.forEach(function (exp) {
@@ -688,6 +968,7 @@ function main() {
     var javaOk = raspilotDeferJava(function () {
         hookTrustManager();
         hookHostnameVerifier();
+        hookPlatformHostnameVerifiers();
         hookOkHttpOnce(0);
         hookNetworkSecurityConfig();
         hookConscrypt();

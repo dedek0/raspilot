@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import logging
 import re
+
+from rasp_vendors import all_tokens
 from typing import Dict, List, Optional, Sequence
 
 logger = logging.getLogger("raspilot.logcat")
@@ -122,13 +124,15 @@ LOW_CONFIDENCE_PATTERNS = {
 # Identificadores de SDKs de RASP conhecidos. O log de um SDK costuma
 # vir na tag do próprio SDK, sem citar o pacote do app — por isso a
 # busca por tag é feita separadamente da exigência de citar o alvo.
-RASP_VENDOR_TAGS = (
-    "promon", "appsuit", "guardsquare", "approtect", "trustchecker",
-    "talsec", "inka", "nexign", "netskope", "bluepoint", "dexprotector",
-    "apkprotector", "apk-protector", "ijiami", "bangcle", "secshell",
-    "tesseract", "appsealing", "quarks", "avast", "nagain", "luciq",
-    "playintegrity", "play integrity", "safetynet", "appcheck",
-    "cloudflare", "turnstile", "nucleus", "appsealing",
+#
+# A lista vem do catálogo de vendors, para que a detecção de vendor
+# tenha uma fonte só.
+RASP_VENDOR_TAGS = tuple(
+    list({token.lower() for token in all_tokens()})
+    + [
+        "playintegrity", "play integrity", "safetynet", "appcheck",
+        "cloudflare", "turnstile", "nucleus", "apk-protector",
+    ]
 )
 
 # Tags cujo log pertence à ferramenta de instrumentação do operador

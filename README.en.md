@@ -288,7 +288,9 @@ raspilot/
 │   ├── ssl_bypass.js           # Universal SSL pinning bypass (Frida)
 │   ├── anti_frida_bypass.js    # Frida detection bypass (Frida)
 │   ├── anti_hooking_bypass.js  # Hooking detection bypass (Frida)
+│   ├── verdict_hook.js         # Neutralises the RASP threat callback
 │   └── anti_root_bypass.js     # Root detection bypass (Frida)
+├── rasp_vendors.py             # Catalogue of known RASP SDKs
 ├── templates/report.html.j2    # HTML report template
 ├── reports/                    # Report output
 └── tests/                      # pytest suite (100% mocked, no device)
@@ -303,9 +305,22 @@ pytest -v
 
 The suite covers: ADB output parsing (mocked `subprocess.run`), `run_all`
 consolidation of each check with mocked data, JSON report generation against
-a schema snapshot, pinning and anti-hooking detection on synthetic APKs and
-the full end-to-end pipeline (with a mocked `DeviceManager`). No physical
-device is required to run the tests.
+a schema snapshot, pinning and anti-hooking detection on synthetic APKs, the
+evidence model (high confidence vs context), the bypass layer and the full
+end-to-end pipeline (with a mocked `DeviceManager`). No physical device is
+required to run the tests.
+
+There is also a **device test** for the SSL pinning bypass, which needs a
+connected device and an installed app:
+
+```bash
+python tests/device_smoke.py --package <package>
+```
+
+It starts an HTTPS server with a self-signed certificate on the host and
+makes a request through the app's JVM. The test requires the request to
+**fail** without the bypass and **succeed** with it — the negative
+control is what proves the bypass is the reason.
 
 ---
 

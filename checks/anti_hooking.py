@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from checks.apk_utils import pull_apk, scan_apk
 from checks.stealth import PROC_FILTER_SCRIPT, load_stealth, unload_stealth
+from rasp_vendors import VENDORS
 from logcat_analyzer import (
     HIGH_CONFIDENCE_CATEGORIES,
     analyze_since,
@@ -146,6 +147,21 @@ STATIC_SIGNATURES: List[Tuple[str, List[Tuple[bytes, str]]]] = [
         (b"frida", "string 'frida' (anti-Frida embutido)"),
     ]),
 ]
+
+# Assinaturas dos SDKs de RASP conhecidos, derivadas do catálogo.
+# O nome do pacote é a assinatura mais estável de um SDK.
+_VENDOR_SIGNATURES: List[Tuple[bytes, str]] = []
+for _vendor in VENDORS:
+    for _token in _vendor.tokens:
+        if "." not in _token:
+            continue
+        _needle = _token.encode("utf-8")
+        if any(existing[0] == _needle for existing in _VENDOR_SIGNATURES):
+            continue
+        _VENDOR_SIGNATURES.append((_needle, f"SDK de RASP {_vendor.name}"))
+
+if _VENDOR_SIGNATURES:
+    STATIC_SIGNATURES.append(("rasp_sdk", _VENDOR_SIGNATURES))
 
 # Prioridade do tipo principal quando há várias assinaturas no APK.
 STATIC_PRIORITY = ["xposed", "lsposed", "edxposed", "substrate", "inline_hook", "frida"]
