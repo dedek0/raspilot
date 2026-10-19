@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 from rich.console import Console
 
 from checks.apk_utils import pull_apk, scan_apk
+from checks.stealth import PROC_FILTER_SCRIPT, load_stealth, unload_stealth
 from logcat_analyzer import (
     analyze_since,
     classify_failure,
@@ -114,13 +115,19 @@ def _now_iso() -> str:
 class SSLPinningCheck:
     """Detecta SSL pinning no APK e tenta bypass via Frida."""
 
-    def __init__(self, dm: "DeviceManager") -> None:
+    def __init__(
+        self, dm: "DeviceManager", mode: str = "bypass", no_java: bool = False
+    ) -> None:
         """Inicializa o check com o gerenciador de dispositivo.
 
         Args:
             dm: Instância conectada de ``DeviceManager``.
+            mode: ``detect``, ``bypass`` ou ``stealth``.
+            no_java: Se True, não tenta carregar hooks Java.
         """
         self.dm = dm
+        self.mode = mode
+        self.no_java = no_java
 
     # ------------------------------------------------------------------
     # Helpers
@@ -259,6 +266,7 @@ class SSLPinningCheck:
         proc_script = None
         kill_script = None
         java_load_error: Optional[str] = None
+        stealth_loaded: List[tuple] = []
         died_after: Optional[int] = None
 
         def on_message(message, data):  # noqa: ANN001 - assinatura frida
@@ -288,6 +296,13 @@ class SSLPinningCheck:
             # Spawn suspenso: instala os hooks ANTES do app rodar, para
             # não perder validações de certificado da inicialização.
             session = self.dm.spawn_app(package_name, resume=False)
+            if self.mode == "stealth":
+                stealth_loaded = load_stealth(
+                    session,
+                    on_message=on_message,
+                    replacements=self._script_replacements(),
+                    include_proc_filter=True,
+                )
             # Fase 1 (antes do resume): hooks nativos SSL + filtro /proc,
             # sem bridge Java.
             script = load_script_file(
@@ -296,29 +311,36 @@ class SSLPinningCheck:
                 with_java_bridge=False,
                 load_timeout=5.0,
             )
-            try:
-                proc_script = load_script_file(
-                    session, PROC_FILTER_SCRIPT, on_message=on_message,
-                    replacements=self._script_replacements(java_only=False),
-                    with_java_bridge=False,
-                    load_timeout=3.0,
-                )
-            except Exception:
-                logger.warning("proc_filter.js indisponível", exc_info=True)
+            proc_loaded = any(
+                path == PROC_FILTER_SCRIPT for path, _ in stealth_loaded
+            )
+            if not proc_loaded:
+                try:
+                    proc_script = load_script_file(
+                        session, PROC_FILTER_SCRIPT, on_message=on_message,
+                        replacements=self._script_replacements(java_only=False),
+                        with_java_bridge=False,
+                        load_timeout=3.0,
+                    )
+                except Exception:
+                    logger.warning("proc_filter.js indisponível", exc_info=True)
             self.dm.resume_app()
             pid = self.dm.last_spawn_pid
             # Fase 2 (após o resume): hooks Java de SSL.
-            try:
-                java_script = load_script_file(
-                    session, SSL_BYPASS_SCRIPT, on_message=on_message,
-                    replacements=self._script_replacements(java_only=True),
-                    with_java_bridge=True,
-                    load_timeout=5.0,
-                )
-            except Exception as exc:
-                java_load_error = str(exc)
-                logger.warning("Hooks Java SSL não carregaram: %s", exc)
-                safe_detach(session)
+            if self.no_java:
+                java_load_error = None
+            else:
+                try:
+                    java_script = load_script_file(
+                        session, SSL_BYPASS_SCRIPT, on_message=on_message,
+                        replacements=self._script_replacements(java_only=True),
+                        with_java_bridge=True,
+                        load_timeout=5.0,
+                    )
+                except Exception as exc:
+                    java_load_error = str(exc)
+                    logger.warning("Hooks Java SSL não carregaram: %s", exc)
+                    safe_detach(session)
             if java_load_error is None:
                 # Diagnóstico de kill carregado por último.
                 try:
@@ -410,6 +432,7 @@ class SSLPinningCheck:
             safe_unload(java_script)
             safe_unload(proc_script)
             safe_unload(kill_script)
+            unload_stealth(stealth_loaded)
             if session is not None:
                 safe_detach(session)
 
@@ -468,6 +491,8 @@ class SSLPinningCheck:
             "logcat": logcat,
             "logcat_evidence": format_evidence(logcat),
             "java_load_error": java_load_error,
+            "java_skipped": bool(self.no_java),
+            "stealth_used": bool(stealth_loaded),
             "error": error,
         }
         logger.info(
@@ -480,7 +505,11 @@ class SSLPinningCheck:
     # Consolidação
     # ------------------------------------------------------------------
     def run_all(
-        self, package_name: str, apk_path: Optional[str] = None, window: int = 12
+        self,
+        package_name: str,
+        apk_path: Optional[str] = None,
+        window: int = 12,
+        precomputed_bypass: Optional[dict] = None,
     ) -> dict:
         """Combina detecção estática e tentativa de bypass.
 
@@ -523,7 +552,29 @@ class SSLPinningCheck:
                 "timestamp": _now_iso(),
             }
 
-        bypass = self.attempt_bypass(package_name, window=window)
+        bypass_skipped_reason = None
+        if self.mode == "detect":
+            bypass_skipped_reason = "modo detect: bypass não executado"
+        elif self.no_java:
+            bypass_skipped_reason = "--no-java: hooks Java necessários ao bypass"
+
+        if bypass_skipped_reason is not None:
+            return {
+                "pinning_detected": True,
+                "pinning_type": detection.get("type", "none"),
+                "bypass_successful": None,
+                "evidence": detection.get("evidence", []),
+                "bypass_details": None,
+                "bypass_skipped_reason": bypass_skipped_reason,
+                "detection": detection,
+                "timestamp": _now_iso(),
+            }
+
+        bypass = (
+            precomputed_bypass
+            if precomputed_bypass is not None
+            else self.attempt_bypass(package_name, window=window)
+        )
         result = {
             "pinning_detected": True,
             "pinning_type": detection.get("type", "none"),

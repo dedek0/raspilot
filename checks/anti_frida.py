@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, Optional
 
+from checks.stealth import load_stealth, unload_stealth
 from logcat_analyzer import (
     RASP_CATEGORIES,
     analyze_since,
@@ -245,13 +246,19 @@ def _now_iso() -> str:
 class AntiFridaCheck:
     """Verifica presença de Frida e detecção de Frida pelo app alvo."""
 
-    def __init__(self, dm: "DeviceManager") -> None:
+    def __init__(
+        self, dm: "DeviceManager", mode: str = "bypass", no_java: bool = False
+    ) -> None:
         """Inicializa o check com o gerenciador de dispositivo.
 
         Args:
             dm: Instância conectada de ``DeviceManager``.
+            mode: ``detect``, ``bypass`` ou ``stealth``.
+            no_java: Se True, não tenta carregar hooks Java.
         """
         self.dm = dm
+        self.mode = mode
+        self.no_java = no_java
 
     # ------------------------------------------------------------------
     # Helpers
@@ -541,6 +548,7 @@ class AntiFridaCheck:
         java_script = None
         kill_script = None
         java_load_error: Optional[str] = None
+        stealth_loaded: List[tuple] = []
         resumed = False
         died_after: Optional[int] = None
         try:
@@ -571,6 +579,13 @@ class AntiFridaCheck:
                 elif message.get("type") == "error":
                     logger.debug("Erro no script de detecção: %s", message.get("description"))
 
+            if self.mode == "stealth":
+                stealth_loaded = load_stealth(
+                    session,
+                    on_message=on_message,
+                    replacements=self._script_replacements(),
+                    include_proc_filter=True,
+                )
             # Fase 1 (antes do resume): hooks nativos, sem bridge Java.
             # Rápido o suficiente para não estourar o start timeout.
             script = load_script(
@@ -587,24 +602,27 @@ class AntiFridaCheck:
                 resumed = True
             # Fase 2 (após o resume): hooks Java. A bridge carrega com o
             # app rodando, sem risco de start timeout.
-            try:
-                java_script = load_script(
-                    session,
-                    DETECTION_SCRIPT,
-                    on_message=on_message,
-                    name="raspilot-detect-java",
-                    replacements=self._script_replacements(java_only=True),
-                    with_java_bridge=True,
-                    load_timeout=5.0,
-                )
-            except Exception as exc:
-                java_load_error = str(exc)
-                logger.warning(
-                    "Hooks Java de observação não carregaram: %s", exc
-                )
-                # Sessão degradada: detach evita travar unload/detach futuros.
-                safe_detach(session)
-            if java_load_error is None:
+            if self.no_java:
+                java_load_error = None
+            else:
+                try:
+                    java_script = load_script(
+                        session,
+                        DETECTION_SCRIPT,
+                        on_message=on_message,
+                        name="raspilot-detect-java",
+                        replacements=self._script_replacements(java_only=True),
+                        with_java_bridge=True,
+                        load_timeout=5.0,
+                    )
+                except Exception as exc:
+                    java_load_error = str(exc)
+                    logger.warning(
+                        "Hooks Java de observação não carregaram: %s", exc
+                    )
+                    # Sessão degradada: detach evita travar unload/detach futuros.
+                    safe_detach(session)
+            if java_load_error is None and not self.no_java:
                 # O kill_trace é diagnóstico e usa Java: carregado por último.
                 try:
                     kill_script = load_script_file(
@@ -711,6 +729,7 @@ class AntiFridaCheck:
             safe_unload(script)
             safe_unload(java_script)
             safe_unload(kill_script)
+            unload_stealth(stealth_loaded)
             if not resumed and on_script_loaded is not None:
                 # Garante que um spawn suspenso nunca fique travado.
                 try:
@@ -758,7 +777,13 @@ class AntiFridaCheck:
             if java_load_error:
                 observation_status = "rasp_agent_terminated"
 
-        if app_alive and java_load_error and not found:
+        if app_alive and self.no_java and not found:
+            observation_status = "native_only"
+            error = (
+                "hooks Java desativados (--no-java); a observação nativa não "
+                "encontrou detecção de Frida"
+            )
+        elif app_alive and java_load_error and not found:
             observation_status = "error"
             error = (
                 "hooks Java de observação não carregaram e nenhuma detecção "
@@ -819,7 +844,7 @@ class AntiFridaCheck:
 
         vulnerable = (
             None
-            if observation_status in ("crashed", "baseline_death", "error")
+            if observation_status in ("crashed", "baseline_death", "error", "native_only")
             else (not found)
         )
         result = {
@@ -834,6 +859,8 @@ class AntiFridaCheck:
             "logcat": logcat,
             "logcat_evidence": format_evidence(logcat),
             "java_load_error": java_load_error,
+            "java_skipped": bool(self.no_java),
+            "stealth_used": bool(stealth_loaded),
             "session_unsafe": bool(java_load_error),
             "details": (
                 f"App detectou Frida via: {'; '.join(found)}" if found
@@ -859,6 +886,7 @@ class AntiFridaCheck:
         window: int = 12,
         package_name: Optional[str] = None,
         logcat_mark: Optional[int] = None,
+        app_detection: Optional[dict] = None,
     ) -> dict:
         """Consolida presença de Frida e capacidade de detecção do app.
 
@@ -885,14 +913,15 @@ class AntiFridaCheck:
         # Observação primeiro: o app está suspenso desde o spawn. Instalar
         # os hooks nativos e retomar o quanto antes evita o start timeout
         # do ActivityManager. Os vetores de dispositivo rodam depois.
-        app_detection = self.check_frida_detection_in_app(
-            session,
-            on_script_loaded=on_script_loaded,
-            window=window,
-            pid=pid,
-            package_name=package_name,
-            logcat_mark=logcat_mark,
-        )
+        if app_detection is None:
+            app_detection = self.check_frida_detection_in_app(
+                session,
+                on_script_loaded=on_script_loaded,
+                window=window,
+                pid=pid,
+                package_name=package_name,
+                logcat_mark=logcat_mark,
+            )
         checks = {
             "frida_processes": self.check_frida_processes(),
             "frida_ports": self.check_frida_ports(),

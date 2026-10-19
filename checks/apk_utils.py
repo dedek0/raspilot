@@ -13,8 +13,10 @@ Marca: RASPilot — Piloto Automático de Auditoria RASP para Android.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 import zipfile
 from typing import Dict, List, Tuple
 
@@ -48,13 +50,37 @@ def contains_bytes(blob: bytes, needle: bytes) -> bool:
     return bool(utf16) and utf16 in blob
 
 
+def _apk_cache_dir(package_name: str, remotes: List[str]) -> str:
+    """Calcula o diretório de cache estável para os APKs do pacote.
+
+    A chave inclui os caminhos remotos (que contêm o hash da versão
+    instalada), então uma atualização do app gera um novo cache.
+
+    Args:
+        package_name: Package name do app.
+        remotes: Caminhos remotos retornados por ``pm path``.
+
+    Returns:
+        Caminho absoluto do diretório de cache.
+    """
+    root = os.environ.get("RASPILOT_CACHE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".raspilot", "cache", "apk"
+    )
+    digest = hashlib.sha1(
+        (package_name + "\n" + "\n".join(remotes)).encode("utf-8", errors="ignore")
+    ).hexdigest()[:16]
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", package_name).strip("_") or "app"
+    return os.path.join(root, f"{slug}_{digest}")
+
+
 def pull_apk(dm: object, package_name: str, dest_dir: str) -> List[str]:
-    """Baixa o(s) APK(s) de um app para o host.
+    """Baixa (ou reutiliza do cache) o(s) APK(s) de um app para o host.
 
     Args:
         dm: Instância de ``DeviceManager`` (ou fake compatível).
         package_name: Package name do app alvo.
-        dest_dir: Diretório local de destino.
+        dest_dir: Diretório local de destino (fallback se o cache estiver
+            desativado/indisponível).
 
     Returns:
         Lista de caminhos locais dos APKs baixados (vazia se falhar).
@@ -64,14 +90,35 @@ def pull_apk(dm: object, package_name: str, dest_dir: str) -> List[str]:
         logger.warning("pm path falhou para %s: %s", package_name, res["stderr"])
         return []
 
-    local_paths: List[str] = []
+    remotes: List[str] = []
     for line in res["stdout"].splitlines():
         line = line.strip()
-        if not line.startswith("package:"):
-            continue
-        remote = line[len("package:"):]
+        if line.startswith("package:"):
+            remotes.append(line[len("package:"):])
+    if not remotes:
+        return []
+
+    use_cache = os.environ.get("RASPILOT_APK_CACHE", "1") != "0"
+    target_dir = dest_dir
+    if use_cache:
+        try:
+            target_dir = _apk_cache_dir(package_name, remotes)
+            os.makedirs(target_dir, exist_ok=True)
+            cached = [
+                os.path.join(target_dir, os.path.basename(remote) or f"{package_name}.apk")
+                for remote in remotes
+            ]
+            if all(os.path.isfile(p) and os.path.getsize(p) > 0 for p in cached):
+                logger.debug("APK em cache: %s", target_dir)
+                return cached
+        except OSError:
+            logger.debug("Cache de APK indisponível; usando destino temporário", exc_info=True)
+            target_dir = dest_dir
+
+    local_paths: List[str] = []
+    for remote in remotes:
         local = os.path.join(
-            dest_dir, os.path.basename(remote) or f"{package_name}.apk"
+            target_dir, os.path.basename(remote) or f"{package_name}.apk"
         )
         try:
             # APKs modernos podem ser grandes — timeout generoso.

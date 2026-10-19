@@ -74,6 +74,8 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--window SEG` | não | Janela de observação em segundos nos checks dinâmicos (default `15`) |
 | `--baseline-window SEG` | não | Janela do baseline sem instrumentação (default `5`) |
 | `--no-baseline` | não | Não executa o baseline antes dos checks dinâmicos |
+| `--mode MODE` | não | Modo: `detect` (só observação), `bypass` (observação+bypass) ou `stealth` (bootstrap nativo antes do resume) |
+| `--no-java` | não | Não carrega hooks Java; útil em apps com RASP que bloqueia a bridge |
 | `--verbose` | não | Logging em nível DEBUG |
 | `--skip CHECK...` | não | Checks a pular (`anti_root`, `anti_frida`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
 
@@ -92,6 +94,7 @@ mensagens de SDKs de segurança e erros de TLS/pinning. Antes de qualquer
 spawn com Frida, um **baseline sem instrumentação** verifica se o app já
 morre sozinho; assim um crash da instrumentação ou o ciclo de vida normal
 do app não é confundido com uma reação do RASP.
+A observação anti-Frida + anti-hooking roda em uma **sessão única**, e os bypasses de anti-hooking/SSL compartilham outro spawn. O cache de APK fica em `~/.raspilot/cache/apk` (desative com `RASPILOT_APK_CACHE=0`).
 
 Semântica de status:
 
@@ -220,7 +223,9 @@ raspilot/
 │   ├── anti_frida.py           # Presença/detecção de Frida
 │   ├── anti_emulator.py        # Classificação de emuladores
 │   ├── anti_hooking.py         # Detecção + bypass de anti-hooking
-│   ├── apk_utils.py            # Helpers compartilhados de análise de APK
+│   ├── combined.py             # Observação/bypass em sessão única
+│   ├── stealth.py              # Bootstrap nativo antes do resume
+│   ├── apk_utils.py            # Helpers compartilhados + cache de APK
 │   └── ssl_pinning.py          # Detecção + bypass de SSL pinning
 ├── scripts/
 │   ├── ssl_bypass.js           # Bypass universal de SSL pinning (Frida)

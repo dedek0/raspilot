@@ -29,6 +29,7 @@ from checks.anti_emulator import AntiEmulatorCheck
 from checks.anti_frida import AntiFridaCheck
 from checks.anti_hooking import AntiHookingCheck
 from checks.anti_root import AntiRootCheck
+from checks.combined import run_combined_bypass, run_combined_observation
 from checks.ssl_pinning import SSLPinningCheck
 from device_manager import (
     TOOL_NAME,
@@ -133,6 +134,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-baseline",
         action="store_true",
         help="Não executa o baseline sem instrumentação antes dos checks dinâmicos",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("detect", "bypass", "stealth"),
+        default="bypass",
+        help="detect=só observação; bypass=observação+bypass; stealth=bypass com bootstrap nativo",
+    )
+    parser.add_argument(
+        "--no-java",
+        action="store_true",
+        help="Não carrega hooks Java (evita bridge em apps com RASP agressivo)",
     )
     parser.add_argument(
         "--version",
@@ -342,48 +354,93 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     f"({dm.baseline.get('reason', 'sem pid')})"
                 )
 
-        # 7) Spawn do app alvo (necessário para anti-frida e ssl).
-        #    Spawn SUSPENSO: os hooks anti-frida são instalados antes do
-        #    código do app rodar (detecções de RASP costumam executar na
-        #    inicialização); o resume acontece via callback do check.
+        # 7) Spawn único para observação combinada (anti-Frida + anti-hooking).
+        #    Spawn SUSPENSO: os hooks nativos são instalados antes do
+        #    código do app rodar; o resume acontece após essa instalação.
         frida_logcat_mark = dm.logcat_mark()
-        if "anti_frida" not in args.skip or "ssl_pinning" not in args.skip:
+        frida_detection = None
+        hook_detection = None
+        need_combined = any(
+            check not in args.skip for check in ("anti_frida", "anti_hooking")
+        )
+        if need_combined:
             with console.status(f"[cyan]Spawning {args.package}...[/]"):
                 session = dm.spawn_app(args.package, resume=False)
             pid = dm.get_app_pid(args.package)
             console.print(f"[green]✓[/] App spawnado suspenso (pid={pid})")
+            if pid is not None:
+                with console.status("[cyan]Observando camadas em sessão única...[/]"):
+                    frida_detection, hook_detection = run_combined_observation(
+                        dm,
+                        session,
+                        pid,
+                        args.package,
+                        args.window,
+                        frida_logcat_mark,
+                        dm.resume_app,
+                        mode=args.mode,
+                        no_java=args.no_java,
+                    )
 
-        # 7) Anti-Frida (requer session + pid; resume via callback).
-        if pid is not None:
-            _run_step(
-                reporter,
-                "anti_frida",
-                lambda: AntiFridaCheck(dm).run_all(
-                    session, pid, on_script_loaded=dm.resume_app,
-                    window=args.window,
-                    package_name=args.package,
-                    logcat_mark=frida_logcat_mark,
-                ),
-                skipped="anti_frida" in args.skip,
-            )
-        elif "anti_frida" not in args.skip:
-            reporter.collect("anti_frida", {"error": "app não pôde ser spawnado"})
-            console.print("[yellow]![/] anti_frida: [red]ERROR[/] (app não spawnado)")
+        # 8) Anti-Frida (usa a detecção combinada; vetores de dispositivo
+        #    rodam em seguida, com o app já retomado).
+        if "anti_frida" not in args.skip:
+            if pid is not None and frida_detection is not None:
+                _run_step(
+                    reporter,
+                    "anti_frida",
+                    lambda: AntiFridaCheck(
+                        dm, mode=args.mode, no_java=args.no_java
+                    ).run_all(
+                        session, pid,
+                        window=args.window,
+                        package_name=args.package,
+                        logcat_mark=frida_logcat_mark,
+                        app_detection=frida_detection,
+                    ),
+                )
+            else:
+                reporter.collect("anti_frida", {"error": "app não pôde ser spawnado"})
+                console.print("[yellow]![/] anti_frida: [red]ERROR[/] (app não spawnado)")
 
-        # 8) Anti-Hooking (spawn próprio interno: observação + bypass,
-        #    como o ssl_pinning — não compartilha a sessão do anti_frida).
+        # 9) Bypass combinado (anti-hooking + SSL) em um único spawn.
+        hooking_bypass = None
+        ssl_bypass = None
+        if (
+            "anti_hooking" not in args.skip
+            and "ssl_pinning" not in args.skip
+            and args.mode != "detect"
+            and not args.no_java
+        ):
+            with console.status("[cyan]Executando bypass combinado...[/]"):
+                hooking_bypass, ssl_bypass = run_combined_bypass(
+                    dm, args.package, args.window,
+                    mode=args.mode, no_java=args.no_java,
+                )
+
+        # 10) Anti-Hooking (usa detecção e bypass combinados quando houver).
         _run_step(
             reporter,
             "anti_hooking",
-            lambda: AntiHookingCheck(dm).run_all(args.package, window=args.window),
+            lambda: AntiHookingCheck(
+                dm, mode=args.mode, no_java=args.no_java
+            ).run_all(
+                args.package,
+                window=args.window,
+                precomputed_detection=hook_detection,
+                precomputed_bypass=hooking_bypass,
+            ),
             skipped="anti_hooking" in args.skip,
         )
 
-        # 9) SSL Pinning (spawn próprio interno no attempt_bypass).
+        # 11) SSL Pinning (usa bypass combinado quando houver).
         _run_step(
             reporter,
             "ssl_pinning",
-            lambda: SSLPinningCheck(dm).run_all(args.package, window=args.window),
+            lambda: SSLPinningCheck(dm, mode=args.mode, no_java=args.no_java).run_all(
+                args.package, window=args.window,
+                precomputed_bypass=ssl_bypass,
+            ),
             skipped="ssl_pinning" in args.skip,
         )
     finally:

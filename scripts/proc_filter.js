@@ -25,11 +25,28 @@
 // fd/FILE* abertos de arquivos de /proc tratados (kind: maps|status|net|comm).
 var fdKind = {};
 var fpKind = {};
+var rawFdKind = {};
+var SYSCALL_NR = null;
+if (Process.arch === 'arm64') {
+    SYSCALL_NR = { read: 63, openat: 56, close: 57, readlinkat: 78, ptrace: 117 };
+} else if (Process.arch === 'x64') {
+    SYSCALL_NR = { read: 0, openat: 257, close: 3, readlinkat: 267, ptrace: 101 };
+}
 
 function report(msg) {
     try {
         send({ type: 'raspilot-hooking-bypass', message: msg });
     } catch (e) { /* host indisponível */ }
+}
+
+function setErrno(value) {
+    try {
+        var errnoFn = raspilotFindExport('libc.so', '__errno');
+        if (errnoFn !== null) {
+            var getErrno = new NativeFunction(errnoFn, 'pointer', []);
+            getErrno().writeS32(value);
+        }
+    } catch (e) { /* best-effort */ }
 }
 
 function matchesHookFramework(str) {
@@ -39,7 +56,8 @@ function matchesHookFramework(str) {
         var keywords = [
             'frida', 'xposed', 'lsposed', 'lspd', 'edxposed', 'substrate',
             'sandhook', 'yahfa', 'lsplant', 'whale', 'dobby', 'riru', 'zygisk',
-            'gadget', 'gum-js', 'linjector', 'andhook', 'shadowhook'
+            'gadget', 'gum-js', 'linjector', 'andhook', 'shadowhook',
+            'libloader64_v8', 'libloader32_v7'
         ];
         for (var i = 0; i < keywords.length; i++) {
             if (lower.indexOf(keywords[i]) !== -1) { return true; }
@@ -292,6 +310,7 @@ function hookProcReads() {
                     try {
                         var fd = args[0].toInt32();
                         if (fdKind[fd] !== undefined) { delete fdKind[fd]; }
+                        if (rawFdKind[fd] !== undefined) { delete rawFdKind[fd]; }
                     } catch (e) { /* best-effort */ }
                 }
             });
@@ -332,9 +351,139 @@ function hookThreadNames() {
     } catch (e) { /* best-effort */ }
 }
 
+function hookReadlinkFamily() {
+    ['readlink', 'readlinkat'].forEach(function (name) {
+        try {
+            var addr = raspilotFindExport('libc.so', name);
+            if (addr === null) { return; }
+            var pathIndex = (name === 'readlinkat') ? 1 : 0;
+            Interceptor.attach(addr, {
+                onEnter: function (args) {
+                    this._block = false;
+                    this._path = '';
+                    try {
+                        var path = args[pathIndex].readCString();
+                        this._path = path;
+                        if (matchesHookFramework(path)) { this._block = true; }
+                    } catch (e) { /* best-effort */ }
+                },
+                onLeave: function (retval) {
+                    if (this._block) {
+                        setErrno(2);
+                        retval.replace(ptr(-1));
+                        report('neutralizado: ' + name + '(' + this._path + ') -> ENOENT');
+                    }
+                }
+            });
+        } catch (e) { /* best-effort */ }
+    });
+}
+
+function hookPtrace() {
+    try {
+        var addr = raspilotFindExport('libc.so', 'ptrace');
+        if (addr === null) { return; }
+        Interceptor.attach(addr, {
+            onEnter: function (args) {
+                this._traced = false;
+                try {
+                    if (args[0].toInt32() === 0) { // PTRACE_TRACEME
+                        this._traced = true;
+                    }
+                } catch (e) { /* best-effort */ }
+            },
+            onLeave: function (retval) {
+                if (this._traced) {
+                    retval.replace(ptr(0));
+                    report('neutralizado: ptrace(PTRACE_TRACEME) -> 0');
+                }
+            }
+        });
+    } catch (e) { /* best-effort */ }
+}
+
+function hookRawSyscall() {
+    if (SYSCALL_NR === null) { return; }
+    try {
+        var addr = raspilotFindExport('libc.so', 'syscall');
+        if (addr === null) { return; }
+        Interceptor.attach(addr, {
+            onEnter: function (args) {
+                this._nr = args[0].toInt32();
+                this._kind = null;
+                this._block = false;
+                this._path = '';
+                try {
+                    if (this._nr === SYSCALL_NR.openat) {
+                        this._path = args[2].readCString();
+                        this._kind = classifyProcPath(this._path);
+                        this._block = matchesHookFramework(this._path);
+                    } else if (this._nr === SYSCALL_NR.read) {
+                        this._fd = args[1].toInt32();
+                        this._buf = args[2];
+                        this._kind = rawFdKind[this._fd] || null;
+                    } else if (this._nr === SYSCALL_NR.readlinkat) {
+                        this._path = args[2].readCString();
+                        this._block = matchesHookFramework(this._path);
+                    } else if (this._nr === SYSCALL_NR.ptrace) {
+                        this._traced = args[1].toInt32() === 0;
+                    } else if (this._nr === SYSCALL_NR.close) {
+                        delete rawFdKind[args[1].toInt32()];
+                    }
+                } catch (e) { /* best-effort */ }
+            },
+            onLeave: function (retval) {
+                try {
+                    if (this._nr === SYSCALL_NR.openat) {
+                        if (this._block) {
+                            setErrno(2);
+                            retval.replace(ptr(-1));
+                            report('neutralizado: syscall(openat,' + this._path + ') -> ENOENT');
+                        } else if (this._kind !== null) {
+                            var fd = retval.toInt32();
+                            if (fd >= 0) { rawFdKind[fd] = this._kind; }
+                        }
+                    } else if (this._nr === SYSCALL_NR.read && this._kind !== null) {
+                        var n = retval.toInt32();
+                        if (n > 0) {
+                            var orig = this._buf.readUtf8String(n);
+                            if (orig !== null && orig.length > 0) {
+                                var res = filterProc(this._kind, orig);
+                                if (res.changed) {
+                                    var text = res.text;
+                                    if (text.length < n) {
+                                        this._buf.writeUtf8String(text);
+                                        retval.replace(ptr(text.length));
+                                    } else if (text.length === n) {
+                                        this._buf.writeByteArray(strToBytes(text));
+                                    } else {
+                                        return;
+                                    }
+                                    report('neutralizado: ' + kindLabel(this._kind) +
+                                           ' em syscall(read) → ' + res.count + ' ' + res.label);
+                                }
+                            }
+                        }
+                    } else if (this._nr === SYSCALL_NR.readlinkat && this._block) {
+                        setErrno(2);
+                        retval.replace(ptr(-1));
+                        report('neutralizado: syscall(readlinkat,' + this._path + ') -> ENOENT');
+                    } else if (this._nr === SYSCALL_NR.ptrace && this._traced) {
+                        retval.replace(ptr(0));
+                        report('neutralizado: syscall(ptrace) -> 0');
+                    }
+                } catch (e) { /* best-effort */ }
+            }
+        });
+    } catch (e) { /* best-effort */ }
+}
+
 function main() {
     hookProcOpenFamily();
     hookProcReads();
+    hookReadlinkFamily();
+    hookPtrace();
+    hookRawSyscall();
     hookThreadNames();
     report('proc_filter.js carregado');
 }

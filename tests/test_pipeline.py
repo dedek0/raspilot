@@ -104,7 +104,8 @@ def runtime_mocks():
              return_value={"available": False, "reason": "mock"},
          ), \
          mock.patch.object(DeviceManager, "logcat_mark", return_value=0), \
-         mock.patch.object(DeviceManager, "logcat_since", return_value=[]):
+         mock.patch.object(DeviceManager, "logcat_since", return_value=[]), \
+         mock.patch.object(DeviceManager, "is_app_alive", return_value=True):
         yield
 
 

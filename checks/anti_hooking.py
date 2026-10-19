@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from checks.apk_utils import pull_apk, scan_apk
+from checks.stealth import PROC_FILTER_SCRIPT, load_stealth, unload_stealth
 from logcat_analyzer import (
     RASP_CATEGORIES,
     analyze_since,
@@ -470,13 +471,19 @@ def _now_iso() -> str:
 class AntiHookingCheck:
     """Verifica proteção anti-hooking do app e tenta contorná-la."""
 
-    def __init__(self, dm: "DeviceManager") -> None:
+    def __init__(
+        self, dm: "DeviceManager", mode: str = "bypass", no_java: bool = False
+    ) -> None:
         """Inicializa o check com o gerenciador de dispositivo.
 
         Args:
             dm: Instância conectada de ``DeviceManager``.
+            mode: ``detect``, ``bypass`` ou ``stealth``.
+            no_java: Se True, não tenta carregar hooks Java.
         """
         self.dm = dm
+        self.mode = mode
+        self.no_java = no_java
 
     # ------------------------------------------------------------------
     # Helpers
@@ -830,6 +837,7 @@ class AntiHookingCheck:
         java_script = None
         kill_script = None
         java_load_error: Optional[str] = None
+        stealth_loaded: List[tuple] = []
         resumed = False
         died_after: Optional[int] = None
 
@@ -864,6 +872,13 @@ class AntiHookingCheck:
                 logger.debug("Erro no script anti-hook: %s", message.get("description"))
 
         try:
+            if self.mode == "stealth":
+                stealth_loaded = load_stealth(
+                    session,
+                    on_message=on_message,
+                    replacements=self._script_replacements(),
+                    include_proc_filter=True,
+                )
             # Fase 1 (antes do resume): hooks nativos, sem bridge Java.
             script = load_script(
                 session, HOOK_DETECTION_SCRIPT, on_message=on_message,
@@ -876,21 +891,24 @@ class AntiHookingCheck:
                 on_script_loaded()
                 resumed = True
             # Fase 2 (após o resume): hooks Java, com o app rodando.
-            try:
-                java_script = load_script(
-                    session, HOOK_DETECTION_SCRIPT, on_message=on_message,
-                    name="raspilot-hook-detect-java",
-                    replacements=self._script_replacements(java_only=True),
-                    with_java_bridge=True,
-                    load_timeout=5.0,
-                )
-            except Exception as exc:
-                java_load_error = str(exc)
-                logger.warning(
-                    "Hooks Java anti-hook não carregaram: %s", exc
-                )
-                safe_detach(session)
-            if java_load_error is None:
+            if self.no_java:
+                java_load_error = None
+            else:
+                try:
+                    java_script = load_script(
+                        session, HOOK_DETECTION_SCRIPT, on_message=on_message,
+                        name="raspilot-hook-detect-java",
+                        replacements=self._script_replacements(java_only=True),
+                        with_java_bridge=True,
+                        load_timeout=5.0,
+                    )
+                except Exception as exc:
+                    java_load_error = str(exc)
+                    logger.warning(
+                        "Hooks Java anti-hook não carregaram: %s", exc
+                    )
+                    safe_detach(session)
+            if java_load_error is None and not self.no_java:
                 # Diagnóstico de kill (usa Java) carregado por último.
                 try:
                     kill_script = load_script_file(
@@ -999,6 +1017,7 @@ class AntiHookingCheck:
             safe_unload(script)
             safe_unload(java_script)
             safe_unload(kill_script)
+            unload_stealth(stealth_loaded)
             if not resumed and on_script_loaded is not None:
                 # Garante que um spawn suspenso nunca fique travado.
                 try:
@@ -1039,7 +1058,13 @@ class AntiHookingCheck:
         error: Optional[str] = None
         app_alive = died_after is None
 
-        if app_alive and java_load_error and not strong:
+        if app_alive and self.no_java and not strong:
+            observation_status = "native_only"
+            error = (
+                "hooks Java desativados (--no-java); a observação nativa não "
+                "encontrou checagem anti-hook"
+            )
+        elif app_alive and java_load_error and not strong:
             observation_status = "error"
             error = (
                 "hooks Java de observação não carregaram e nenhuma checagem "
@@ -1110,6 +1135,8 @@ class AntiHookingCheck:
             "logcat": logcat,
             "logcat_evidence": format_evidence(logcat),
             "java_load_error": java_load_error,
+            "java_skipped": bool(self.no_java),
+            "stealth_used": bool(stealth_loaded),
             "session_unsafe": bool(java_load_error),
             "details": (
                 f"App executou checagens anti-hook: {'; '.join(strong)}"
@@ -1160,6 +1187,7 @@ class AntiHookingCheck:
         proc_script = None
         kill_script = None
         java_load_error: Optional[str] = None
+        stealth_loaded: List[tuple] = []
         died_after: Optional[int] = None
 
         def on_message(message, data):  # noqa: ANN001 - assinatura frida
@@ -1185,6 +1213,13 @@ class AntiHookingCheck:
             # Spawn suspenso: instala os hooks ANTES do app rodar, para
             # não perder as checagens anti-hook da inicialização.
             session = self.dm.spawn_app(package_name, resume=False)
+            if self.mode == "stealth":
+                stealth_loaded = load_stealth(
+                    session,
+                    on_message=on_message,
+                    replacements=self._script_replacements(),
+                    include_proc_filter=True,
+                )
             # Fase 1 (antes do resume): hooks nativos de bypass e filtro
             # de /proc, sem bridge Java.
             script = load_script_file(
@@ -1193,12 +1228,16 @@ class AntiHookingCheck:
                 with_java_bridge=False,
                 load_timeout=5.0,
             )
-            proc_script = load_script_file(
-                session, PROC_FILTER_SCRIPT, on_message=on_message,
-                replacements=self._script_replacements(java_only=False),
-                with_java_bridge=False,
-                load_timeout=5.0,
+            proc_loaded = any(
+                path == PROC_FILTER_SCRIPT for path, _ in stealth_loaded
             )
+            if not proc_loaded:
+                proc_script = load_script_file(
+                    session, PROC_FILTER_SCRIPT, on_message=on_message,
+                    replacements=self._script_replacements(java_only=False),
+                    with_java_bridge=False,
+                    load_timeout=5.0,
+                )
             self.dm.resume_app()
             pid = self.dm.last_spawn_pid or self.dm.get_app_pid(package_name)
             # Fase 2 (após o resume): hooks Java de bypass.
@@ -1303,6 +1342,7 @@ class AntiHookingCheck:
             safe_unload(java_script)
             safe_unload(proc_script)
             safe_unload(kill_script)
+            unload_stealth(stealth_loaded)
             if session is not None:
                 safe_detach(session)
 
@@ -1349,6 +1389,7 @@ class AntiHookingCheck:
             "logcat": logcat,
             "logcat_evidence": format_evidence(logcat),
             "java_load_error": java_load_error,
+            "stealth_used": bool(stealth_loaded),
             "error": error,
         }
         logger.info(
@@ -1361,7 +1402,12 @@ class AntiHookingCheck:
     # Consolidação
     # ------------------------------------------------------------------
     def run_all(
-        self, package_name: str, window: int = 12, apk_path: Optional[str] = None
+        self,
+        package_name: str,
+        window: int = 12,
+        apk_path: Optional[str] = None,
+        precomputed_detection: Optional[dict] = None,
+        precomputed_bypass: Optional[dict] = None,
     ) -> dict:
         """Combina vetores, detecção (estática + dinâmica) e bypass.
 
@@ -1396,50 +1442,61 @@ class AntiHookingCheck:
 
         static = self.detect_static(package_name, apk_path=apk_path)
 
-        # Fase dinâmica: spawn suspenso + script de observação.
+        # Fase dinâmica: usa a observação combinada quando fornecida;
+        # caso contrário, cria um spawn próprio (uso standalone).
         session = None
         pid: Optional[int] = None
         app_detection: dict = {}
-        logcat_mark = get_logcat_mark(self.dm)
-        try:
-            session = self.dm.spawn_app(package_name, resume=False)
-            pid = self.dm.last_spawn_pid or self.dm.get_app_pid(package_name)
-        except Exception as exc:
-            logger.warning("Spawn para observação anti-hook falhou", exc_info=True)
-            app_detection = {
+        if precomputed_detection is not None:
+            app_detection = precomputed_detection
+            checks["hook_libraries"] = {
                 "detected": False,
-                "detection_methods_found": [],
-                "strong_signals": [],
-                "weak_signals": [],
-                "app_alive_at_end": True,
-                "error": str(exc),
+                "evidence": [],
+                "source": None,
+                "details": "enumeração feita na sessão combinada",
+                "skipped": True,
             }
-            checks["hook_libraries"] = self.check_hook_libraries(None, pid=pid)
         else:
+            logcat_mark = get_logcat_mark(self.dm)
             try:
-                app_detection = self.check_hook_detection_in_app(
-                    session,
-                    on_script_loaded=self.dm.resume_app,
-                    window=window,
-                    pid=pid,
-                    package_name=package_name,
-                    logcat_mark=logcat_mark,
-                )
-            finally:
-                # App está vivo (ou morreu) — enumera libs de hooking do
-                # processo antes de soltar a sessão. Sessão degradada
-                # (timeout de bridge) pode travar a enumeração.
-                if app_detection.get("session_unsafe"):
-                    checks["hook_libraries"] = {
-                        "detected": False,
-                        "evidence": [],
-                        "source": None,
-                        "details": "enumeração pulada: sessão Frida degradada",
-                        "skipped": True,
-                    }
-                else:
-                    checks["hook_libraries"] = self.check_hook_libraries(session, pid=pid)
-                safe_detach(session)
+                session = self.dm.spawn_app(package_name, resume=False)
+                pid = self.dm.last_spawn_pid or self.dm.get_app_pid(package_name)
+            except Exception as exc:
+                logger.warning("Spawn para observação anti-hook falhou", exc_info=True)
+                app_detection = {
+                    "detected": False,
+                    "detection_methods_found": [],
+                    "strong_signals": [],
+                    "weak_signals": [],
+                    "app_alive_at_end": True,
+                    "error": str(exc),
+                }
+                checks["hook_libraries"] = self.check_hook_libraries(None, pid=pid)
+            else:
+                try:
+                    app_detection = self.check_hook_detection_in_app(
+                        session,
+                        on_script_loaded=self.dm.resume_app,
+                        window=window,
+                        pid=pid,
+                        package_name=package_name,
+                        logcat_mark=logcat_mark,
+                    )
+                finally:
+                    # App está vivo (ou morreu) — enumera libs de hooking do
+                    # processo antes de soltar a sessão. Sessão degradada
+                    # (timeout de bridge) pode travar a enumeração.
+                    if app_detection.get("session_unsafe"):
+                        checks["hook_libraries"] = {
+                            "detected": False,
+                            "evidence": [],
+                            "source": None,
+                            "details": "enumeração pulada: sessão Frida degradada",
+                            "skipped": True,
+                        }
+                    else:
+                        checks["hook_libraries"] = self.check_hook_libraries(session, pid=pid)
+                    safe_detach(session)
 
         protection_detected = bool(static.get("static_detected")) or bool(
             app_detection.get("detected")
@@ -1453,8 +1510,16 @@ class AntiHookingCheck:
 
         bypass_details: Optional[dict] = None
         bypass_successful: Optional[bool] = None
-        if protection_detected:
-            bypass_details = self.attempt_bypass(package_name, window=window)
+        bypass_skipped_reason: Optional[str] = None
+        if self.mode == "detect":
+            bypass_skipped_reason = "modo detect: bypass não executado"
+        elif self.no_java:
+            bypass_skipped_reason = "--no-java: hooks Java necessários ao bypass"
+        elif protection_detected:
+            if precomputed_bypass is not None:
+                bypass_details = precomputed_bypass
+            else:
+                bypass_details = self.attempt_bypass(package_name, window=window)
             if bypass_details.get("error"):
                 phase_errors.append(f"bypass: {bypass_details['error']}")
             else:
@@ -1470,6 +1535,7 @@ class AntiHookingCheck:
             "static_detection": static,
             "app_detection": app_detection,
             "bypass_details": bypass_details,
+            "bypass_skipped_reason": bypass_skipped_reason,
             "timestamp": _now_iso(),
         }
         if phase_errors:

@@ -74,6 +74,8 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--window SECS` | no | Observation window in seconds for dynamic checks (default `15`) |
 | `--baseline-window SECS` | no | Uninstrumented baseline window (default `5`) |
 | `--no-baseline` | no | Skip the uninstrumented baseline |
+| `--mode MODE` | no | Mode: `detect` (observation only), `bypass` (observation+bypass) or `stealth` (native bootstrap before resume) |
+| `--no-java` | no | Do not load Java hooks; useful when RASP blocks the Java bridge |
 | `--verbose` | no | DEBUG-level logging |
 | `--skip CHECK...` | no | Checks to skip (`anti_root`, `anti_frida`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
 
@@ -91,6 +93,7 @@ independent evidence source to correlate deaths (`SIGKILL`, `SIGSEGV`,
 Before any Frida spawn, an **uninstrumented baseline** checks whether the
 app already dies by itself, so instrumentation crashes or normal app
 lifecycle are not mistaken for a RASP reaction.
+Anti-Frida + anti-hooking observation runs in a **single session**, and anti-hooking/SSL bypasses share another spawn. The APK cache lives in `~/.raspilot/cache/apk` (disable with `RASPILOT_APK_CACHE=0`).
 
 Status semantics:
 
@@ -220,7 +223,9 @@ raspilot/
 │   ├── anti_frida.py           # Frida presence/detection
 │   ├── anti_emulator.py        # Emulator classification
 │   ├── anti_hooking.py         # Anti-hooking detection + bypass
-│   ├── apk_utils.py            # Shared APK analysis helpers
+│   ├── combined.py             # Single-session observation/bypass
+│   ├── stealth.py              # Native bootstrap before resume
+│   ├── apk_utils.py            # Shared APK helpers + APK cache
 │   └── ssl_pinning.py          # SSL pinning detection + bypass
 ├── scripts/
 │   ├── ssl_bypass.js           # Universal SSL pinning bypass (Frida)
