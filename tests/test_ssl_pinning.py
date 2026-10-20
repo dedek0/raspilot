@@ -306,6 +306,29 @@ class TestRunAll:
         assert res["timestamp"]
 
 
+    def test_bypass_blocked_by_app_is_a_resisted_pinning(self, tmp_path):
+        """App que bloqueia o bypass prova que o pinning resistiu."""
+        apk = _make_apk(str(tmp_path / "ok.apk"), {
+            "classes.dex": b"okhttp3/CertificatePinner\x00",
+        })
+        dm = mock.MagicMock()
+        dm.spawn_app.return_value = TestAttemptBypass._FakeSession([])
+        dm.is_app_alive.return_value = False
+        dm.capture_death_cause.return_value = {
+            "evidence": [], "signal": "SIGKILL", "summary": "SIGKILL",
+        }
+        dm.logcat_since.return_value = [
+            "10-16 10:00:00.000 42 42 I ActivityManager: "
+            "Process com.app (pid 42) has died",
+        ]
+        dm.baseline = {"available": True, "alive_at_end": True}
+        with mock.patch("checks.ssl_pinning.OBSERVATION_POLL_INTERVAL", 0.0):
+            res = SSLPinningCheck(dm).run_all("com.app", apk_path=apk)
+        assert res["pinning_detected"] is True
+        assert res["bypass_successful"] is False
+        assert res["bypass_details"]["blocked"] is True
+
+
 class TestReliability:
     """Propagação de erro e rigor da evidência de bypass."""
 

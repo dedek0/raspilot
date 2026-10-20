@@ -474,15 +474,33 @@ class SSLPinningCheck:
         else:
             evidence_strength = "none"
 
+        # O app bloqueou a auditoria: encerrou com a instrumentação e a
+        # causa é atribuível ao RASP. Isso é uma conclusão sobre a
+        # proteção (ela resistiu), não uma etapa que não rodou.
+        blocked = bool(
+            not alive
+            and classify_failure(
+                logcat, getattr(self.dm, "baseline", None)
+            ).get("is_rasp")
+        )
         error: Optional[str] = None
         if alive and java_load_error and not intercepted_hosts:
             # OkHttp/TrustManager são Java; sem esses hooks o bypass não
             # pode ser confirmado, mesmo com hooks nativos ativos.
             success = False
             error = f"hooks Java de SSL não carregaram: {java_load_error}"
+        elif not alive:
+            # O app encerrou durante o bypass: o bypass não venceu — o
+            # app bloqueou a auditoria.
+            success = False
+            error = (
+                "o app bloqueou o bypass de SSL: encerrou durante a execução "
+                "do bypass"
+            )
 
         result = {
             "success": success,
+            "blocked": blocked,
             "intercepted_hosts": intercepted_hosts,
             "bypass_logs": bypass_logs,
             "effective_logs": effective,
@@ -602,7 +620,14 @@ class SSLPinningCheck:
             "detection": detection,
             "timestamp": _now_iso(),
         }
-        if bypass_error:
+        if bypass.get("blocked"):
+            # O app bloqueou a auditoria: o pinning resistiu. É uma
+            # conclusão sobre a proteção, não uma etapa que não rodou.
+            result["bypass_successful"] = False
+            result["bypass_skipped_reason"] = (
+                "o app bloqueou a auditoria: encerrou durante o bypass de SSL"
+            )
+        elif bypass_error:
             result["bypass_skipped_reason"] = f"bypass: {bypass_error}"
         elif not_exercised:
             result["bypass_skipped_reason"] = (

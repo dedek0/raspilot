@@ -46,7 +46,7 @@ var HOOK_KEYWORDS = [
     'lsposed', 'lspd', 'edxposed', 'epic.xposed',
     'cydia.substrate', 'com.saurik.substrate',
     'sandhook', 'yahfa', 'lsplant', 'dobby', 'riru', 'zygisk',
-    'frida', 'gum-js', 'linjector', 'andhook', 'shadowhook',
+    'frida', 'libfrida', 'gum-js', 'linjector', 'andhook', 'shadowhook',
     'libloader64_v8', 'libloader32_v7'
 ];
 
@@ -65,6 +65,28 @@ var HOOK_PATHS = [
     'frida-server',
     're.frida.server'
 ];
+
+// Casa um termo como TOKEN, e não como substring solta.
+//
+// A comparação por substring transformava qualquer acesso do app a um
+// arquivo próprio em "ocultação de framework" quando o nome do pacote
+// continha o termo — e o bypass passava a esconder arquivos legítimos
+// do app. A fronteira exige que o termo esteja isolado por caracteres
+// não alfanuméricos.
+function isTokenBoundary(ch) {
+    return ch === '' || !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'));
+}
+
+function containsToken(lower, term) {
+    var idx = lower.indexOf(term);
+    while (idx !== -1) {
+        var before = idx === 0 ? '' : lower.charAt(idx - 1);
+        var after = lower.charAt(idx + term.length);
+        if (isTokenBoundary(before) && isTokenBoundary(after)) { return true; }
+        idx = lower.indexOf(term, idx + 1);
+    }
+    return false;
+}
 
 // Envia log para o host (visível em bypass_logs do relatório).
 function report(msg) {
@@ -110,7 +132,7 @@ function matchesHookPath(str) {
         var lower = ('' + str).toLowerCase();
         if (matchesHookFramework(lower)) { return true; }
         for (var i = 0; i < HOOK_PATH_KEYWORDS.length; i++) {
-            if (lower.indexOf(HOOK_PATH_KEYWORDS[i]) !== -1) { return true; }
+            if (containsToken(lower, HOOK_PATH_KEYWORDS[i])) { return true; }
         }
         return false;
     } catch (e) { return false; }
@@ -121,7 +143,7 @@ function matchesHookFramework(str) {
         if (str === null || str === undefined) { return false; }
         var lower = ('' + str).toLowerCase();
         for (var i = 0; i < HOOK_KEYWORDS.length; i++) {
-            if (lower.indexOf(HOOK_KEYWORDS[i]) !== -1) { return true; }
+            if (containsToken(lower, HOOK_KEYWORDS[i])) { return true; }
         }
         if (HOOK_PATHS.indexOf(lower) !== -1) { return true; }
     } catch (e) { /* best-effort */ }
@@ -152,32 +174,18 @@ function setErrno(value) {
 // 1) Java — Class.forName / ClassLoader.loadClass
 // ----------------------------------------------------------------------
 function hookClassLookups() {
-    try {
-        var Class = Java.use('java.lang.Class');
-        var forName1 = Class.forName.overload('java.lang.String');
-        forName1.implementation = function (name) {
-            try {
-                if (matchesHookFramework(name)) {
-                    // O app costuma detectar o framework pelo padrão
-                    // try/catch: procura a classe e considera o
-                    // framework presente quando a busca tem sucesso.
-                    // Devolver null faria a exceção de "classe não
-                    // encontrada" nunca acontecer, e o app concluiria
-                    // que o framework ESTÁ presente. O comportamento
-                    // correto é simular a ausência da classe.
-                    reportEvidence("neutralizado: Class.forName('" + name +
-                        "') -> ClassNotFoundException");
-                    throw notFoundException(name);
-                }
-            } catch (e) {
-                if (e && e.__raspilot) { throw e; }
-            }
-            return forName1.call(this, name);
-        };
-    } catch (e) {
-        report('falha ao hookar Class.forName(String): ' + e);
-    }
-
+    // A sobrecarga de um argumento de Class.forName NÃO é hookada.
+    //
+    // ART resolve o nome da classe com o class loader de quem chamou.
+    // Invocar o original através do Frida faz o ART inferir o caller a
+    // partir do frame do agente em vez do frame do app — e a classe
+    // passa a ser procurada no boot class loader. O app então recebe
+    // ClassNotFoundException para classes legítimas, e apps que usam um
+    // class loader próprio (packers, plugins) quebram na inicialização.
+    //
+    // A sobrecarga de três argumentos preserva a semântica (o loader
+    // chega explícito) e continua interceptando a de um argumento, que
+    // delega para ela.
     try {
         var ClassCl = Java.use('java.lang.Class');
         var forName3 = ClassCl.forName.overload(
@@ -201,15 +209,19 @@ function hookClassLookups() {
 
     try {
         var ClassLoader = Java.use('java.lang.ClassLoader');
+        var loadClass = ClassLoader.loadClass.overload('java.lang.String');
         var CNFE = Java.use('java.lang.ClassNotFoundException');
-        ClassLoader.loadClass.overload('java.lang.String').implementation = function (name) {
+        loadClass.implementation = function (name) {
             var shouldThrow = false;
             try { shouldThrow = matchesHookFramework(name); } catch (e) { shouldThrow = false; }
             if (shouldThrow) {
                 reportEvidence("neutralizado: ClassLoader.loadClass('" + name + "') -> ClassNotFoundException");
                 throw CNFE.$new('' + name);
             }
-            return this.loadClass(name);
+            // Chama a implementação original da classe base: a
+            // delegação para o parent e a resolução via findClass
+            // continuam sendo feitas pelo ART.
+            return loadClass.call(this, name);
         };
     } catch (e) {
         report('falha ao hookar ClassLoader.loadClass: ' + e);
@@ -426,10 +438,23 @@ function bytesContainKeyword(buffer, keywords) {
                     break;
                 }
             }
-            if (match) { return true; }
+            if (!match) { continue; }
+            // Fronteira de token: o byte anterior e o byte posterior
+            // precisam ser não alfanuméricos, senão "fridaplayer" casaria
+            // com "frida".
+            var before = p === 0 ? 0 : lower[p - 1];
+            var after = (p + needle.length < lower.length) ? lower[p + needle.length] : 0;
+            if (isTokenByte(before) && isTokenByte(after)) { return true; }
         }
     }
     return false;
+}
+
+// Um byte é fronteira de token quando não é alfanumérico.
+function isTokenByte(c) {
+    if (c === 0) { return true; }
+    var lower = (c >= 65 && c <= 90) ? (c + 32) : c;
+    return !((lower >= 97 && lower <= 122) || (lower >= 48 && lower <= 57));
 }
 
 // Busca por palavra-chave numa string.
@@ -437,7 +462,7 @@ function containsKeyword(cstr, keywords) {
     if (cstr === null || cstr === undefined) { return false; }
     var lower = ('' + cstr).toLowerCase();
     for (var i = 0; i < keywords.length; i++) {
-        if (lower.indexOf(keywords[i]) !== -1) { return true; }
+        if (containsToken(lower, keywords[i])) { return true; }
     }
     return false;
 }

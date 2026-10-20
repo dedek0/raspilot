@@ -164,6 +164,25 @@ HIGH_CONFIDENCE_CATEGORIES = tuple(
 MAX_EVIDENCE_LINES = 40
 MAX_LINE_LEN = 500
 
+# Frames que indicam que a queda do processo foi causada pela
+# instrumentação, e não pela proteção do app.
+#
+# O agente do Frida em si é o caso óbvio. O glue JNI do ART entra
+# junto: a liberação de uma referência global JNI é feita por código
+# nativo acionado pelo agente, e uma falha ali derruba o app — sem que
+# o app tenha reagido a nada.
+CRASH_INSTRUMENTATION_MARKERS = (
+    "frida-agent",
+    "libfrida",
+    "frida-gadget",
+    "artjniu",
+    "artquickgenericjni",
+    "frida_agent",
+)
+
+# Quantos frames do backtrace são lidos para decidir a origem da falha.
+CRASH_ORIGIN_FRAMES_LIMIT = 12
+
 
 # Verbos que transformam um termo genérico em evidência de reação.
 #
@@ -382,6 +401,13 @@ def analyze_logcat(
             if matches_target or (pid is None and package is None):
                 death_evidence.append(line)
 
+        # Frames do backtrace de crash (buffer "crash", tag F DEBUG) não
+        # são análise de segurança: citar "frida-agent" no backtrace de
+        # um crash é descrever a instrumentação, não o app detectando.
+        # Eles servem apenas para classificar a origem da falha.
+        if " F DEBUG " in line and re.search(r"#\d+\s+pc\s+", line):
+            continue
+
         is_operator_framework = _is_operator_framework_line(line)
 
         for category, pattern in SECURITY_PATTERNS.items():
@@ -456,6 +482,7 @@ def analyze_logcat(
     vendor_signals = _vendor_signals(lines, package, pid)
     has_rasp_evidence = bool(rasp_signals) or bool(tls_errors) or bool(vendor_signals)
     agent_terminated = bool(categories.get("frida_agent_crash"))
+    crash_origin = classify_crash_origin(lines, pid)
 
     if death_detected:
         detail = f"morte ({death_kind or 'desconhecida'}"
@@ -514,6 +541,7 @@ def analyze_logcat(
         "has_rasp_evidence": has_rasp_evidence,
         "agent_terminated": agent_terminated,
         "instrumentation_kill": instrumentation_kill,
+        "crash_origin": crash_origin,
         "summary": detail,
         "suggestions": suggestions,
     }
@@ -627,6 +655,11 @@ def classify_failure(
 ) -> Dict[str, object]:
     """Classifica uma falha de observação/script usando logcat + baseline.
 
+    O baseline é o que separa "o app reagiu à instrumentação" de "o app
+    morre sozinho": um app que sobrevive sem instrumentação e morre com
+    ela tem a instrumentação como gatilho — ou seja, **bloqueou a
+    auditoria**, que é exatamente o que uma proteção eficaz faz.
+
     Args:
         analysis: Resultado de :func:`analyze_logcat`.
         baseline: Resultado de ``DeviceManager.run_app_baseline`` (opcional).
@@ -641,8 +674,12 @@ def classify_failure(
         category in (categories or {}) for category in HIGH_CONFIDENCE_CATEGORIES
     ) or bool(analysis.get("vendor_signals"))
     death = analysis.get("death") or {}
+    baseline_available = bool(baseline and baseline.get("available"))
     baseline_died = bool(
-        baseline and baseline.get("available") and baseline.get("alive_at_end") is False
+        baseline_available and baseline.get("alive_at_end") is False
+    )
+    baseline_healthy = bool(
+        baseline_available and baseline.get("alive_at_end") is True
     )
 
     if analysis.get("instrumentation_kill") or death.get("kind") == "start_timeout":
@@ -659,7 +696,20 @@ def classify_failure(
         # filtrados antes).
         kind = "rasp_reaction"
     elif death.get("detected") and death.get("kind") in ("crash", "anr"):
-        kind = "instrumentation_crash"
+        # O app sobreviveu sem instrumentação e morreu com ela: a
+        # instrumentação foi o gatilho da morte. Para a auditoria isso
+        # significa que o app bloqueou a auditoria — a proteção funcionou
+        # e o veredito é "protegido".
+        #
+        # A ressalva é quando o backtrace aponta a instrumentação como
+        # autora da queda (o agente do Frida, ou o glue JNI do ART que
+        # ele aciona): aí a morte é da ferramenta, não do app, e o
+        # veredito fica inconclusivo.
+        origin = str(analysis.get("crash_origin") or "unknown")
+        if baseline_healthy and origin != "instrumentation":
+            kind = "rasp_reaction"
+        else:
+            kind = "instrumentation_crash"
     elif death.get("detected"):
         kind = "unknown_death"
     else:
@@ -673,6 +723,59 @@ def classify_failure(
         ),
         "summary": str(analysis.get("summary", "")),
     }
+
+
+def classify_crash_origin(
+    lines: Sequence[str], pid: Optional[int] = None
+) -> str:
+    """Distingue "o app se protegeu" de "a instrumentação derrubou o app".
+
+    O backtrace do crash nativo chega pelo buffer de crash do logcat.
+    Uma falha dentro do agente do Frida — ou no glue JNI do ART que o
+    agente aciona — é da **ferramenta**, não da proteção do app: nesses
+    casos o veredito precisa ser inconclusivo, porque o app não
+    demonstrou nenhuma reação.
+
+    Args:
+        lines: Linhas de logcat (buffer principal + buffer de crash).
+        pid: PID do processo morto, quando conhecido.
+
+    Returns:
+        ``"instrumentation"``, ``"app"`` ou ``"unknown"``.
+    """
+    if not lines:
+        return "unknown"
+
+    target = str(pid) if pid is not None else None
+    frames: List[str] = []
+    in_target_block = target is None
+    for raw in lines:
+        line = _clip(raw)
+        if not line:
+            continue
+        if " F DEBUG " in line and "pid:" in line:
+            # Cabeçalho de um bloco de crash: "pid: 1234, tid: 567 ...".
+            in_target_block = target is None or re.search(
+                rf"\bpid:\s*{re.escape(target)}\b", line
+            ) is not None
+            if in_target_block:
+                frames = []
+            continue
+        if not in_target_block:
+            continue
+        if " F DEBUG " in line and re.search(r"#\d+\s+pc\s+", line):
+            frames.append(line)
+            if len(frames) >= CRASH_ORIGIN_FRAMES_LIMIT:
+                break
+
+    if not frames:
+        return "unknown"
+
+    for frame in frames:
+        lowered = frame.lower()
+        if any(marker in lowered for marker in CRASH_INSTRUMENTATION_MARKERS):
+            return "instrumentation"
+    return "app"
 
 
 def format_evidence(analysis: Dict[str, object], limit: int = 8) -> List[str]:

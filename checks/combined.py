@@ -131,6 +131,9 @@ def _frida_detection(
     baseline_died = bool(
         baseline and baseline.get("available") and baseline.get("alive_at_end") is False
     )
+    baseline_healthy = bool(
+        baseline and baseline.get("available") and baseline.get("alive_at_end") is True
+    )
     death_cause: Optional[dict] = None
     death_classification: Optional[str] = None
     observation_status = "ok"
@@ -184,12 +187,18 @@ def _frida_detection(
                 "carregamento (instrumentação)"
             )
         elif logcat.get("available") and logcat_death.get("kind") in ("crash", "anr"):
-            death_classification = "instrumentation_crash"
-            observation_status = "crashed"
-            error = (
-                "app encerrou por crash/ANR sem evidência de segurança no logcat "
-                "(possível crash da instrumentação)"
-            )
+            if baseline_healthy and logcat.get("crash_origin") != "instrumentation":
+                # O app sobreviveu sem instrumentação e morreu com ela:
+                # a instrumentação foi o gatilho. O app bloqueou a
+                # auditoria — que é o que uma proteção eficaz faz.
+                death_classification = "rasp_reaction"
+            else:
+                death_classification = "instrumentation_crash"
+                observation_status = "crashed"
+                error = (
+                    "app encerrou por crash/ANR sem evidência de segurança no logcat "
+                    "(possível crash da instrumentação)"
+                )
         else:
             death_classification = "unclassified_death"
             observation_status = "inconclusive"
@@ -285,6 +294,9 @@ def _hooking_detection(
     baseline_died = bool(
         baseline and baseline.get("available") and baseline.get("alive_at_end") is False
     )
+    baseline_healthy = bool(
+        baseline and baseline.get("available") and baseline.get("alive_at_end") is True
+    )
     death_cause: Optional[dict] = None
     death_classification: Optional[str] = None
     observation_status = "ok"
@@ -329,12 +341,18 @@ def _hooking_detection(
                 "carregamento (instrumentação)"
             )
         elif logcat.get("available") and logcat_death.get("kind") in ("crash", "anr"):
-            death_classification = "instrumentation_crash"
-            observation_status = "crashed"
-            error = (
-                "app encerrou por crash/ANR sem evidência de segurança no logcat "
-                "(possível crash da instrumentação)"
-            )
+            if baseline_healthy and logcat.get("crash_origin") != "instrumentation":
+                # O app sobreviveu sem instrumentação e morreu com ela:
+                # a instrumentação foi o gatilho. O app bloqueou a
+                # auditoria — que é o que uma proteção eficaz faz.
+                death_classification = "rasp_reaction"
+            else:
+                death_classification = "instrumentation_crash"
+                observation_status = "crashed"
+                error = (
+                    "app encerrou por crash/ANR sem evidência de segurança no logcat "
+                    "(possível crash da instrumentação)"
+                )
         else:
             death_classification = "unclassified_death"
             observation_status = "inconclusive"
@@ -351,7 +369,11 @@ def _hooking_detection(
                 f"({death_classification})",
             )
 
-    detected = bool(strong) and observation_status != "inconclusive"
+    # O app bloquear a auditoria é evidência de proteção: tanto uma
+    # checagem observada quanto a terminação do processo contam.
+    detected = (
+        bool(strong) or death_classification in ("rasp_kill", "rasp_reaction")
+    ) and observation_status != "inconclusive"
     result = {
         "detected": detected,
         "detection_methods_found": found,
@@ -488,31 +510,26 @@ def run_combined_observation(
             logger.debug("Erro no script combinado: %s", message.get("description"))
 
     try:
-        if mode == "stealth":
-            stealth_loaded = load_stealth(
-                session,
-                on_message=on_message,
-                replacements=_replacements(
-                    dm, java_only=False, package_name=package_name
-                ),
-                include_proc_filter=True,
-            )
-        else:
-            # A camada nativa de evasão é carregada também fora do modo
-            # stealth: sem ela, o app aborta logo após o resume e a
-            # janela de observação termina sem produzir sinal algum.
-            #
-            # No modo ``detect`` a evasão fica desligada de propósito:
-            # observar a reação do app exige que a reação aconteça.
-            stealth_loaded = load_stealth(
-                session,
-                on_message=on_message,
-                replacements=_replacements(
-                    dm, java_only=False, package_name=package_name
-                ),
-                include_proc_filter=mode != "detect",
-                load_native_frida=mode != "detect",
-            )
+        # A observação **nunca** carrega a camada de evasão anti-Frida.
+        #
+        # Medir a capacidade de detecção do app exige que a reação
+        # possa acontecer: com a evasão ativa, o app não enxerga os
+        # artefatos de instrumentação e a observação não observa nada.
+        # A evasão pertence à etapa de bypass, onde a pergunta é outra:
+        # "dá para sobreviver à instrumentação?".
+        #
+        # O abort do app não é perda de sinal — é o sinal: um app que
+        # morre ao ser instrumentado bloqueou a auditoria, e isso é
+        # creditado como proteção eficaz.
+        stealth_loaded = load_stealth(
+            session,
+            on_message=on_message,
+            replacements=_replacements(
+                dm, java_only=False, package_name=package_name
+            ),
+            include_proc_filter=False,
+            load_native_frida=False,
+        )
 
         native_source = _replacements(
                     dm, java_only=False, package_name=package_name
@@ -929,11 +946,21 @@ def run_combined_bypass(
     if alive and hook_java_error:
         hook_success = False
         hook_error = f"hooks Java do bypass não carregaram: {hook_java_error}"
-    elif not alive and not is_rasp:
-        hook_error = (
-            "app encerrou sem reação RASP identificável durante o bypass "
-            f"({kind})"
-        )
+    elif not alive:
+        # O app encerrou durante o bypass: o bypass não venceu. O app
+        # bloqueou a auditoria — que é o resultado esperado de uma
+        # proteção eficaz, e não um bypass bem-sucedido.
+        hook_success = False
+        if is_rasp:
+            hook_error = (
+                "o app bloqueou o bypass: encerrou durante a execução do "
+                "bypass (reação do RASP)"
+            )
+        else:
+            hook_error = (
+                "app encerrou sem reação RASP identificável durante o bypass "
+                f"({kind})"
+            )
     if hook_error is None and combined_error and not (not alive and is_rasp):
         hook_error = combined_error
 
@@ -942,16 +969,24 @@ def run_combined_bypass(
     if alive and ssl_java_error and not hosts:
         ssl_success = False
         ssl_error = f"hooks Java de SSL não carregaram: {ssl_java_error}"
-    elif not alive and not is_rasp:
-        ssl_error = (
-            "app encerrou sem reação RASP identificável durante o bypass "
-            f"({kind})"
-        )
+    elif not alive:
+        ssl_success = False
+        if is_rasp:
+            ssl_error = (
+                "o app bloqueou o bypass de SSL: encerrou durante a execução "
+                "do bypass (reação do RASP)"
+            )
+        else:
+            ssl_error = (
+                "app encerrou sem reação RASP identificável durante o bypass "
+                f"({kind})"
+            )
     if ssl_error is None and combined_error and not (not alive and is_rasp):
         ssl_error = combined_error
 
     hooking = {
         "success": hook_success,
+        "blocked": bool(not alive and is_rasp),
         "bypass_logs": hook_logs,
         "effective_logs": hook_effective,
         "app_alive_at_end": alive,
@@ -965,6 +1000,7 @@ def run_combined_bypass(
     }
     ssl = {
         "success": ssl_success,
+        "blocked": bool(not alive and is_rasp),
         "intercepted_hosts": hosts,
         "bypass_logs": ssl_logs,
         "effective_logs": ssl_effective,

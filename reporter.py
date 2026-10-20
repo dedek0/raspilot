@@ -152,6 +152,14 @@ class Reporter:
                 "bypass_successful": bypass,
                 "hook_frameworks_present": bool(result.get("hook_frameworks_present")),
             }
+            blocked = bool((result.get("bypass_details") or {}).get("blocked"))
+            if blocked:
+                # O app bloqueou a auditoria: a proteção resistiu ao
+                # bypass. O motivo entra no resumo para que o "OK" não
+                # pareça uma ausência de proteção.
+                summary["blocked_reason"] = (
+                    "o app bloqueou a auditoria durante o bypass"
+                )
             if not protected:
                 status = "FALHOU"
             elif bypass is True:
@@ -178,6 +186,11 @@ class Reporter:
                 "pinning_type": result.get("pinning_type"),
                 "bypass_successful": bypass,
             }
+            blocked = bool((result.get("bypass_details") or {}).get("blocked"))
+            if blocked:
+                summary["blocked_reason"] = (
+                    "o app bloqueou a auditoria durante o bypass"
+                )
             if bypass is True:
                 status = "FALHOU"
             elif bypass is None and pinned:

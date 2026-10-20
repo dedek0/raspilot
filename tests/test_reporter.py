@@ -196,6 +196,29 @@ class TestGenerateJson:
         })
         assert rep.generate_json()["summary"]["anti_hooking"]["status"] == "ERROR"
 
+    def test_blocked_bypass_is_a_resisted_protection(self):
+        """App que bloqueou a auditoria: a proteção resistiu (OK + motivo)."""
+        rep = Reporter(device_info=DEVICE, package_name="pkg")
+        rep.collect("anti_hooking", {
+            "protection_detected": True, "bypass_successful": False,
+            "bypass_details": {"blocked": True},
+        })
+        summary = rep.generate_json()["summary"]["anti_hooking"]
+        assert summary["status"] == "OK"
+        assert summary["blocked_reason"]
+
+    def test_blocked_ssl_bypass_is_a_resisted_pinning(self):
+        """App que bloqueou a auditoria: o pinning resistiu (OK + motivo)."""
+        rep = Reporter(device_info=DEVICE, package_name="pkg")
+        rep.collect("ssl_pinning", {
+            "pinning_detected": True, "pinning_type": "okhttp",
+            "bypass_successful": False,
+            "bypass_details": {"blocked": True},
+        })
+        summary = rep.generate_json()["summary"]["ssl_pinning"]
+        assert summary["status"] == "OK"
+        assert summary["blocked_reason"]
+
 
 class TestGenerateHtml:
     """Renderização do template HTML."""

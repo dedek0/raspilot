@@ -58,18 +58,39 @@ function setErrno(value) {
     } catch (e) { /* best-effort */ }
 }
 
+// Casa um termo como TOKEN, e não como substring solta.
+//
+// A comparação por substring casava "frida" dentro do nome do pacote
+// do próprio app e filtrava o /proc do app como se fosse artefato de
+// instrumentação. A fronteira exige que o termo esteja isolado por
+// caracteres não alfanuméricos.
+function isTokenBoundary(ch) {
+    return ch === '' || !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'));
+}
+
+function containsToken(lower, term) {
+    var idx = lower.indexOf(term);
+    while (idx !== -1) {
+        var before = idx === 0 ? '' : lower.charAt(idx - 1);
+        var after = lower.charAt(idx + term.length);
+        if (isTokenBoundary(before) && isTokenBoundary(after)) { return true; }
+        idx = lower.indexOf(term, idx + 1);
+    }
+    return false;
+}
+
 function matchesHookFramework(str) {
     try {
         if (str === null || str === undefined) { return false; }
         var lower = ('' + str).toLowerCase();
         var keywords = [
-            'frida', 'xposed', 'lsposed', 'lspd', 'edxposed', 'substrate',
-            'sandhook', 'yahfa', 'lsplant', 'whale', 'dobby', 'riru', 'zygisk',
-            'gadget', 'gum-js', 'linjector', 'andhook', 'shadowhook',
-            'libloader64_v8', 'libloader32_v7'
+            'frida', 'libfrida', 'xposed', 'lsposed', 'lspd', 'edxposed',
+            'substrate', 'sandhook', 'yahfa', 'lsplant', 'whale', 'dobby',
+            'riru', 'zygisk', 'gadget', 'gum-js', 'linjector', 'andhook',
+            'shadowhook', 'libloader64_v8', 'libloader32_v7'
         ];
         for (var i = 0; i < keywords.length; i++) {
-            if (lower.indexOf(keywords[i]) !== -1) { return true; }
+            if (containsToken(lower, keywords[i])) { return true; }
         }
     } catch (e) { /* best-effort */ }
     return false;

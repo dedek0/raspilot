@@ -532,6 +532,30 @@ class TestAppReady:
 class TestPidAndDeviceSelection:
     """Robustez na resolução de PID/dispositivo."""
 
+    def test_zombie_process_is_not_alive(self):
+        """Processo encerrado (zumbi) não conta como vivo."""
+        dm = DeviceManager(device_id="SER1")
+        with mock.patch.object(dm, "run_shell", return_value={
+            "ok": True, "rc": 0, "stdout": "Z", "stderr": ""
+        }):
+            assert dm.is_app_alive(4242) is False
+
+    def test_running_process_is_alive(self):
+        """Processo em execução normal conta como vivo."""
+        dm = DeviceManager(device_id="SER1")
+        with mock.patch.object(dm, "run_shell", return_value={
+            "ok": True, "rc": 0, "stdout": "S", "stderr": ""
+        }):
+            assert dm.is_app_alive(4242) is True
+
+    def test_missing_process_is_not_alive(self):
+        """Processo já recolhido não conta como vivo."""
+        dm = DeviceManager(device_id="SER1")
+        with mock.patch.object(dm, "run_shell", return_value={
+            "ok": True, "rc": 0, "stdout": "", "stderr": ""
+        }):
+            assert dm.is_app_alive(4242) is False
+
     def test_get_app_pid_does_not_reuse_other_package(self):
         """PID do último spawn de outro package não é reutilizado."""
         dm = DeviceManager(device_id="SER1")

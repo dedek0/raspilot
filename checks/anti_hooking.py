@@ -207,20 +207,79 @@ var RASPILOT_JAVA_ONLY = (typeof __RASPILOT_JAVA_ONLY__ !== 'undefined')
 
 // Palavras-chave de frameworks de hooking que apps anti-hook procuram
 // (em classes, paths, comandos e buscas nativas).
+//
+// Termos ambíguos ('whale', 'gadget') só casam quando aparecem como
+// TOKEN isolado: "gadgets" ou "bluewhale" não são evidência de nada.
 var HOOK_KEYWORDS = [
-    'frida', 'xposed', 'lsposed', 'lspd', 'edxposed', 'substrate',
+    'frida', 'libfrida', 'xposed', 'lsposed', 'lspd', 'edxposed', 'substrate',
     'sandhook', 'yahfa', 'lsplant', 'whale', 'dobby', 'riru', 'zygisk',
     'gadget', 'gum-js', 'linjector', 'andhook', 'shadowhook'
 ];
+
+// Casa um termo como TOKEN, e não como substring solta.
+//
+// A comparação por substring transformava qualquer acesso do app a um
+// arquivo próprio em "detecção" quando o nome do pacote continha o
+// termo. A fronteira exige que o termo esteja isolado por caracteres
+// não alfanuméricos.
+function isTokenBoundary(ch) {
+    return ch === '' || !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'));
+}
+
+function containsToken(lower, term) {
+    var idx = lower.indexOf(term);
+    while (idx !== -1) {
+        var before = idx === 0 ? '' : lower.charAt(idx - 1);
+        var after = lower.charAt(idx + term.length);
+        if (isTokenBoundary(before) && isTokenBoundary(after)) { return true; }
+        idx = lower.indexOf(term, idx + 1);
+    }
+    return false;
+}
 
 function matchesHookFramework(str) {
     try {
         if (str === null || str === undefined) { return false; }
         var lower = ('' + str).toLowerCase();
         for (var i = 0; i < HOOK_KEYWORDS.length; i++) {
-            if (lower.indexOf(HOOK_KEYWORDS[i]) !== -1) { return true; }
+            if (containsToken(lower, HOOK_KEYWORDS[i])) { return true; }
         }
     } catch (e) { /* best-effort */ }
+    return false;
+}
+
+// Um byte é fronteira de token quando não é alfanumérico.
+function isTokenByte(c) {
+    if (c === 0) { return true; }
+    var lower = (c >= 65 && c <= 90) ? (c + 32) : c;
+    return !((lower >= 97 && lower <= 122) || (lower >= 48 && lower <= 57));
+}
+
+// Procura os tokens de framework direto nos bytes do buffer, sem
+// materializar a string: em função muito chamada, montar a string
+// caractere a caractere é o que trava o app.
+function bytesContainHook(buffer) {
+    if (buffer === null || buffer === undefined) { return false; }
+    var bytes = new Uint8Array(buffer);
+    var lower = [];
+    for (var i = 0; i < bytes.length; i++) {
+        var c = bytes[i];
+        lower[i] = (c >= 65 && c <= 90) ? (c + 32) : c;
+    }
+    for (var k = 0; k < HOOK_KEYWORDS.length; k++) {
+        var needle = HOOK_KEYWORDS[k];
+        var limit = lower.length - needle.length;
+        for (var p = 0; p <= limit; p++) {
+            var match = true;
+            for (var j = 0; j < needle.length; j++) {
+                if (lower[p + j] !== needle.charCodeAt(j)) { match = false; break; }
+            }
+            if (!match) { continue; }
+            var before = p === 0 ? 0 : lower[p - 1];
+            var after = (p + needle.length < lower.length) ? lower[p + needle.length] : 0;
+            if (isTokenByte(before) && isTokenByte(after)) { return true; }
+        }
+    }
     return false;
 }
 
@@ -279,6 +338,10 @@ if (!RASPILOT_JAVA_ONLY) {
 
 // memcmp — varre o buffer pelas mesmas strings (comparações por tamanho,
 // típicas de checagens anti-hook sem string literal no binário).
+//
+// A busca é feita sobre os bytes: montar a string caractere a caractere
+// trava o app em função muito chamada, e é o que o gancho de memcmp
+// precisa evitar.
 try {
     var memcmpAddr = raspilotFindExport('libc.so', 'memcmp');
     if (memcmpAddr !== null) {
@@ -286,14 +349,9 @@ try {
             onEnter: function (args) {
                 try {
                     var n = args[2].toInt32();
-                    if (n > 0 && n < 4096) {
-                        var bytes = new Uint8Array(args[0].readByteArray(n));
-                        var s = '';
-                        for (var i = 0; i < bytes.length; i++) {
-                            var c = bytes[i];
-                            s += (c >= 32 && c < 127) ? String.fromCharCode(c) : ' ';
-                        }
-                        if (matchesHookFramework(s)) {
+                    if (n > 0 && n <= 64) {
+                        if (bytesContainHook(args[0].readByteArray(n)) ||
+                                bytesContainHook(args[1].readByteArray(n))) {
                             report('native_memcmp', 'buffer contém string de framework');
                         }
                     }
@@ -369,17 +427,20 @@ function reportStackHit(source, frames) {
 function installJavaHooks() {
     // Class.forName('de.robv.android.xposed.XposedBridge') — checagem
     // clássica de detecção de Xposed/LSPosed (dispara sem precisar achar).
-    try {
-        var Class = Java.use('java.lang.Class');
-        var forName1 = Class.forName.overload('java.lang.String');
-        forName1.implementation = function (name) {
-            try {
-                if (matchesHookFramework(name)) { report('Class.forName', '' + name); }
-            } catch (e) { /* best-effort */ }
-            return forName1.call(this, name);
-        };
-    } catch (e) { /* Java indisponível */ }
-
+    //
+    // Só a sobrecarga de três argumentos é hookada. A de um argumento
+    // NÃO pode ser substituída: ART resolve o nome usando o class
+    // loader de quem chamou, e essa informação se perde quando o
+    // original é invocado através do Frida — o ART passa a inferir o
+    // caller a partir do frame do próprio agente e resolve a classe no
+    // boot class loader. O efeito é pior que não hookar: o app passa a
+    // receber ClassNotFoundException para classes legítimas, e apps que
+    // carregam código de um class loader próprio (packers, plugins)
+    // quebram na inicialização.
+    //
+    // A sobrecarga de três argumentos preserva a semântica: o loader
+    // chega explícito, e a de um argumento delega para ela — a checagem
+    // continua sendo interceptada.
     try {
         var ClassCl = Java.use('java.lang.Class');
         var forName3 = ClassCl.forName.overload(
@@ -1059,6 +1120,9 @@ class AntiHookingCheck:
         baseline_died = bool(
             baseline and baseline.get("available") and baseline.get("alive_at_end") is False
         )
+        baseline_healthy = bool(
+            baseline and baseline.get("available") and baseline.get("alive_at_end") is True
+        )
         if died_after is None and pid is not None:
             try:
                 if not self.dm.is_app_alive(pid):
@@ -1134,14 +1198,20 @@ class AntiHookingCheck:
             elif logcat_rasp:
                 death_classification = "rasp_reaction"
             elif logcat.get("available") and logcat_death.get("kind") in ("crash", "anr"):
-                # Crash/ANR sem evidência de segurança: provável crash da
-                # instrumentação, não reação anti-hook.
-                death_classification = "instrumentation_crash"
-                observation_status = "crashed"
-                error = (
-                    "app encerrou por crash/ANR sem evidência de segurança no logcat "
-                    "(possível crash da instrumentação)"
-                )
+                if baseline_healthy and logcat.get("crash_origin") != "instrumentation":
+                    # O app sobreviveu sem instrumentação e morreu com ela:
+                    # a instrumentação foi o gatilho. O app bloqueou a
+                    # auditoria — que é o que uma proteção eficaz faz.
+                    death_classification = "rasp_reaction"
+                else:
+                    # Sem baseline que prove que o app é estável sozinho,
+                    # a causa da morte não pode ser atribuída.
+                    death_classification = "instrumentation_crash"
+                    observation_status = "crashed"
+                    error = (
+                        "app encerrou por crash/ANR sem evidência de segurança no logcat "
+                        "(possível crash da instrumentação)"
+                    )
             else:
                 death_classification = "unclassified_death"
 
@@ -1154,7 +1224,11 @@ class AntiHookingCheck:
                 if death_cause:
                     add_signal("app_kill_external", death_cause.get("summary", "?"))
 
-        detected = bool(strong)
+        # O app bloquear a auditoria é evidência de proteção: tanto uma
+        # checagem observada quanto a terminação do processo contam.
+        detected = (
+            bool(strong) or death_classification in ("rasp_kill", "rasp_reaction")
+        ) and observation_status != "inconclusive"
         result = {
             "detected": detected,
             "detection_methods_found": found,
@@ -1344,6 +1418,7 @@ class AntiHookingCheck:
             if failure.get("is_rasp"):
                 return {
                     "success": False,
+                    "blocked": True,
                     "bypass_logs": bypass_logs,
                     "effective_logs": [],
                     "app_alive_at_end": False,
@@ -1371,6 +1446,7 @@ class AntiHookingCheck:
                 error = str(exc)
             return {
                 "success": False,
+                "blocked": False,
                 "bypass_logs": bypass_logs,
                 "effective_logs": [],
                 "app_alive_at_end": app_alive if app_alive is not None else True,
@@ -1421,15 +1497,30 @@ class AntiHookingCheck:
         logcat = analyze_since(
             self.dm, logcat_mark, package_name, locals().get("pid")
         )
+        # O app bloqueou a auditoria: encerrou com a instrumentação e a
+        # causa é atribuível ao RASP. Isso é uma conclusão sobre a
+        # proteção (ela resistiu), não uma etapa que não rodou.
+        blocked = bool(
+            not alive
+            and classify_failure(logcat, self._baseline()).get("is_rasp")
+        )
         error: Optional[str] = None
         if alive and java_load_error:
             # Hooks Java são essenciais para o anti-hooking; neutralizar
             # só a camada nativa não permite afirmar que o bypass venceu.
             success = False
             error = f"hooks Java do bypass não carregaram: {java_load_error}"
+        elif not alive:
+            # O app encerrou durante o bypass: o bypass não venceu — o
+            # app bloqueou a auditoria.
+            success = False
+            error = (
+                "o app bloqueou o bypass: encerrou durante a execução do bypass"
+            )
 
         result = {
             "success": success,
+            "blocked": blocked,
             "bypass_logs": bypass_logs,
             "effective_logs": effective,
             "app_alive_at_end": alive,
@@ -1568,7 +1659,11 @@ class AntiHookingCheck:
                 bypass_details = precomputed_bypass
             else:
                 bypass_details = self.attempt_bypass(package_name, window=window)
-            if bypass_details.get("error"):
+            if bypass_details.get("blocked"):
+                # O app bloqueou o bypass: a proteção resistiu. Isso é uma
+                # conclusão sobre a proteção, não uma etapa que não rodou.
+                bypass_successful = False
+            elif bypass_details.get("error"):
                 # A proteção foi detectada, mas o bypass não pôde ser
                 # avaliado. Isso é uma etapa que não rodou, não uma
                 # conclusão sobre a proteção: o veredito da detecção
