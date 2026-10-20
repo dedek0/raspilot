@@ -382,7 +382,10 @@ class DeviceManager:
         cmd = ["adb"]
         if self.device_id:
             cmd += ["-s", self.device_id]
-        cmd += ["logcat", "-v", "threadtime"]
+        # O buffer "crash" traz o backtrace completo do tombstone: é o
+        # que permite distinguir "o app se protegeu" de "a instrumentação
+        # derrubou o app". Não exige root.
+        cmd += ["logcat", "-b", "main", "-b", "crash", "-v", "threadtime"]
 
         try:
             proc = subprocess.Popen(
@@ -1232,14 +1235,34 @@ class DeviceManager:
     def is_app_alive(self, pid: int) -> bool:
         """Verifica se um processo continua em execução no dispositivo.
 
+        A verificação usa o **estado** do processo em ``/proc/<pid>/stat``,
+        e não apenas a existência do diretório: um processo que já morreu
+        permanece como *zumbi* até ser recolhido pelo zygote, e a
+        existência do diretório ``/proc/<pid>`` continua verdadeira nesse
+        intervalo. Um app que se auto-destruiu (reação do RASP) ficaria
+        reportado como vivo durante essa janela — e um bypass avaliado
+        nesse instante seria dado como bem-sucedido sobre um processo
+        morto.
+
         Args:
             pid: PID do processo alvo.
 
         Returns:
-            True se ``/proc/<pid>`` ainda existe.
+            True se o processo existe e não está em estado zumbi ou morto.
         """
-        res = self.run_shell(f"[ -d /proc/{pid} ] && echo alive", timeout=5)
-        return "alive" in (res.get("stdout") or "")
+        # O campo ``state`` é o terceiro campo de /proc/<pid>/stat, mas o
+        # nome do processo (campo 2) pode conter espaços e parênteses: a
+        # posição é obtida a partir do último ')' da linha.
+        res = self.run_shell(
+            f"if [ -r /proc/{pid}/stat ]; then "
+            f"sed 's/.*) //' /proc/{pid}/stat | cut -d' ' -f1; fi",
+            timeout=5,
+        )
+        state = (res.get("stdout") or "").strip().split()
+        if not state:
+            return False
+        # 'Z' = zumbi (terminado, aguardando reaping), 'X' = morto.
+        return state[0] not in ("Z", "X", "x")
 
     def capture_death_cause(
         self, pid: Optional[int] = None, package: Optional[str] = None

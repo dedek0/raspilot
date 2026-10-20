@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest import mock
 
-from checks.anti_frida import DETECTION_SCRIPT, AntiFridaCheck
+from checks.anti_frida import DETECTION_SCRIPT, AntiFridaCheck, _contains_token
 
 
 class FakeModule:
@@ -85,6 +85,19 @@ class FakeSessionNoEnum:
 
 class TestDeviceVectors:
     """Vetores de dispositivo (processos, portas, threads)."""
+
+    def test_token_match_requires_boundary(self):
+        """O termo precisa estar isolado por caracteres não alfanuméricos."""
+        # Artefato real: casa.
+        assert _contains_token("/data/local/tmp/frida-server", "frida") is True
+        assert _contains_token("/memfd:frida-agent-64.so", "frida") is True
+        assert _contains_token("libfrida.so", "libfrida") is True
+        # Nome do próprio app que contém o termo: não casa.
+        assert _contains_token("/data/app/com.acme.fridaplayer-1/base.apk", "frida") is False
+        assert _contains_token("myfridaapp", "frida") is False
+        # Termo composto, com fronteira própria.
+        assert _contains_token("xposedbridge", "xposed") is False
+        assert _contains_token("de.robv.android.xposed.XposedBridge", "xposed") is True
 
     def test_frida_processes_detected(self, fake_dm_factory):
         """frida-server no ps é detectado."""
@@ -324,8 +337,8 @@ class TestObservationReliability:
         assert res["vulnerable"] is False
         assert any(s.startswith("logcat_frida") for s in res["detection_methods_found"])
 
-    def test_crash_without_security_is_inconclusive(self):
-        """Crash nativo sem evidência de segurança não vira proteção OK."""
+    def test_crash_after_healthy_baseline_is_a_blocked_audit(self):
+        """App que sobrevive sem instrumentação e morre com ela bloqueou a auditoria."""
         dm = mock.MagicMock()
         dm.is_app_alive.return_value = False
         dm.capture_death_cause.return_value = {
@@ -335,6 +348,27 @@ class TestObservationReliability:
             "10-16 10:00:00.000 1234 1234 F libc: Fatal signal 11 (SIGSEGV), pid 1234",
         ]
         dm.baseline = {"available": True, "alive_at_end": True}
+        check = AntiFridaCheck(dm)
+        with mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
+            res = check.check_frida_detection_in_app(
+                FakeSession(messages=[]), window=2, pid=1234,
+                package_name="com.app", logcat_mark=0,
+            )
+        assert res["vulnerable"] is False
+        assert res["death_classification"] == "rasp_reaction"
+        assert any(s.startswith("app_terminated") for s in res["detection_methods_found"])
+
+    def test_crash_without_baseline_is_inconclusive(self):
+        """Sem baseline não há como atribuir a causa da morte."""
+        dm = mock.MagicMock()
+        dm.is_app_alive.return_value = False
+        dm.capture_death_cause.return_value = {
+            "evidence": [], "signal": "SIGSEGV", "summary": "sinal fatal SIGSEGV",
+        }
+        dm.logcat_since.return_value = [
+            "10-16 10:00:00.000 1234 1234 F libc: Fatal signal 11 (SIGSEGV), pid 1234",
+        ]
+        dm.baseline = {"available": False}
         check = AntiFridaCheck(dm)
         with mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_frida_detection_in_app(

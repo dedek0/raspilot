@@ -610,6 +610,32 @@ class TestRunAll:
         assert res["bypass_successful"] is None
         assert "spawn falhou" in res["bypass_skipped_reason"]
 
+    def test_bypass_blocked_by_app_is_a_resisted_protection(self, tmp_path):
+        """App que bloqueia o bypass prova que a proteção resistiu.
+
+        Não é uma etapa que não rodou: o app encerrou durante o bypass,
+        e a proteção respondeu. O veredito é "resistiu", não "SKIP".
+        """
+        apk = _make_apk(str(tmp_path / "x.apk"), {
+            "classes.dex": b"de.robv.android.xposed.XposedBridge\x00",
+        })
+        dm = self._mock_dm()
+        dm.spawn_app.side_effect = [FakeSession(), FakeSession()]
+        dm.is_app_alive.return_value = False
+        dm.capture_death_cause.return_value = {
+            "evidence": [], "signal": "SIGKILL", "summary": "SIGKILL",
+        }
+        dm.logcat_since.return_value = [
+            "10-16 10:00:00.000 42 42 I ActivityManager: "
+            "Process com.app (pid 42) has died",
+        ]
+        dm.baseline = {"available": True, "alive_at_end": True}
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
+            res = AntiHookingCheck(dm).run_all("com.app", apk_path=apk)
+        assert res["protection_detected"] is True
+        assert res["bypass_successful"] is False
+        assert res["bypass_details"]["blocked"] is True
+
     def test_observation_failure_without_static_is_error(self, tmp_path):
         """Spawn da observação falha e sem APK => error (sem veredito)."""
         apk = _make_apk(str(tmp_path / "clean.apk"), {"classes.dex": b"plain"})
@@ -662,8 +688,8 @@ class TestLogcatCorrelation:
         assert res["detected"] is True
         assert any(s.startswith("logcat_hooking") for s in res["strong_signals"])
 
-    def test_crash_without_security_is_inconclusive(self):
-        """Crash sem evidência de segurança não é reação anti-hook."""
+    def test_crash_after_healthy_baseline_is_a_blocked_audit(self):
+        """App que sobrevive sem instrumentação e morre com ela bloqueou a auditoria."""
         dm = mock.MagicMock()
         dm.is_app_alive.return_value = False
         dm.capture_death_cause.return_value = {
@@ -673,6 +699,27 @@ class TestLogcatCorrelation:
             "10-16 10:00:00.000 42 42 F libc: Fatal signal 11 (SIGSEGV), pid 42",
         ]
         dm.baseline = {"available": True, "alive_at_end": True}
+        check = AntiHookingCheck(dm)
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
+            res = check.check_hook_detection_in_app(
+                FakeSession(), window=2, pid=42, package_name="com.app",
+                logcat_mark=0,
+            )
+        assert res["observation_status"] == "ok"
+        assert res["death_classification"] == "rasp_reaction"
+        assert res["detected"] is True
+
+    def test_crash_without_baseline_is_inconclusive(self):
+        """Sem baseline não há como atribuir a causa da morte."""
+        dm = mock.MagicMock()
+        dm.is_app_alive.return_value = False
+        dm.capture_death_cause.return_value = {
+            "evidence": [], "signal": "SIGSEGV", "summary": "SIGSEGV",
+        }
+        dm.logcat_since.return_value = [
+            "10-16 10:00:00.000 42 42 F libc: Fatal signal 11 (SIGSEGV), pid 42",
+        ]
+        dm.baseline = {"available": False}
         check = AntiHookingCheck(dm)
         with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_hook_detection_in_app(

@@ -159,13 +159,26 @@ Semântica de status:
 > houve evidência de confiança alta. Termos genéricos de logcat (`root`,
 > `hook`, `detected`, `checksum`), logs de frameworks de hooking
 > instalados no device e o crash do próprio agente de instrumentação são
-> contexto — nunca sustentam um veredito. Uma morte sem causa atribuível
-> resulta em inconclusivo, não em "o app detectou".
+> contexto — nunca sustentam um veredito.
+>
+> **App que bloqueia a auditoria é app protegido.** Quando o app sobrevive
+> ao baseline (sem instrumentação) e encerra quando instrumentado, a
+> instrumentação é o gatilho da morte: o app bloqueou a auditoria e a
+> proteção é creditada como eficaz. Sem um baseline que prove que o app é
+> estável sozinho, a morte continua inconclusiva (`ERROR`) — não há como
+> atribuir a causa.
+>
+> A atribuição usa o **backtrace do crash** (buffer `crash` do logcat,
+> que não exige root): uma queda dentro do agente do Frida, ou no glue
+> JNI do ART que ele aciona, é falha da **instrumentação** — e aí o
+> veredito é inconclusivo, porque o app não demonstrou reação. Queda no
+> código do próprio app é reação do app.
 >
 > O mesmo vale para o bypass: um bypass **instalado** mas nunca
 > **exercitado** (nenhuma requisição TLS observada, por exemplo) não
 > prova que a proteção resistiu — a etapa fica `SKIP`, com o motivo em
-> `skip_reason`.
+> `skip_reason`. E um bypass em que o app encerrou **não** é um bypass
+> vencido: o app bloqueou a auditoria.
 
 > **Importante:** o RASPilot **não modifica permanentemente** o dispositivo.
 > Ao final de cada execução ele encerra o `frida-server`, remove
@@ -204,8 +217,8 @@ Confiança: `high` (≥2 vetores), `medium` (1), `low` (0).
   Frida e no `kill_trace`)
 - Correlação com o **logcat** e com o **baseline sem instrumentação**: uma
   morte só vira evidência de detecção quando há sinal de segurança, kill
-  rastreado ou o app não morria no baseline; crash da instrumentação vira
-  `ERROR`/inconclusivo, não `OK`
+  rastreado ou o app não morria no baseline; sem baseline que isole a
+  causa, o crash fica `ERROR`/inconclusivo, não `OK`
 - Se a observação não puder executar (script/attach), o resultado é
   `ERROR`, não `vulnerable=True`
 

@@ -93,6 +93,31 @@ class TestHookingBypassSemantics:
         assert "notFoundException" in source
         assert "ClassNotFoundException" in source
 
+    def test_class_for_name_single_arg_is_not_hooked(self):
+        """A sobrecarga de um argumento quebra o class loader do caller.
+
+        ART resolve o nome com o class loader de quem chamou; invocar o
+        original pelo Frida faz o ART inferir o caller a partir do frame
+        do agente, e a classe passa a ser procurada no boot class loader.
+        O app então recebe ClassNotFoundException para classes
+        legítimas. A sobrecarga de três argumentos cobre a checagem.
+        """
+        source = _read("anti_hooking_bypass.js")
+        block = source.split("function hookClassLookups")[1][:4000]
+        assert "Class.forName.overload('java.lang.String')" not in block
+        assert "forName.overload('java.lang.String')" not in block
+        assert "'java.lang.String', 'boolean', 'java.lang.ClassLoader'" in block
+
+    def test_keyword_match_requires_token_boundary(self):
+        """Substring solta casa o nome do pacote do app com o termo.
+
+        Um app cujo pacote contenha "frida" faria todo acesso a arquivo
+        próprio virar "detecção".
+        """
+        source = _read("anti_hooking_bypass.js")
+        assert "containsToken(lower, HOOK_KEYWORDS[i])" in source
+        assert "lower.indexOf(HOOK_KEYWORDS[i])" not in source
+
     def test_ambiguous_keywords_are_not_used_for_string_search(self):
         """"gadget" e "whale" são palavras comuns."""
         source = _read("anti_hooking_bypass.js")

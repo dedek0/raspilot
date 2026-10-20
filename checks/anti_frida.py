@@ -60,6 +60,35 @@ FRIDA_THREAD_NAMES = ("gum-js-loop", "gmain", "pool-frida", "frida-agent")
 # Strings que um app anti-frida costuma procurar.
 FRIDA_KEYWORDS = ("frida", "gum-js-loop", "gadget", "libfrida")
 
+
+def _contains_token(text: str, term: str) -> bool:
+    """Indica se ``term`` aparece em ``text`` como token isolado.
+
+    O casamento é por fronteira: o caractere anterior e o posterior
+    precisam ser não alfanuméricos. Sem isso, o nome do pacote de um app
+    que contém o termo (ex: "fridaplayer") casaria e viraria "detecção"
+    do próprio app.
+
+    Args:
+        text: Texto já em minúsculas.
+        term: Termo procurado, em minúsculas.
+
+    Returns:
+        True se o termo aparecer isolado no texto.
+    """
+    if not term:
+        return False
+    start = 0
+    while True:
+        idx = text.find(term, start)
+        if idx == -1:
+            return False
+        before = text[idx - 1] if idx > 0 else ""
+        after = text[idx + len(term)] if idx + len(term) < len(text) else ""
+        if not (before.isalnum() or after.isalnum()):
+            return True
+        start = idx + 1
+
 # Script de OBSERVAÇÃO (não bypass): registra chamadas de detecção do app
 # (File.exists em paths Frida, Runtime.exec com 'frida', strstr/strcmp em
 # libc procurando 'frida') e as envia ao host via send().
@@ -86,10 +115,42 @@ function reportHookError(msg) {
     send({ type: 'frida-detection-error', message: msg });
 }
 
+// Artefatos de instrumentação reconhecidos por nome.
+//
+// A comparação é feita por TOKEN (termo isolado por caracteres não
+// alfanuméricos), e não por substring solta: o nome do pacote de um app
+// pode conter o termo sem que o app esteja detectando o Frida — sem a
+// fronteira, todo acesso do app a um arquivo próprio viraria
+// "detecção".
+var FRIDA_TOKENS = [
+    'frida', 'libfrida', 'frida-agent', 'fridaagent', 'frida-gadget',
+    'fridagadget', 'frida-server', 'gum-js', 'gum-js-loop', 'linjector',
+    're.frida.server'
+];
+
+function isTokenBoundary(ch) {
+    return ch === '' || !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'));
+}
+
+function containsToken(lower, term) {
+    var idx = lower.indexOf(term);
+    while (idx !== -1) {
+        var before = idx === 0 ? '' : lower.charAt(idx - 1);
+        var after = lower.charAt(idx + term.length);
+        if (isTokenBoundary(before) && isTokenBoundary(after)) { return true; }
+        idx = lower.indexOf(term, idx + 1);
+    }
+    return false;
+}
+
 function looksLikeFrida(str) {
     try {
         if (str === null || str === undefined) { return false; }
-        return ('' + str).toLowerCase().indexOf('frida') !== -1;
+        var lower = ('' + str).toLowerCase();
+        for (var i = 0; i < FRIDA_TOKENS.length; i++) {
+            if (containsToken(lower, FRIDA_TOKENS[i])) { return true; }
+        }
+        return false;
     } catch (e) { return false; }
 }
 
@@ -172,7 +233,9 @@ try {
         Interceptor.attach(addr, {
             onEnter: function (args) {
                 try {
-                    var path = args[0].readCString();
+                    // faccessat/faccessat2 recebem (dirfd, path, ...): o
+                    // caminho é o segundo argumento, não o primeiro.
+                    var path = args[name === 'faccessat' || name === 'faccessat2' ? 1 : 0].readCString();
                     if (looksLikeFrida(path)) {
                         reportDetection('native_' + name, path);
                     }
@@ -453,7 +516,8 @@ class AntiFridaCheck:
         evidence: List[str] = []
         try:
             for name in self._enumerate_module_names(sess):
-                if any(k in name.lower() for k in FRIDA_KEYWORDS):
+                lowered = name.lower()
+                if any(_contains_token(lowered, k) for k in FRIDA_KEYWORDS):
                     evidence.append(name)
         except Exception as exc:
             return {
@@ -757,6 +821,9 @@ class AntiFridaCheck:
         baseline_died = bool(
             baseline and baseline.get("available") and baseline.get("alive_at_end") is False
         )
+        baseline_healthy = bool(
+            baseline and baseline.get("available") and baseline.get("alive_at_end") is True
+        )
         # Rechecagem: o app pode ter morrido depois da janela (ex: durante
         # o carregamento Java que estourou timeout).
         if died_after is None and pid is not None:
@@ -841,14 +908,20 @@ class AntiFridaCheck:
             elif logcat_rasp:
                 death_classification = "rasp_reaction"
             elif logcat.get("available") and logcat_death.get("kind") in ("crash", "anr"):
-                # Crash sem evidência de segurança: provavelmente da própria
-                # instrumentação. Não pode virar "proteção OK" nem "vulnerável".
-                death_classification = "instrumentation_crash"
-                observation_status = "crashed"
-                error = (
-                    "app encerrou por crash/ANR sem evidência de segurança no logcat "
-                    "(possível crash da instrumentação)"
-                )
+                if baseline_healthy and logcat.get("crash_origin") != "instrumentation":
+                    # O app sobreviveu sem instrumentação e morreu com ela:
+                    # a instrumentação foi o gatilho. O app bloqueou a
+                    # auditoria — que é o que uma proteção eficaz faz.
+                    death_classification = "rasp_reaction"
+                else:
+                    # Sem baseline que prove que o app é estável sozinho,
+                    # a causa da morte não pode ser atribuída.
+                    death_classification = "instrumentation_crash"
+                    observation_status = "crashed"
+                    error = (
+                        "app encerrou por crash/ANR sem evidência de segurança no logcat "
+                        "(possível crash da instrumentação)"
+                    )
             else:
                 # Sem logcat/baseline disponíveis: mantém o comportamento
                 # conservador de tratar a morte como possível reação.

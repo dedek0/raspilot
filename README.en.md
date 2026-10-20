@@ -159,13 +159,26 @@ Status semantics:
 > high-confidence evidence. Generic logcat terms (`root`, `hook`,
 > `detected`, `checksum`), logs from hooking frameworks installed on the
 > device and the crash of the instrumentation agent itself are context —
-> they never support a verdict. A death with no attributable cause yields
-> inconclusive, not "the app detected it".
+> they never support a verdict.
+>
+> **An app that blocks the audit is a protected app.** When the app
+> survives the baseline (uninstrumented) and terminates once instrumented,
+> the instrumentation is the trigger for the death: the app blocked the
+> audit and the protection is credited as effective. Without a baseline
+> proving the app is stable on its own, the death stays inconclusive
+> (`ERROR`) — the cause cannot be attributed.
+>
+> Attribution uses the **crash backtrace** (logcat `crash` buffer, which
+> needs no root): a fault inside the Frida agent — or in the ART JNI glue
+> it triggers — is a failure of the **instrumentation**, and the verdict
+> is then inconclusive, because the app demonstrated no reaction. A
+> fault in the app's own code is the app reacting.
 >
 > The same applies to the bypass: a bypass that was **installed** but
 > never **exercised** (no observed TLS request, for instance) does not
 > prove that the protection held — the step stays `SKIP`, with the
-> reason in `skip_reason`.
+> reason in `skip_reason`. And a bypass in which the app terminated is
+> **not** a bypass that won: the app blocked the audit.
 
 > **Important:** RASPilot **does not permanently modify** the device.
 > After each run it stops the `frida-server`, removes
@@ -204,8 +217,8 @@ Confidence: `high` (≥2 vectors), `medium` (1), `low` (0).
   Frida paths and `kill_trace`)
 - Correlation with **logcat** and the **uninstrumented baseline**: a death
   becomes detection evidence only with a security signal, a traced kill,
-  or when the app did not die in the baseline; instrumentation crashes
-  become `ERROR`/inconclusive, not `OK`
+  or when the app did not die in the baseline; without a baseline that
+  isolates the cause, the crash stays `ERROR`/inconclusive, not `OK`
 - If observation cannot run (script/attach failure), the result is
   `ERROR`, not `vulnerable=True`
 

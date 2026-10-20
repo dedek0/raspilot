@@ -108,6 +108,93 @@ class TestDeathClassification:
         assert failure["is_rasp"] is False
         assert failure["kind"] in ("instrumentation_crash", "unknown_death")
 
+    def test_crash_after_healthy_baseline_is_a_rasp_reaction(self):
+        """App estável sozinho que morre instrumentado bloqueou a auditoria."""
+        analysis = analyze_logcat(
+            [_line("libc", "Fatal signal 11 (SIGSEGV), code 1 in tid 4242")],
+            PKG, PID,
+        )
+        failure = classify_failure(
+            analysis, {"available": True, "alive_at_end": True}
+        )
+        assert failure["kind"] == "rasp_reaction"
+        assert failure["is_rasp"] is True
+
+    def test_crash_after_dead_baseline_stays_inconclusive(self):
+        """App que já morre no baseline não é reação à instrumentação."""
+        analysis = analyze_logcat(
+            [_line("libc", "Fatal signal 11 (SIGSEGV), code 1 in tid 4242")],
+            PKG, PID,
+        )
+        failure = classify_failure(
+            analysis, {"available": True, "alive_at_end": False}
+        )
+        assert failure["kind"] == "baseline_death"
+        assert failure["is_rasp"] is False
+
+
+class TestCrashOrigin:
+    """A origem da queda distingue a proteção do app da falha da tool."""
+
+    FRAMES_INSTRUMENTATION = [
+        "10-16 10:00:00.000 999 999 F DEBUG   :       #00 pc 00000000002f9b88  "
+        "/apex/com.android.art/lib64/libart.so (art::Monitor::MonitorExit(...)+120)",
+        "10-16 10:00:00.000 999 999 F DEBUG   :       #01 pc 00000000002faf60  "
+        "/apex/com.android.art/lib64/libart.so (artJniUnlockObject+56)",
+        "10-16 10:00:00.000 999 999 F DEBUG   :       #02 pc 00000000002fb484  "
+        "/apex/com.android.art/lib64/libart.so (artQuickGenericJniEndTrampoline+804)",
+    ]
+
+    FRAMES_APP = [
+        "10-16 10:00:00.000 999 999 F DEBUG   :       #00 pc 0000000000012345  "
+        "/data/app/~~abc==/com.app-xyz/lib/arm64/libguard.so (guard_check+32)",
+        "10-16 10:00:00.000 999 999 F DEBUG   :       #01 pc 0000000000012346  "
+        "/data/app/~~abc==/com.app-xyz/lib/arm64/libguard.so (guard_abort+16)",
+    ]
+
+    def _lines(self, frames):
+        header = (
+            "10-16 10:00:00.000 999 999 F DEBUG   : pid: 4242, tid: 4243, "
+            "name: worker  >>> com.app <<<"
+        )
+        return [header] + frames
+
+    def test_artifact_of_the_agent_is_the_instrumentation(self):
+        """Queda dentro do agente do Frida é falha da ferramenta."""
+        analysis = analyze_logcat(self._lines(self.FRAMES_INSTRUMENTATION), PKG, PID)
+        assert analysis["crash_origin"] == "instrumentation"
+
+    def test_crash_in_the_app_code_is_the_app(self):
+        """Queda no código do próprio app é reação do app."""
+        analysis = analyze_logcat(self._lines(self.FRAMES_APP), PKG, PID)
+        assert analysis["crash_origin"] == "app"
+
+    def test_no_backtrace_is_unknown(self):
+        """Sem backtrace não há como atribuir a origem."""
+        analysis = analyze_logcat([_line("libc", "Fatal signal 11")], PKG, PID)
+        assert analysis["crash_origin"] == "unknown"
+
+    def test_instrumentation_crash_is_not_a_rasp_reaction(self):
+        """Queda da instrumentação não credita proteção ao app."""
+        lines = self._lines(self.FRAMES_INSTRUMENTATION) + [
+            _line("libc", "Fatal signal 11 (SIGSEGV), code 1 in tid 4242"),
+        ]
+        analysis = analyze_logcat(lines, PKG, PID)
+        failure = classify_failure(
+            analysis, {"available": True, "alive_at_end": True}
+        )
+        assert failure["kind"] == "instrumentation_crash"
+        assert failure["is_rasp"] is False
+
+    def test_backtrace_frames_are_not_read_as_detection(self):
+        """Citar "frida-agent" no backtrace não é detecção do app."""
+        lines = self._lines([
+            "10-16 10:00:00.000 999 999 F DEBUG   :       #00 pc 0000000000012345  "
+            "/memfd:frida-agent-64.so (deleted) (gum_js_loop+32)",
+        ])
+        analysis = analyze_logcat(lines, PKG, PID)
+        assert analysis["categories"].get("frida") is None
+
 
 class TestHookingVerdict:
     """O veredito de anti-hooking ignora evidência fraca."""
