@@ -154,6 +154,30 @@ class TestDeviceVectors:
         assert res["detected"] is True
         assert "gum-js-loop" in res["evidence"]
 
+    def test_gmain_alone_is_not_frida_evidence(self, fake_dm_factory):
+        """"gmain" é o loop do GLib: qualquer app com GLib tem uma."""
+        dm = fake_dm_factory(
+            {"task/*/comm": "com.example.app\ngmain\nBinder:1_1\n"}
+        )
+        res = AntiFridaCheck(dm).check_frida_threads(1234)
+        assert res["detected"] is False
+        assert res["evidence"] == []
+        assert "gmain" in res["details"]
+
+    def test_gmain_corroborates_a_frida_thread(self, fake_dm_factory):
+        """Com outra thread de assinatura, gmain corrobora."""
+        dm = fake_dm_factory(
+            {"task/*/comm": "com.example.app\ngmain\npool-frida\n"}
+        )
+        res = AntiFridaCheck(dm).check_frida_threads(1234)
+        assert res["detected"] is True
+        assert "gmain" in res["evidence"]
+
+    def test_detection_script_watches_memcmp(self):
+        """App que compara blocos procurando o nome é detectado."""
+        assert "native_memcmp" in DETECTION_SCRIPT
+        assert "bytesContainFrida" in DETECTION_SCRIPT
+
     def test_frida_libraries_detected(self):
         """libfrida-gadget.so no processo é detectada via session."""
         check = AntiFridaCheck(mock.MagicMock())

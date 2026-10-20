@@ -248,6 +248,41 @@ function matchesHookFramework(str) {
     return false;
 }
 
+// Um byte é fronteira de token quando não é alfanumérico.
+function isTokenByte(c) {
+    if (c === 0) { return true; }
+    var lower = (c >= 65 && c <= 90) ? (c + 32) : c;
+    return !((lower >= 97 && lower <= 122) || (lower >= 48 && lower <= 57));
+}
+
+// Procura os tokens de framework direto nos bytes do buffer, sem
+// materializar a string: em função muito chamada, montar a string
+// caractere a caractere é o que trava o app.
+function bytesContainHook(buffer) {
+    if (buffer === null || buffer === undefined) { return false; }
+    var bytes = new Uint8Array(buffer);
+    var lower = [];
+    for (var i = 0; i < bytes.length; i++) {
+        var c = bytes[i];
+        lower[i] = (c >= 65 && c <= 90) ? (c + 32) : c;
+    }
+    for (var k = 0; k < HOOK_KEYWORDS.length; k++) {
+        var needle = HOOK_KEYWORDS[k];
+        var limit = lower.length - needle.length;
+        for (var p = 0; p <= limit; p++) {
+            var match = true;
+            for (var j = 0; j < needle.length; j++) {
+                if (lower[p + j] !== needle.charCodeAt(j)) { match = false; break; }
+            }
+            if (!match) { continue; }
+            var before = p === 0 ? 0 : lower[p - 1];
+            var after = (p + needle.length < lower.length) ? lower[p + needle.length] : 0;
+            if (isTokenByte(before) && isTokenByte(after)) { return true; }
+        }
+    }
+    return false;
+}
+
 // /proc/<pid>/maps, /proc/<pid>/status, /proc/net/tcp (port-scan das
 // portas Frida) e .../comm (nomes de threads). Retorna o nome do método
 // fraco ou null.
@@ -303,6 +338,10 @@ if (!RASPILOT_JAVA_ONLY) {
 
 // memcmp — varre o buffer pelas mesmas strings (comparações por tamanho,
 // típicas de checagens anti-hook sem string literal no binário).
+//
+// A busca é feita sobre os bytes: montar a string caractere a caractere
+// trava o app em função muito chamada, e é o que o gancho de memcmp
+// precisa evitar.
 try {
     var memcmpAddr = raspilotFindExport('libc.so', 'memcmp');
     if (memcmpAddr !== null) {
@@ -310,14 +349,9 @@ try {
             onEnter: function (args) {
                 try {
                     var n = args[2].toInt32();
-                    if (n > 0 && n < 4096) {
-                        var bytes = new Uint8Array(args[0].readByteArray(n));
-                        var s = '';
-                        for (var i = 0; i < bytes.length; i++) {
-                            var c = bytes[i];
-                            s += (c >= 32 && c < 127) ? String.fromCharCode(c) : ' ';
-                        }
-                        if (matchesHookFramework(s)) {
+                    if (n > 0 && n <= 64) {
+                        if (bytesContainHook(args[0].readByteArray(n)) ||
+                                bytesContainHook(args[1].readByteArray(n))) {
                             report('native_memcmp', 'buffer contém string de framework');
                         }
                     }

@@ -115,19 +115,26 @@ def test_combined_observation_mode_detect_does_not_neutralize():
     assert _count(session, "auto-destruição neutralizada") == 0
 
 
-def test_combined_observation_neutralizes_self_termination_in_bypass_mode():
-    """Fora do modo detect, a auto-destruição do app é neutralizada."""
-    dm = mock.MagicMock()
-    dm.is_app_alive.return_value = True
-    dm.logcat_since.return_value = []
-    dm.baseline = None
-    session = _Session()
-    with mock.patch("checks.combined.OBSERVATION_POLL_INTERVAL", 0.0):
-        run_combined_observation(
-            dm, session, 42, "com.example.app", 1, 0,
-            on_resume=lambda: None, mode="bypass",
-        )
-    assert _count(session, "auto-destruição neutralizada") == 1
+def test_combined_observation_never_loads_the_evasion():
+    """Observar a detecção exige que a reação do app possa acontecer.
+
+    Com a evasão anti-Frida ativa, o app não enxerga os artefatos de
+    instrumentação e a observação não observa nada — o check mediria a
+    stealth da ferramenta, e não a proteção do app. A evasão pertence à
+    etapa de bypass.
+    """
+    for mode in ("detect", "bypass", "stealth"):
+        dm = mock.MagicMock()
+        dm.is_app_alive.return_value = True
+        dm.logcat_since.return_value = []
+        dm.baseline = None
+        session = _Session()
+        with mock.patch("checks.combined.OBSERVATION_POLL_INTERVAL", 0.0):
+            run_combined_observation(
+                dm, session, 42, "com.example.app", 1, 0,
+                on_resume=lambda: None, mode=mode,
+            )
+        assert _count(session, "auto-destruição neutralizada") == 0, mode
 
 
 def test_combined_bypass_reuses_one_spawn():

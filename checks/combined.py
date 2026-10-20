@@ -510,31 +510,26 @@ def run_combined_observation(
             logger.debug("Erro no script combinado: %s", message.get("description"))
 
     try:
-        if mode == "stealth":
-            stealth_loaded = load_stealth(
-                session,
-                on_message=on_message,
-                replacements=_replacements(
-                    dm, java_only=False, package_name=package_name
-                ),
-                include_proc_filter=True,
-            )
-        else:
-            # A camada nativa de evasão é carregada também fora do modo
-            # stealth: sem ela, o app aborta logo após o resume e a
-            # janela de observação termina sem produzir sinal algum.
-            #
-            # No modo ``detect`` a evasão fica desligada de propósito:
-            # observar a reação do app exige que a reação aconteça.
-            stealth_loaded = load_stealth(
-                session,
-                on_message=on_message,
-                replacements=_replacements(
-                    dm, java_only=False, package_name=package_name
-                ),
-                include_proc_filter=mode != "detect",
-                load_native_frida=mode != "detect",
-            )
+        # A observação **nunca** carrega a camada de evasão anti-Frida.
+        #
+        # Medir a capacidade de detecção do app exige que a reação
+        # possa acontecer: com a evasão ativa, o app não enxerga os
+        # artefatos de instrumentação e a observação não observa nada.
+        # A evasão pertence à etapa de bypass, onde a pergunta é outra:
+        # "dá para sobreviver à instrumentação?".
+        #
+        # O abort do app não é perda de sinal — é o sinal: um app que
+        # morre ao ser instrumentado bloqueou a auditoria, e isso é
+        # creditado como proteção eficaz.
+        stealth_loaded = load_stealth(
+            session,
+            on_message=on_message,
+            replacements=_replacements(
+                dm, java_only=False, package_name=package_name
+            ),
+            include_proc_filter=False,
+            load_native_frida=False,
+        )
 
         native_source = _replacements(
                     dm, java_only=False, package_name=package_name

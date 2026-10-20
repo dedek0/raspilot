@@ -55,7 +55,12 @@ KILL_TRACE_SCRIPT = os.path.join(
 )
 
 # Nomes de threads típicas do Frida/GumJS.
-FRIDA_THREAD_NAMES = ("gum-js-loop", "gmain", "pool-frida", "frida-agent")
+FRIDA_THREAD_NAMES = ("gum-js-loop", "pool-frida", "frida-agent")
+
+# "gmain" é o loop principal do GLib: qualquer app que use uma
+# biblioteca GLib tem uma thread com esse nome. Só vale como
+# corroboração quando há outra thread de assinatura Frida no processo.
+FRIDA_THREAD_WEAK_NAMES = ("gmain",)
 
 # Strings que um app anti-frida costuma procurar.
 FRIDA_KEYWORDS = ("frida", "gum-js-loop", "gadget", "libfrida")
@@ -154,6 +159,43 @@ function looksLikeFrida(str) {
     } catch (e) { return false; }
 }
 
+// Um byte é fronteira de token quando não é alfanumérico.
+function isTokenByte(c) {
+    if (c === 0) { return true; }
+    var lower = (c >= 65 && c <= 90) ? (c + 32) : c;
+    return !((lower >= 97 && lower <= 122) || (lower >= 48 && lower <= 57));
+}
+
+// Procura os tokens de instrumentação direto nos bytes do buffer.
+//
+// Montar a string caractere a caractere trava o app em função muito
+// chamada: o custo quadrático da concatenação é o problema, e é
+// exatamente o que o gancho de memcmp evita.
+function bytesContainFrida(buffer) {
+    if (buffer === null || buffer === undefined) { return false; }
+    var bytes = new Uint8Array(buffer);
+    var lower = [];
+    for (var i = 0; i < bytes.length; i++) {
+        var c = bytes[i];
+        lower[i] = (c >= 65 && c <= 90) ? (c + 32) : c;
+    }
+    for (var k = 0; k < FRIDA_TOKENS.length; k++) {
+        var needle = FRIDA_TOKENS[k];
+        var limit = lower.length - needle.length;
+        for (var p = 0; p <= limit; p++) {
+            var match = true;
+            for (var j = 0; j < needle.length; j++) {
+                if (lower[p + j] !== needle.charCodeAt(j)) { match = false; break; }
+            }
+            if (!match) { continue; }
+            var before = p === 0 ? 0 : lower[p - 1];
+            var after = (p + needle.length < lower.length) ? lower[p + needle.length] : 0;
+            if (isTokenByte(before) && isTokenByte(after)) { return true; }
+        }
+    }
+    return false;
+}
+
 // Native: strstr/strcmp em libc buscando 'frida' (técnica clássica).
 if (!RASPILOT_JAVA_ONLY) {
 ['strstr', 'strcmp'].forEach(function (name) {
@@ -244,6 +286,33 @@ try {
         });
     } catch (e) { reportHookError('instalação de ' + name + ' falhou: ' + e); }
 });
+
+// Native: memcmp — o app compara blocos de memória procurando o nome
+// de um artefato de instrumentação. É uma técnica comum justamente
+// por não deixar string literal no binário.
+//
+// O limite de tamanho mantém o custo baixo: comparação de blocos
+// inteiros é o caso comum, e não é neles que mora o nome de um
+// artefato.
+try {
+    var memcmpAddr = raspilotFindExport('libc.so', 'memcmp');
+    if (memcmpAddr !== null) {
+        Interceptor.attach(memcmpAddr, {
+            onEnter: function (args) {
+                try {
+                    var n = args[2].toInt32();
+                    if (n > 0 && n <= 64) {
+                        if (bytesContainFrida(args[0].readByteArray(n)) ||
+                                bytesContainFrida(args[1].readByteArray(n))) {
+                            reportDetection('native_memcmp',
+                                'buffer contém nome de artefato de instrumentação');
+                        }
+                    }
+                } catch (e) { /* best-effort */ }
+            }
+        });
+    }
+} catch (e) { reportHookError('instalação de memcmp falhou: ' + e); }
 }
 
 function installJavaHooks() {
@@ -549,7 +618,12 @@ class AntiFridaCheck:
         """Compara nomes de threads do processo com assinaturas Frida.
 
         Lê ``/proc/<pid>/task/*/comm`` no dispositivo e procura por
-        ``gum-js-loop``, ``gmain``, ``pool-frida`` e ``frida-agent``.
+        ``gum-js-loop``, ``pool-frida`` e ``frida-agent``.
+
+        ``gmain`` é o loop do GLib e aparece em qualquer app que use
+        uma biblioteca GLib — sozinho, ele não é evidência de nada, e
+        por isso só corrobora quando outra thread de assinatura Frida
+        está presente.
 
         Returns:
             Dict com ``detected``, ``evidence`` e ``details``.
@@ -568,19 +642,30 @@ class AntiFridaCheck:
                 "error": res["stderr"] or f"rc={res['rc']}",
             }
 
-        evidence = [
-            line.strip()
+        names = [
+            line.strip().lower()
             for line in res["stdout"].splitlines()
-            if any(t in line.lower() for t in FRIDA_THREAD_NAMES)
+            if line.strip()
         ]
-        detected = bool(evidence)
+        specific = [n for n in names if any(t in n for t in FRIDA_THREAD_NAMES)]
+        weak = [n for n in names if any(t in n for t in FRIDA_THREAD_WEAK_NAMES)]
+        detected = bool(specific)
+        evidence = list(specific)
+        if detected:
+            evidence.extend(weak)
+        if detected:
+            details = f"Threads Frida no processo: {evidence}"
+        elif weak:
+            details = (
+                "Nenhuma thread Frida conhecida no processo "
+                f"(thread genérica: {weak})"
+            )
+        else:
+            details = "Nenhuma thread Frida conhecida no processo"
         result = {
             "detected": detected,
             "evidence": evidence,
-            "details": (
-                f"Threads Frida no processo: {evidence}" if detected
-                else "Nenhuma thread Frida conhecida no processo"
-            ),
+            "details": details,
         }
         logger.debug("check_frida_threads: detected=%s", detected)
         return result
