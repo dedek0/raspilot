@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import main as mainmod
@@ -55,6 +57,26 @@ class TestParseArgs:
             "anti_hooking", "ssl_pinning",
         }
 
+    def test_avd_flags_are_optional(self):
+        """O suporte ao AVD é opcional: nada é ativado por padrão."""
+        args = mainmod.parse_args(["--package", "com.example.app"])
+        assert args.avd is False
+        assert args.avd_check is False
+        assert args.avd_config is None
+        assert args.avd_name is None
+
+    def test_avd_flags_are_accepted(self, tmp_path):
+        """As flags do ambiente emulado são aceitas."""
+        args = mainmod.parse_args([
+            "--package", "com.example.app",
+            "--avd",
+            "--avd-config", str(tmp_path / "avd.json"),
+            "--avd-name", "meu_avd",
+        ])
+        assert args.avd is True
+        assert args.avd_config.endswith("avd.json")
+        assert args.avd_name == "meu_avd"
+
 
 class TestBanner:
     """Banner de marca."""
@@ -64,3 +86,33 @@ class TestBanner:
         mainmod.print_banner()
         captured = capsys.readouterr()
         assert "RASPilot" in captured.out
+
+
+class TestAvdCheck:
+    """Validação do ambiente emulado pela CLI."""
+
+    def test_missing_config_returns_error(self, tmp_path, capsys):
+        """Sem configuração, --avd-check explica o que fazer."""
+        rc = mainmod.main([
+            "--package", "com.example.app",
+            "--avd-check",
+            "--avd-config", str(tmp_path / "nao-existe.json"),
+        ])
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "avdmanager" in out
+
+    def test_config_without_environment_reports_problems(self, tmp_path, capsys):
+        """Configuração que aponta para um SDK inexistente é apontada."""
+        config = tmp_path / "avd.json"
+        config.write_text(
+            json.dumps({"sdk_root": str(tmp_path / "sdk"), "avd_name": "avd"}),
+            encoding="utf-8",
+        )
+        rc = mainmod.main([
+            "--package", "com.example.app",
+            "--avd-check",
+            "--avd-config", str(config),
+        ])
+        assert rc == 1
+        assert "emulator" in capsys.readouterr().out

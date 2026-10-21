@@ -26,6 +26,7 @@ from typing import Callable, List, Optional
 from rich.console import Console
 from rich.table import Table
 
+from avd_manager import AvdConfig, AvdConfigError, AvdError, AvdManager
 from checks.anti_emulator import AntiEmulatorCheck
 from checks.anti_frida import AntiFridaCheck
 from checks.anti_hooking import AntiHookingCheck
@@ -163,6 +164,38 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("qjs", "v8"),
         default="qjs",
         help="Runtime JavaScript usado pelo Frida para os scripts",
+    )
+    parser.add_argument(
+        "--avd",
+        action="store_true",
+        help=(
+            "Audita contra o AVD configurado em vez do device físico: "
+            "sobe o emulador, espera o boot e o encerra no final. "
+            "Requer a configuração do ambiente (veja --avd-config)"
+        ),
+    )
+    parser.add_argument(
+        "--avd-config",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Arquivo JSON com a configuração do ambiente emulado "
+            "(default: ~/.raspilot/avd.json ou $RASPILOT_AVD_CONFIG)"
+        ),
+    )
+    parser.add_argument(
+        "--avd-name",
+        default=None,
+        metavar="NOME",
+        help="Nome do AVD a usar, sobrescrevendo a configuração",
+    )
+    parser.add_argument(
+        "--avd-check",
+        action="store_true",
+        help=(
+            "Valida o ambiente emulado e mostra o que falta (sem rodar "
+            "a auditoria)"
+        ),
     )
     parser.add_argument(
         "--version",
@@ -341,6 +374,11 @@ def _build_run_context(args: argparse.Namespace, dm: "DeviceManager") -> dict:
             "skip": list(args.skip or []),
             "device_id": args.device_id,
             "wifi": args.wifi,
+            "avd": {
+                "enabled": bool(getattr(args, "avd", False)),
+                "config_path": getattr(args, "avd_config", None),
+                "avd_name": getattr(args, "avd_name", None),
+            },
         },
         "frida_client_version": frida_version,
         "frida_port": getattr(dm, "frida_port", None),
@@ -350,6 +388,80 @@ def _build_run_context(args: argparse.Namespace, dm: "DeviceManager") -> dict:
             "available": bool(getattr(dm, "_logcat_available", False)),
         },
     }
+
+
+def _load_avd_config(args: argparse.Namespace) -> AvdConfig:
+    """Carrega a configuração do ambiente emulado.
+
+    Args:
+        args: Argumentos já parseados.
+
+    Returns:
+        Configuração carregada (com ``--avd-name`` aplicado).
+
+    Raises:
+        AvdConfigError: se a configuração estiver ausente ou inválida.
+    """
+    config = AvdConfig.load(args.avd_config)
+    if args.avd_name:
+        config.avd_name = args.avd_name
+    return config
+
+
+def run_avd_check(args: argparse.Namespace) -> int:
+    """Valida o ambiente emulado e mostra o que falta.
+
+    Não roda a auditoria: serve para confirmar que o AVD está pronto
+    antes de gastar tempo com uma execução completa.
+
+    Args:
+        args: Argumentos já parseados.
+
+    Returns:
+        0 quando o ambiente está pronto, 1 caso contrário.
+    """
+    try:
+        config = _load_avd_config(args)
+    except AvdConfigError as exc:
+        console.print(f"[bold red]✗[/] {exc}")
+        return 1
+
+    manager = AvdManager(config)
+    env = manager.check()
+    for key, value in env.details.items():
+        console.print(f"    [dim]{key}:[/] {value}")
+    if env.ok:
+        console.print("[green]✓[/] Ambiente emulado pronto")
+        return 0
+
+    for problem in env.problems:
+        console.print(f"[yellow]![/] {problem}")
+    for hint in env.hints:
+        console.print(f"    [dim]{hint}[/]")
+    console.print(AvdConfig.setup_instructions(args.avd_config))
+    return 1
+
+
+def _activate_avd(args: argparse.Namespace) -> Optional[AvdManager]:
+    """Ativa o ambiente emulado configurado.
+
+    Sobe o AVD, espera o boot completo e devolve o gerenciador (que
+    encerra o emulador no final da auditoria).
+
+    Args:
+        args: Argumentos já parseados.
+
+    Returns:
+        Gerenciador do AVD, ou None se ``--avd`` não foi informado.
+    """
+    if not args.avd:
+        return None
+    config = _load_avd_config(args)
+    manager = AvdManager(config)
+    with console.status(f"[cyan]Iniciando AVD {config.avd_name}...[/]"):
+        serial = manager.start()
+    console.print(f"[green]✓[/] AVD online: {serial}")
+    return manager
 
 
 def run_pipeline(args: argparse.Namespace) -> int:
@@ -364,6 +476,9 @@ def run_pipeline(args: argparse.Namespace) -> int:
     app enxergar um emulador, o que contaminaria a observação dos demais
     checks.
 
+    Com ``--avd``, o alvo é o emulador configurado em vez do device
+    físico: ele é iniciado antes da conexão ADB e encerrado no cleanup.
+
     Args:
         args: Argumentos já parseados.
 
@@ -373,14 +488,32 @@ def run_pipeline(args: argparse.Namespace) -> int:
     """
     logger = logging.getLogger("raspilot")
 
+    # 0) Ambiente emulado (opcional): o alvo passa a ser o AVD.
+    avd_manager = None
+    try:
+        avd_manager = _activate_avd(args)
+        if avd_manager is not None:
+            args.device_id = avd_manager.serial
+    except Exception:
+        if avd_manager is not None:
+            avd_manager.stop()
+        raise
+
     # 1) Conexão ADB (USB ou Wi-Fi).
     logger.info("Conectando ao dispositivo...")
-    dm = DeviceManager(
-        device_id=args.device_id,
-        wifi_target=args.wifi,
-        verbose=args.verbose,
-    )
-    dm.connect_adb()
+    try:
+        dm = DeviceManager(
+            device_id=args.device_id,
+            wifi_target=args.wifi,
+            verbose=args.verbose,
+        )
+        dm.connect_adb()
+    except Exception:
+        # O emulador subiu antes da conexão: sem este cuidado ele
+        # ficaria rodando sem ninguém para encerrá-lo.
+        if avd_manager is not None:
+            avd_manager.stop()
+        raise
 
     info = dm.get_device_info()
     console.print("[green]✓[/] Dispositivo conectado:")
@@ -570,6 +703,13 @@ def run_pipeline(args: argparse.Namespace) -> int:
             dm.run_shell(f"am force-stop {args.package}", timeout=10)
         except Exception:
             logger.warning("Falha no cleanup final do dispositivo", exc_info=True)
+        if avd_manager is not None:
+            # O emulador que esta execução subiu é encerrado aqui; um
+            # AVD que já estava rodando antes é preservado.
+            try:
+                avd_manager.stop()
+            except Exception:
+                logger.warning("Falha ao encerrar o AVD", exc_info=True)
 
     # 14) Relatórios.
     json_path, html_path = reporter.save()
@@ -607,9 +747,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.debug("Não foi possível instalar handler de SIGTERM", exc_info=True)
 
     try:
+        if args.avd_check:
+            return run_avd_check(args)
         return run_pipeline(args)
     except (DeviceConnectionError, FridaSetupError) as exc:
         console.print(f"[bold red]✗ Erro:[/] {exc}")
+        logger.debug("Detalhes do erro:", exc_info=True)
+        return 1
+    except (AvdConfigError, AvdError) as exc:
+        console.print(f"[bold red]✗ Ambiente emulado:[/] {exc}")
         logger.debug("Detalhes do erro:", exc_info=True)
         return 1
     except KeyboardInterrupt:

@@ -128,6 +128,10 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--js-runtime RUNTIME` | no | Frida JavaScript runtime: `qjs` (default) or `v8` |
 | `--verbose` | no | DEBUG-level logging |
 | `--skip CHECK...` | no | Checks to skip (`anti_root`, `anti_frida`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
+| `--avd` | no | Audit against the configured AVD instead of the physical device (boots the emulator, waits for boot and shuts it down afterwards) |
+| `--avd-config PATH` | no | JSON configuration of the emulated environment (default `~/.raspilot/avd.json` or `$RASPILOT_AVD_CONFIG`) |
+| `--avd-name NAME` | no | AVD name, overriding the configuration |
+| `--avd-check` | no | Validate the emulated environment and show what is missing (no audit) |
 
 ### Output
 
@@ -318,11 +322,112 @@ bypass won.
 
 ---
 
+## Emulated environment (AVD) — optional
+
+Everything in this section is **optional**: without the `--avd` flag
+RASPilot behaves exactly as before and **does not depend on the Android
+SDK**.
+
+### Why
+
+The anti-emulator check measures the bypass in two ways: the *probe* makes
+the app see an emulator and the *mask* hides the decisive artifacts. On a
+physical device that is a simulation — the emulator is only what the app
+perceives.
+
+On a **real AVD** the artifacts actually exist: the app receives the
+values of a physical device while the machine is an emulator. That is the
+ground truth of the bypass — and the only way to properly measure an app
+that blocks instrumentation (anti-Frida), because emulator protection is
+evaluated before hook protection.
+
+### Environment setup
+
+**1. Install the Android SDK** (cmdline-tools) and export the root:
+
+```bash
+export ANDROID_SDK_ROOT="$HOME/Android/Sdk"
+export PATH="$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator:$PATH"
+```
+
+**2. Download the system image and create the AVD:**
+
+```bash
+sdkmanager "system-images;android-33;google_apis;x86_64"
+echo no | avdmanager create avd --name raspilot_avd \
+    --package "system-images;android-33;google_apis;x86_64" \
+    --device "pixel_6"
+```
+
+**3. Describe the environment** in `~/.raspilot/avd.json` (or point
+elsewhere with `--avd-config` / `$RASPILOT_AVD_CONFIG`):
+
+```json
+{
+  "sdk_root": "/home/user/Android/Sdk",
+  "avd_name": "raspilot_avd",
+  "system_image": "system-images;android-33;google_apis;x86_64",
+  "device_profile": "pixel_6",
+  "port": 5554,
+  "headless": true,
+  "wipe_data": false,
+  "boot_timeout": 300,
+  "extra_args": ["-no-snapshot-save", "-gpu", "swiftshader_indirect"]
+}
+```
+
+| Key | Default | Purpose |
+|---|---|---|
+| `sdk_root` | (`$ANDROID_SDK_ROOT`) | Android SDK root |
+| `avd_name` | — (required) | AVD to launch |
+| `system_image` | `system-images;android-33;google_apis;x86_64` | system image (instructions only) |
+| `device_profile` | `pixel_6` | hardware profile (instructions only) |
+| `port` | `5554` | emulator console/adb port |
+| `headless` | `true` | launch without window and audio |
+| `wipe_data` | `false` | restart the AVD with clean data |
+| `boot_timeout` | `300` | maximum wait for boot (s) |
+| `extra_args` | `[]` | extra `emulator` arguments |
+
+**4. Validate and run:**
+
+```bash
+# shows what is missing, without auditing
+python main.py --package com.example.app --avd-check
+
+# boots the AVD, audits inside it and shuts the emulator down afterwards
+python main.py --package com.example.app --avd
+```
+
+`--avd` boots the emulator (or reuses one that is already running), waits
+for `sys.boot_completed`, hands the serial (`emulator-5554`) to the
+`DeviceManager` and shuts down **only** the emulator it started itself.
+
+| Flag | Effect |
+|---|---|
+| `--avd` | audit against the configured AVD |
+| `--avd-config PATH` | configuration file (default `~/.raspilot/avd.json`) |
+| `--avd-name NAME` | override `avd_name` from the configuration |
+| `--avd-check` | validate the environment and show what is missing |
+
+> **Limitations.** An AVD does not reproduce hardware-backed protections
+> (TEE, attested provisioning, hardware keystore) nor the profile of a
+> real handset. An AVD run complements the audit on a physical device — it
+> does not replace it. The `frida-server` is downloaded for the emulator
+> ABI (`x86_64`), and apps that require Play Integrity may not install.
+
+> **Root in the emulator.** `google_apis` images are `userdebug`: the
+> `adb` shell is already root, which is what lets the `frida-server`
+> spawn apps that are not debuggable. Plain `default`/`aosp` images
+> without root limit the audit to debuggable apps.
+
+---
+
 ## Repository structure
 
 ```
 raspilot/
 ├── main.py                     # CLI + auditing pipeline
+├── avd_manager.py              # Optional emulated environment (AVD)
 ├── device_manager.py           # ADB (USB/Wi-Fi) + frida-server + logcat/baseline
 ├── logcat_analyzer.py          # Death/security/TLS logcat correlation
 ├── reporter.py                 # JSON/HTML reports (Jinja2)
