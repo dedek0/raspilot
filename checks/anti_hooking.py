@@ -37,6 +37,7 @@ from checks.stealth import PROC_FILTER_SCRIPT, load_stealth, unload_stealth
 from rasp_vendors import VENDORS
 from logcat_analyzer import (
     HIGH_CONFIDENCE_CATEGORIES,
+    analyze_logcat,
     analyze_since,
     classify_failure,
     format_detection_signals,
@@ -50,6 +51,7 @@ from script_loader import (
     safe_detach,
     safe_unload,
 )
+from instrumentation import ModuleConfig, XposedManager
 
 if TYPE_CHECKING:  # evita import circular em tempo de importação
     from device_manager import DeviceManager
@@ -561,7 +563,12 @@ class AntiHookingCheck:
     """Verifica proteção anti-hooking do app e tenta contorná-la."""
 
     def __init__(
-        self, dm: "DeviceManager", mode: str = "bypass", no_java: bool = False
+        self,
+        dm: "DeviceManager",
+        mode: str = "bypass",
+        no_java: bool = False,
+        method: str = "auto",
+        xposed: Optional["XposedManager"] = None,
     ) -> None:
         """Inicializa o check com o gerenciador de dispositivo.
 
@@ -569,10 +576,15 @@ class AntiHookingCheck:
             dm: Instância conectada de ``DeviceManager``.
             mode: ``detect``, ``bypass`` ou ``stealth``.
             no_java: Se True, não tenta carregar hooks Java.
+            method: Método do bypass: ``frida``, ``module`` ou ``auto``.
+            xposed: Gerenciador do módulo de instrumentação (opcional).
         """
         self.dm = dm
         self.mode = mode
         self.no_java = no_java
+        self.method = method or "auto"
+        self.xposed = xposed
+        self._module_observation: Optional[dict] = None
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1538,6 +1550,224 @@ class AntiHookingCheck:
         return result
 
     # ------------------------------------------------------------------
+    # Bypass via módulo do dispositivo
+    # ------------------------------------------------------------------
+    def module_available(self) -> bool:
+        """Informa se o bypass via módulo pode ser usado.
+
+        Returns:
+            True quando há framework de hooking no dispositivo e o
+            método escolhido permite o uso do módulo.
+        """
+        if self.method == "frida":
+            return False
+        if self.xposed is None:
+            return False
+        framework = self.xposed.detect()
+        return bool(framework.get("available"))
+
+    def observe_with_module(self, package_name: str, window: int = 12) -> dict:
+        """Observa as checagens anti-hook do app com o módulo.
+
+        A observação acontece sem instrumentação externa: o app roda
+        com o framework de hooking do dispositivo presente e as
+        consultas que ele faz às camadas Java são registradas pelo
+        módulo. Isso cobre o caso em que a instrumentação externa é
+        derrubada pelo RASP antes de as checagens aparecerem.
+
+        Returns:
+            Dict com ``detection_methods_found``, ``app_alive_at_end``,
+            ``module_ready`` e ``error``.
+        """
+        manager = self.xposed
+        if manager is None:
+            return {"observed": False, "detection_methods_found": [], "error": "módulo indisponível"}
+        if self._module_observation is not None:
+            return self._module_observation
+
+        config = ModuleConfig(
+            hook="observe",
+            emulator="off",
+            target=package_name,
+            label="hook-observe",
+        )
+        phase = manager.run_phase(config, window=window)
+        run = phase.get("run") or {}
+        observed = [
+            f"{item['method']}: {item['detail']}".strip(": ")
+            for item in run.get("observed", [])
+        ]
+        result = {
+            "observed": True,
+            "detection_methods_found": observed,
+            "app_alive_at_end": run.get("app_alive_at_end"),
+            "module_ready": bool(run.get("module_ready")),
+            "effective_config": run.get("effective_config", {}),
+            "error": phase.get("error") or run.get("error"),
+        }
+        self._module_observation = result
+        return result
+
+    def attempt_module_bypass(self, package_name: str, window: int = 12) -> dict:
+        """Contorna as checagens anti-hook com o módulo do dispositivo.
+
+        Em vez de injetar um agente no processo, o módulo é instalado no
+        dispositivo e limitado ao pacote alvo: o app é executado com o
+        framework de hooking do próprio sistema — exatamente o ambiente
+        que a proteção anti-hook procura detectar.
+
+        Duas fases são executadas:
+
+        1. **Observação**: com o módulo em modo de observação, o app
+           consulta os artefatos de framework e o módulo registra quais
+           consultas foram feitas.
+        2. **Bypass**: com o módulo neutralizando as consultas, o app
+           precisa continuar vivo.
+
+        Returns:
+            Dict no formato de :meth:`attempt_bypass`, acrescido de
+            ``method``, ``observed_checks``, ``neutralized``,
+            ``framework_artifacts`` e ``phases``.
+        """
+        manager = self.xposed
+        if manager is None:
+            return {
+                "success": False,
+                "blocked": False,
+                "bypass_logs": [],
+                "effective_logs": [],
+                "app_alive_at_end": None,
+                "error": "gerenciador do módulo indisponível",
+                "method": "module",
+            }
+
+        logs: List[str] = []
+        evidence: List[str] = []
+        phases: List[dict] = []
+
+        # Fase 1 — observação: quais checagens o app executa.
+        observation = self.observe_with_module(package_name, window=window)
+        observed: List[str] = list(observation.get("detection_methods_found") or [])
+        logs.extend(f"[observe] {item}" for item in observed)
+        if observation.get("module_ready") is False:
+            logs.append("[observe] módulo não carregado no processo alvo")
+
+        # Fase 2 — bypass: as consultas são neutralizadas.
+        bypass_config = ModuleConfig(
+            hook="bypass",
+            emulator="off",
+            target=package_name,
+            label="hook-bypass",
+        )
+        phase = manager.run_phase(bypass_config, window=window)
+        phases.append({"phase": "bypass", "ok": phase.get("ok"),
+                       "error": phase.get("error")})
+
+        if not phase.get("ok") and not phase.get("run"):
+            return {
+                "success": False,
+                "blocked": False,
+                "bypass_logs": logs,
+                "effective_logs": [],
+                "app_alive_at_end": None,
+                "error": phase.get("error") or "fase de bypass do módulo falhou",
+                "method": "module",
+                "observed_checks": observed,
+                "neutralized": [],
+                "framework_artifacts": [],
+                "phases": phases,
+                "steps": phase.get("steps", []),
+            }
+
+        run = phase.get("run") or {}
+        neutralized = run.get("neutralized", [])
+        evidence.extend(
+            f"neutralizado: {item['method']} -> {item['detail']}"
+            for item in neutralized
+        )
+        logs.extend(f"[bypass] {item['method']} {item['detail']}".strip()
+                    for item in neutralized)
+
+        alive = bool(run.get("app_alive_at_end"))
+        pid = run.get("pid")
+        artifacts = manager.framework_artifacts(pid)
+        conflicts = manager.scoped_modules_for(package_name)
+        if conflicts:
+            names = ", ".join(str(item.get("package")) for item in conflicts)
+            logs.append(
+                f"[bypass] outros módulos ativos no escopo do alvo: {names}"
+            )
+
+        death_cause = None
+        death_classification = None
+        logcat = analyze_logcat(run.get("lines", []), package=package_name, pid=pid)
+        if not alive:
+            try:
+                death_cause = self.dm.capture_death_cause(pid=pid, package=package_name)
+            except Exception:
+                logger.debug("Falha ao capturar causa da morte", exc_info=True)
+            failure = classify_failure(logcat, self._baseline())
+            death_classification = str(failure.get("kind", "unknown"))
+            is_rasp = bool(failure.get("is_rasp"))
+        else:
+            is_rasp = False
+
+        success = False
+        blocked = False
+        error: Optional[str] = None
+        if alive:
+            # O app continuou vivo com o framework de hooking presente: a
+            # proteção não interrompeu a auditoria.
+            success = True
+            if not neutralized:
+                logs.append(
+                    "[bypass] nenhuma checagem anti-hook foi neutralizada em Java"
+                )
+        elif is_rasp:
+            blocked = True
+            error = (
+                "o app bloqueou o bypass: encerrou com o framework de hooking "
+                "ativo (reação do RASP)"
+            )
+        else:
+            error = (
+                "o app encerrou durante o bypass com o módulo "
+                f"({death_classification})"
+            )
+
+        if run.get("error"):
+            error = error or str(run["error"])
+
+        result = {
+            "success": success,
+            "blocked": blocked,
+            "bypass_logs": logs,
+            "effective_logs": evidence,
+            "app_alive_at_end": alive,
+            "death_cause": death_cause,
+            "death_classification": death_classification,
+            "observed_checks": observed,
+            "neutralized": [
+                f"{item['method']}: {item['detail']}" for item in neutralized
+            ],
+            "framework_artifacts": artifacts,
+            "other_modules_in_scope": conflicts,
+            "module_ready": bool(run.get("module_ready")),
+            "effective_config": run.get("effective_config", {}),
+            "logcat": logcat,
+            "logcat_evidence": format_evidence(logcat),
+            "error": error,
+            "method": "module",
+            "phases": phases,
+            "steps": phase.get("steps", []),
+        }
+        logger.info(
+            "Bypass anti-hook (módulo): success=%s neutralizados=%s alive=%s",
+            success, len(neutralized), alive,
+        )
+        return result
+
+    # ------------------------------------------------------------------
     # Consolidação
     # ------------------------------------------------------------------
     def run_all(
@@ -1641,6 +1871,27 @@ class AntiHookingCheck:
             app_detection.get("detected")
         )
 
+        # Observação adicional via módulo: as checagens em Java do app
+        # continuam observáveis quando a instrumentação externa é
+        # derrubada pelo RASP antes de as checagens aparecerem.
+        module_detection: Optional[dict] = None
+        if not protection_detected and self.module_available():
+            module_detection = self.observe_with_module(package_name, window=window)
+            module_signals = module_detection.get("detection_methods_found") or []
+            if module_signals:
+                protection_detected = True
+                app_detection = dict(app_detection or {})
+                app_detection["detected"] = True
+                app_detection.setdefault("strong_signals", [])
+                app_detection["strong_signals"] = list(
+                    app_detection["strong_signals"]
+                ) + [f"module_observe: {item}" for item in module_signals]
+                app_detection["module_detection"] = module_detection
+                logger.info(
+                    "Anti-Hooking: módulo observou %d checagens anti-hook",
+                    len(module_signals),
+                )
+
         phase_errors: List[str] = []
         if app_detection.get("error") and not protection_detected:
             # Sem sinal estático e sem observação: não dá para afirmar
@@ -1650,6 +1901,7 @@ class AntiHookingCheck:
         bypass_details: Optional[dict] = None
         bypass_successful: Optional[bool] = None
         bypass_skipped_reason: Optional[str] = None
+        bypass_method = "frida"
         if self.mode == "detect":
             bypass_skipped_reason = "modo detect: bypass não executado"
         elif self.no_java:
@@ -1657,6 +1909,10 @@ class AntiHookingCheck:
         elif protection_detected:
             if precomputed_bypass is not None:
                 bypass_details = precomputed_bypass
+                bypass_method = str(precomputed_bypass.get("method") or "frida")
+            elif self.module_available():
+                bypass_method = "module"
+                bypass_details = self.attempt_module_bypass(package_name, window=window)
             else:
                 bypass_details = self.attempt_bypass(package_name, window=window)
             if bypass_details.get("blocked"):
@@ -1675,6 +1931,8 @@ class AntiHookingCheck:
         result: dict = {
             "protection_detected": protection_detected,
             "bypass_successful": bypass_successful,
+            "bypass_method": bypass_method,
+            "module_detection": module_detection,
             "hook_frameworks_present": any(
                 c.get("detected") for c in checks.values()
             ),

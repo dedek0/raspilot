@@ -51,11 +51,13 @@ from checks.apk_utils import pull_apk, scan_apk
 from checks.stealth import load_stealth, unload_stealth
 from logcat_analyzer import (
     HIGH_CONFIDENCE_CATEGORIES,
+    analyze_logcat,
     analyze_since,
     format_evidence,
     get_logcat_mark,
 )
 from script_loader import load_script_file, safe_detach, safe_unload
+from instrumentation import ModuleConfig, XposedManager
 
 if TYPE_CHECKING:  # evita import circular em tempo de importação
     from device_manager import DeviceManager
@@ -186,6 +188,24 @@ EMULATOR_THREAT_PATTERNS = (
 DECISIVE_CHANNEL = "decisive"
 SECONDARY_CHANNEL = "secondary"
 
+# Cobertura do spoof por módulo: o módulo atua na camada Java do app e
+# não alcança verificações nativas. A limitação é registrada no relatório
+# para que o veredito não pareça mais abrangente do que é.
+MODULE_COVERAGE = {
+    "covered": [
+        "Build (campos estáticos)",
+        "SystemProperties.get",
+        "TelephonyManager (identidade de telefonia)",
+        "Settings.Secure (android_id)",
+        "File.exists (paths de emulador)",
+    ],
+    "not_covered": [
+        "leitura nativa de /proc/self/maps",
+        "busca nativa de strings (strstr/memcmp)",
+        "verificações em código nativo do app",
+    ],
+}
+
 
 def _now_iso() -> str:
     """Retorna o timestamp atual em ISO8601 (UTC).
@@ -205,6 +225,8 @@ class AntiEmulatorCheck:
         mode: str = "bypass",
         no_java: bool = False,
         java_timeout: float = 30.0,
+        method: str = "auto",
+        xposed: Optional["XposedManager"] = None,
     ) -> None:
         """Inicializa o check com o gerenciador de dispositivo.
 
@@ -215,11 +237,16 @@ class AntiEmulatorCheck:
             java_timeout: Tempo máximo de carga dos scripts Java, em
                 segundos. A bridge Java domina o tempo de carga e um
                 limite curto descarta o script no meio da execução.
+            method: Método do probe/bypass: ``frida``, ``module`` ou
+                ``auto``.
+            xposed: Gerenciador do módulo de instrumentação (opcional).
         """
         self.dm = dm
         self.mode = mode
         self.no_java = no_java
         self.java_timeout = java_timeout
+        self.method = method or "auto"
+        self.xposed = xposed
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1315,6 +1342,325 @@ class AntiEmulatorCheck:
         return "unclassified_death"
 
     # ------------------------------------------------------------------
+    # Probe e bypass via módulo do dispositivo
+    # ------------------------------------------------------------------
+    def module_available(self) -> bool:
+        """Informa se o probe/bypass via módulo pode ser usado.
+
+        Returns:
+            True quando há framework de hooking no dispositivo e o
+            método escolhido permite o uso do módulo.
+        """
+        if self.method == "frida":
+            return False
+        if self.xposed is None:
+            return False
+        framework = self.xposed.detect()
+        return bool(framework.get("available"))
+
+    def _module_events(self, run: dict) -> Tuple[List[dict], List[dict]]:
+        """Separa consultas do app e spoofings do módulo.
+
+        Args:
+            run: Resultado da fase do módulo.
+
+        Returns:
+            Tupla ``(consultas, spoofings)``.
+        """
+        queries: List[dict] = []
+        spoofs: List[dict] = []
+        for item in run.get("evidence", []):
+            if not item.get("channel", "").startswith("emulator"):
+                continue
+            if item.get("kind") == "spoof":
+                spoofs.append(item)
+            elif item.get("kind") in ("neutralize", "observe"):
+                queries.append(item)
+        return queries, spoofs
+
+    def attempt_module_probe(self, package_name: str, window: int = 12) -> dict:
+        """Faz o app enxergar um emulador usando o módulo do dispositivo.
+
+        O módulo é limitado ao pacote alvo e executado **sem**
+        instrumentação externa: o app reage ao ambiente emulado, e não a
+        um agente injetado.
+
+        Returns:
+            Dict com ``detected``, ``detection_methods_found``,
+            ``strong_signals``, ``weak_signals``, ``channels``,
+            ``app_alive_at_end`` e ``observation_status``.
+        """
+        manager = self.xposed
+        empty = {
+            "detected": False,
+            "detection_methods_found": [],
+            "strong_signals": [],
+            "weak_signals": [],
+            "channels": {DECISIVE_CHANNEL: [], SECONDARY_CHANNEL: []},
+            "app_alive_at_end": None,
+            "observed": False,
+            "observation_status": "error",
+            "method": "module",
+        }
+        if manager is None:
+            return {**empty, "error": "gerenciador do módulo indisponível"}
+
+        config = ModuleConfig(
+            hook="bypass",
+            emulator="probe",
+            target=package_name,
+            label="emu-probe",
+        )
+        phase = manager.run_phase(config, window=window)
+        run = phase.get("run") or {}
+        if not run:
+            return {**empty, "error": phase.get("error") or "probe do módulo falhou"}
+
+        queries, spoofs = self._module_events(run)
+        found: List[str] = []
+        strong: List[str] = []
+        weak: List[str] = []
+        channels: Dict[str, List[str]] = {DECISIVE_CHANNEL: [], SECONDARY_CHANNEL: []}
+
+        def add_signal(method: str, detail: str, strong_signal: bool) -> None:
+            entry = f"{method}: {detail}"
+            if entry in found:
+                return
+            found.append(entry)
+            (strong if strong_signal else weak).append(entry)
+            logger.info("App consultou primitiva de emulador -> %s", entry)
+
+        for item in queries:
+            channel = item.get("channel", "")
+            bucket = DECISIVE_CHANNEL if channel.endswith("decisive") else SECONDARY_CHANNEL
+            entry = f"{item.get('method')}: {item.get('detail')}"
+            if entry not in channels[bucket]:
+                channels[bucket].append(entry)
+            add_signal(item.get("method", "?"), item.get("detail", ""),
+                       bucket == DECISIVE_CHANNEL)
+
+        pid = run.get("pid")
+        alive = bool(run.get("app_alive_at_end"))
+        logcat = analyze_logcat(run.get("lines", []), package=package_name, pid=pid)
+        baseline = self._baseline()
+
+        for line in self._emulator_threat_lines(logcat):
+            add_signal("logcat_emulator", line, True)
+
+        death_cause = None
+        death_classification = None
+        if not alive:
+            try:
+                death_cause = self.dm.capture_death_cause(pid=pid, package=package_name)
+            except Exception:
+                logger.debug("Falha ao capturar causa da morte", exc_info=True)
+            death_classification = self._classify_death(logcat, baseline, alive)
+            if death_classification in ("rasp_kill", "rasp_reaction"):
+                add_signal(
+                    "app_terminated",
+                    f"processo encerrou durante o probe com o módulo "
+                    f"({death_classification})",
+                    True,
+                )
+
+        observation_status = "ok"
+        error: Optional[str] = None
+        if not run.get("module_ready"):
+            observation_status = "error"
+            error = (
+                "o módulo não foi carregado no processo alvo — o escopo do "
+                "framework não foi aplicado"
+            )
+        elif not alive and death_classification == "baseline_death" and not strong:
+            observation_status = "baseline_death"
+            error = (
+                "app encerrou no baseline sem instrumentação; a observação "
+                "anti-emulador é inconclusiva"
+            )
+
+        detected = bool(strong)
+        result = {
+            "detected": detected,
+            "detection_methods_found": found,
+            "strong_signals": strong,
+            "weak_signals": weak,
+            "channels": channels,
+            "spoofed_values": [
+                f"{item.get('method')}: {item.get('detail')}" for item in spoofs
+            ],
+            "app_alive_at_end": alive,
+            "observed": True,
+            "observation_status": observation_status,
+            "death_cause": death_cause,
+            "death_classification": death_classification,
+            "baseline": baseline,
+            "logcat": logcat,
+            "logcat_evidence": format_evidence(logcat),
+            "coverage": MODULE_COVERAGE,
+            "method": "module",
+            "steps": phase.get("steps", []),
+            "details": (
+                f"App reagiu ao ambiente emulado: {'; '.join(strong[:5])}"
+                if strong
+                else (
+                    "App consultou primitivas de emulador, sem reação"
+                    if weak
+                    else "Nenhuma checagem anti-emulador observada"
+                )
+            ),
+        }
+        if error:
+            result["error"] = error
+        logger.info(
+            "check_emulator_detection_in_app (módulo): detected=%s strong=%s weak=%s",
+            detected, len(strong), len(weak),
+        )
+        return result
+
+    def attempt_module_bypass(self, package_name: str, window: int = 12) -> dict:
+        """Oculta do app os artefatos de emulador usando o módulo.
+
+        O módulo é limitado ao pacote alvo e aplica a camada de máscara:
+        os artefatos decisivos ficam ocultos enquanto os secundários
+        permanecem visíveis.
+
+        Returns:
+            Dict com ``success``, ``bypass_logs``, ``masked_channels``,
+            ``exposed_channels``, ``app_alive_at_end`` e ``error``.
+        """
+        manager = self.xposed
+        if manager is None:
+            return {
+                "success": False,
+                "bypass_logs": [],
+                "masked_channels": [],
+                "exposed_channels": [],
+                "app_alive_at_end": None,
+                "error": "gerenciador do módulo indisponível",
+                "method": "module",
+            }
+
+        config = ModuleConfig(
+            hook="bypass",
+            emulator="mask",
+            target=package_name,
+            label="emu-mask",
+        )
+        phase = manager.run_phase(config, window=window)
+        run = phase.get("run") or {}
+        if not run:
+            return {
+                "success": False,
+                "bypass_logs": [],
+                "masked_channels": [],
+                "exposed_channels": [],
+                "app_alive_at_end": None,
+                "error": phase.get("error") or "bypass do módulo falhou",
+                "method": "module",
+            }
+
+        queries, spoofs = self._module_events(run)
+        masked: List[str] = []
+        exposed: List[str] = []
+        for item in queries:
+            entry = f"{item.get('method')}: {item.get('detail')}"
+            channel = item.get("channel", "")
+            if channel.endswith("decisive"):
+                if entry not in masked:
+                    masked.append(entry)
+            elif entry not in exposed:
+                exposed.append(entry)
+
+        pid = run.get("pid")
+        alive = bool(run.get("app_alive_at_end"))
+        logcat = analyze_logcat(run.get("lines", []), package=package_name, pid=pid)
+        baseline = self._baseline()
+        conflicts = manager.scoped_modules_for(package_name)
+
+        signals: List[str] = []
+        for line in self._emulator_threat_lines(logcat):
+            entry = f"logcat_emulator: {line}"
+            if entry not in signals:
+                signals.append(entry)
+
+        death_cause = None
+        death_classification = None
+        if not alive:
+            try:
+                death_cause = self.dm.capture_death_cause(pid=pid, package=package_name)
+            except Exception:
+                logger.debug("Falha ao capturar causa da morte", exc_info=True)
+            death_classification = self._classify_death(logcat, baseline, alive)
+            if death_classification in ("rasp_kill", "rasp_reaction"):
+                entry = "app_terminated: processo encerrou durante o bypass com o módulo"
+                if entry not in signals:
+                    signals.append(entry)
+
+        success = bool(alive) and not signals
+        inconclusive = False
+        error: Optional[str] = None
+        if not alive and death_classification == "instrumentation_crash":
+            inconclusive = True
+            error = (
+                "o app encerrou antes que o bypass anti-emulador pudesse ser "
+                "avaliado"
+            )
+        elif not alive and death_classification == "baseline_death":
+            inconclusive = True
+            error = (
+                "app encerrou no baseline sem instrumentação; o bypass "
+                "anti-emulador é inconclusivo"
+            )
+        elif not alive:
+            error = (
+                "o app bloqueou o bypass: encerrou durante a execução do "
+                "bypass anti-emulador"
+            )
+        elif run.get("error"):
+            error = str(run["error"])
+
+        result = {
+            "success": success,
+            "inconclusive": inconclusive,
+            "blocked": bool(
+                not alive and not inconclusive
+                and death_classification in ("rasp_kill", "rasp_reaction")
+            ),
+            "bypass_logs": [f"{item.get('method')}: {item.get('detail')}"
+                            for item in queries],
+            "masked_channels": masked,
+            "exposed_channels": exposed,
+            "spoofed_values": [
+                f"{item.get('method')}: {item.get('detail')}" for item in spoofs
+            ],
+            "detection_signals": signals,
+            "app_alive_at_end": alive,
+            "death_cause": death_cause,
+            "death_classification": death_classification,
+            "logcat": logcat,
+            "logcat_evidence": format_evidence(logcat),
+            "coverage": MODULE_COVERAGE,
+            "method": "module",
+            "steps": phase.get("steps", []),
+            "other_modules_in_scope": conflicts,
+            "details": (
+                "nenhum artefato de emulador no dispositivo: o app enxergou "
+                "o device real"
+                if not masked and not exposed
+                else (
+                    f"artefatos ocultos: {len(masked)}; "
+                    f"artefatos secundários expostos: {len(exposed)}"
+                )
+            ),
+            "error": error,
+        }
+        logger.info(
+            "Bypass anti-emulador (módulo): success=%s ocultados=%s expostos=%s",
+            success, len(masked), len(exposed),
+        )
+        return result
+
+    # ------------------------------------------------------------------
     # Consolidação
     # ------------------------------------------------------------------
     def run_all(
@@ -1358,8 +1704,12 @@ class AntiEmulatorCheck:
         session = None
         pid: Optional[int] = None
         app_detection: dict = {}
+        probe_method = "frida"
         if precomputed_detection is not None:
             app_detection = precomputed_detection
+        elif self.module_available():
+            probe_method = "module"
+            app_detection = self.attempt_module_probe(package_name, window=window)
         else:
             logcat_mark = get_logcat_mark(self.dm)
             try:
@@ -1407,13 +1757,18 @@ class AntiEmulatorCheck:
         bypass_details: Optional[dict] = None
         bypass_successful: Optional[bool] = None
         bypass_skipped_reason: Optional[str] = None
+        bypass_method = "frida"
         if self.mode == "detect":
             bypass_skipped_reason = "modo detect: bypass não executado"
-        elif self.no_java:
+        elif self.no_java and probe_method == "frida":
             bypass_skipped_reason = "--no-java: hooks Java necessários ao bypass"
         elif protection_detected:
             if precomputed_bypass is not None:
                 bypass_details = precomputed_bypass
+                bypass_method = str(precomputed_bypass.get("method") or "frida")
+            elif self.module_available():
+                bypass_method = "module"
+                bypass_details = self.attempt_module_bypass(package_name, window=window)
             else:
                 bypass_details = self.attempt_bypass(package_name, window=window)
             if bypass_details.get("blocked"):
@@ -1431,6 +1786,8 @@ class AntiEmulatorCheck:
         result: dict = {
             "protection_detected": protection_detected,
             "bypass_successful": bypass_successful,
+            "probe_method": probe_method,
+            "bypass_method": bypass_method,
             "device_is_emulator": bool(device.get("is_emulator")),
             "emulator_type": device.get("emulator_type"),
             "checks": device.get("checks", {}),

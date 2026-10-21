@@ -24,6 +24,12 @@ the collected evidence.
 - `adb` (Android Platform Tools) on `PATH`
 - Frida — a compatible `frida-server` is downloaded automatically matching
   the locally installed `frida` package version
+- Android SDK (`build-tools` + `platform`) and a JDK — **only** to build the
+  instrumentation module described below. Without them RASPilot keeps
+  working with the `frida` method (see *Instrumentation module*). The
+  toolchain is installed without system privileges:
+  `./instrumentation/setup_toolchain.sh` (requirements in
+  `instrumentation/requirements.txt`).
 
 ### On the Android device
 
@@ -125,6 +131,9 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--mode MODE` | no | Mode: `detect` (observation only), `bypass` (observation+bypass) or `stealth` (native bootstrap before resume) |
 | `--no-java` | no | Do not load Java hooks; useful when RASP blocks the Java bridge |
 | `--java-timeout SEC` | no | Maximum time to load the Java scripts (default `30`). Bridge loading is dominated by the Java runtime initialisation in the target and by classloader enumeration |
+| `--hook-method METHOD` | no | Anti-hook bypass: `frida` (injected agent), `module` (hooking APK on the device, scoped to the target package) or `auto` (default: uses the module when a framework is available) |
+| `--emulator-method METHOD` | no | Anti-emulator probe/bypass: `frida`, `module` or `auto` (default) |
+| `--module-apk PATH` | no | Pre-built instrumentation module APK (skips the build, which requires the Android SDK) |
 | `--js-runtime RUNTIME` | no | Frida JavaScript runtime: `qjs` (default) or `v8` |
 | `--verbose` | no | DEBUG-level logging |
 | `--skip CHECK...` | no | Checks to skip (`anti_root`, `anti_frida`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
@@ -270,6 +279,12 @@ observation is declared **inconclusive**: the death is not attributed to
 emulator detection, and the bypass is reported as `SKIP` with the reason
 recorded.
 
+With `--emulator-method module` (the default when a hooking framework is
+available on the device) the probe and the mask run **without** external
+instrumentation: the app runs normally while the module performs the
+spoof. That removes the agent death as a confounding factor — the verdict
+reflects the app's reaction to the emulated environment, not to the tool.
+
 ### 4. Anti-Hooking (`checks/anti_hooking.py`)
 
 Checks whether the app detects hooking frameworks (Xposed, LSPosed,
@@ -308,6 +323,13 @@ phases consolidated into `protection_detected` + `bypass_successful`:
 (RASP failure). `bypass_successful=True` ⇒ the protection exists, but the
 bypass won.
 
+With `--hook-method module` (the default when a hooking framework is
+available on the device) the observation and the bypass run **without**
+external instrumentation: the module is scoped to the target package,
+records the app's anti-hook queries and neutralises them. The verdict then
+rests on the app's reaction to the device's own hooking framework — the
+vector the protection actually inspects.
+
 ### 5. SSL Pinning (`checks/ssl_pinning.py`)
 
 - **Static detection**: pulls the APK (`pm path` + `adb pull`) and scans
@@ -319,6 +341,83 @@ bypass won.
   considered successful with a **real intercepted host and a live app**;
   hook-install/native-config logs are diagnostics only. Logcat is attached
   to corroborate TLS/pinning errors.
+
+---
+
+## Instrumentation module (hooking APK) — optional
+
+Everything in this section is **optional**: without a hooking framework on
+the device RASPilot uses the `frida` method and behaves as before.
+
+### Why
+
+The Frida bypass injects an **agent** into the app process. For an app with
+anti-hook protection that agent is what kills the audit: the app finds the
+`frida-agent` in the memory map or in a stack trace before any anti-hook
+check happens.
+
+A **hooking module (APK)** swaps the instrument: instead of an injected
+agent, the device itself loads the hooking framework into the app process —
+exactly the environment the protection looks for. The module neutralises the
+app's queries and the auditor observes the result **without** leaving a
+trace of external injection. It is also what allows the anti-emulator check
+to run without instrumentation: the app sees an emulator while running
+normally.
+
+### How it works
+
+1. **Build** — `instrumentation/build.sh` compiles the module with the
+   Android SDK's `aapt2`/`d8`/`apksigner` (no Gradle, no network). Sources
+   live in `instrumentation/xposed/`.
+2. **Install** — `adb install -r` of the APK.
+3. **Enable and scope** — the module is enabled and its scope is set to the
+   **target package only** (`--package`), through the framework's cli
+   (`modules enable`, `scope set`).
+4. **Configure** — the phase mode (`observe`, `bypass`, `probe`, `mask`) is
+   written to a system property read by the module when the process starts:
+   switching phases does not require reinstalling the APK.
+5. **Run** — the app is started normally (no Frida) and the evidence emitted
+   by the module is read from logcat (`RASPilotModule: EVT|...`).
+6. **Restore** — the original scope is restored, the module is disabled and
+   the APK is removed from the device.
+
+### Requirements
+
+- a device with **root** and a hooking framework installed (LSPosed,
+  Vector, EdXposed) whose configuration cli is available
+- Android SDK (`build-tools`, `platform`) and a JDK on the host — or a
+  pre-built APK with `--module-apk`
+
+The build toolchain is installed without system privileges:
+
+```bash
+./instrumentation/setup_toolchain.sh
+```
+
+Detailed requirements live in `instrumentation/requirements.txt`.
+
+```bash
+export ANDROID_HOME="$HOME/Android"
+export JAVA_HOME="$HOME/Android/jdk"
+
+# default: uses the module when a framework is available
+python main.py --package com.example.app
+
+# force the module (fails when no framework is present)
+python main.py --package com.example.app --hook-method module
+
+# use an already compiled APK
+python main.py --package com.example.app --module-apk ./module.apk
+```
+
+### Coverage and limitations
+
+The module acts on the app's **Java layer**: `Build`, `SystemProperties`,
+`TelephonyManager`, `Settings.Secure` and `File.exists`. Checks written in
+native code (reading `/proc/self/maps`, string searches) are **not**
+covered — the module has no native component. The report records that
+limitation in `coverage` and lists the framework artifacts that stay visible
+in the target process.
 
 ---
 
@@ -431,6 +530,12 @@ raspilot/
 ├── device_manager.py           # ADB (USB/Wi-Fi) + frida-server + logcat/baseline
 ├── logcat_analyzer.py          # Death/security/TLS logcat correlation
 ├── reporter.py                 # JSON/HTML reports (Jinja2)
+├── instrumentation/            # Instrumentation module (hooking APK)
+│   ├── manager.py              # Setup, framework scoping and evidence
+│   ├── build.sh                # APK build (aapt2/d8/apksigner, no Gradle)
+│   ├── setup_toolchain.sh      # Installs Android SDK + JDK in ~/Android
+│   ├── requirements.txt        # Build toolchain requirements
+│   └── xposed/                 # Module sources (anti-hook + emulator spoof)
 ├── checks/
 │   ├── anti_root.py            # Multi-vector root detection
 │   ├── anti_frida.py           # Frida presence/detection
@@ -466,6 +571,12 @@ a schema snapshot, pinning and anti-hooking detection on synthetic APKs, the
 evidence model (high confidence vs context), the bypass layer and the full
 end-to-end pipeline (with a mocked `DeviceManager`). No physical device is
 required to run the tests.
+
+The instrumentation module has its own tests (`tests/test_instrumentation.py`
+for the manager, `tests/test_instrumentation_checks.py` for the check
+integration): configuration, evidence parsing from logcat, scope
+application and restoration on the framework, and the module-based
+bypass/probe phases of the hooking and emulator checks.
 
 Every test has a time ceiling: a test that freezes turns into a failure
 with the stack of all threads, instead of holding the machine indefinitely.
@@ -519,6 +630,8 @@ baseline result) so the run can be reproduced.
 | `Dispositivo não ficou pronto em 15s` | Offline/connection issue | Check cable / `adb kill-server` |
 | App spawned but checks empty | App protected against debuggers | Use `--verbose` and inspect `details` in the JSON |
 | Window too short for slow apps | Long splash or late RASP checks | Increase with `--window 20` (or more) |
+| `hooking framework unavailable` | No framework with a configuration cli on the device | Use `--hook-method frida --emulator-method frida` |
+| `module build failed` | Android SDK or JDK missing on the host | Install `build-tools` + `platform` in `$ANDROID_HOME` and a JDK, or use `--module-apk` |
 
 ---
 
@@ -551,6 +664,13 @@ and it stops responding — the symptom is a session that freezes without
 an error. The native layer therefore concentrates on low-volume
 functions (`strstr`, `raise`, `kill`, `abort`, `exit`); exact name
 matching stays covered by the Java layer and by the `/proc` filter.
+
+**The instrumentation module acts on the app's Java layer.**
+When the bypass (or the probe) runs through the module, the app's native
+queries (reading `/proc/self/maps`, string searches in native code) are not
+covered: the module has no native component. The limitation is recorded in
+`coverage.not_covered`, and the framework artifacts that stay visible in
+the target process are listed in `framework_artifacts`.
 
 **Classes generated by the Java layer depend on the cache directory.**
 The bridge writes the temporary class to a directory of its own; its

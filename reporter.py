@@ -153,6 +153,10 @@ class Reporter:
                 "bypass_successful": bypass,
                 "device_is_emulator": bool(result.get("device_is_emulator")),
             }
+            if result.get("probe_method"):
+                summary["probe_method"] = result.get("probe_method")
+            if result.get("bypass_method"):
+                summary["bypass_method"] = result.get("bypass_method")
             blocked = bool((result.get("bypass_details") or {}).get("blocked"))
             if blocked:
                 summary["blocked_reason"] = (
@@ -182,6 +186,8 @@ class Reporter:
                 "bypass_successful": bypass,
                 "hook_frameworks_present": bool(result.get("hook_frameworks_present")),
             }
+            if result.get("bypass_method"):
+                summary["bypass_method"] = result.get("bypass_method")
             blocked = bool((result.get("bypass_details") or {}).get("blocked"))
             if blocked:
                 # O app bloqueou a auditoria: a proteção resistiu ao

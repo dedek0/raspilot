@@ -5,3 +5,7 @@ frida-tools>=14.0.0
 rich>=13.0.0
 colorama>=0.4.6
 jinja2>=3.1.0
+
+# O módulo de instrumentação (instrumentation/) é um APK Android e não tem
+# dependências pip: ele exige o SDK do Android e um JDK no host.
+# Veja instrumentation/requirements.txt e instrumentation/setup_toolchain.sh.

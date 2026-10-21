@@ -38,6 +38,33 @@ class TestParseArgs:
         assert args.verbose is True
         assert args.skip == ["anti_emulator", "ssl_pinning"]
 
+    def test_module_flags_are_optional(self):
+        """O módulo é opcional: o padrão é ``auto``."""
+        args = mainmod.parse_args(["--package", "com.example.app"])
+        assert args.hook_method == "auto"
+        assert args.emulator_method == "auto"
+        assert args.module_apk is None
+
+    def test_module_flags_are_accepted(self, tmp_path):
+        """As flags do módulo são aceitas."""
+        apk = tmp_path / "module.apk"
+        apk.write_bytes(b"apk")
+        args = mainmod.parse_args([
+            "--package", "com.example.app",
+            "--hook-method", "module",
+            "--emulator-method", "frida",
+            "--module-apk", str(apk),
+        ])
+        assert args.hook_method == "module"
+        assert args.emulator_method == "frida"
+        assert args.module_apk == str(apk)
+
+    def test_unknown_method_exits(self):
+        """Um método desconhecido é rejeitado."""
+        with pytest.raises(SystemExit) as exc:
+            mainmod.parse_args(["--package", "x", "--hook-method", "zzz"])
+        assert exc.value.code == 2
+
     def test_missing_package_exits(self):
         """Sem --package o argparse encerra com código 2."""
         with pytest.raises(SystemExit) as exc:

@@ -1,0 +1,24 @@
+# RASPilot — requisitos do módulo de instrumentação
+#
+# O módulo (instrumentation/xposed) é um APK Android: não há dependências
+# pip. O que ele exige é um *toolchain* no host, instalado fora do pip:
+#
+#   - Android SDK: build-tools (>= 34) e platform (android-33 ou superior)
+#   - JDK 17+ (javac, jar e keytool)
+#
+# O script `setup_toolchain.sh` instala ambos em "$HOME/Android", sem
+# privilégios de sistema:
+#
+#   ./instrumentation/setup_toolchain.sh
+#
+# Depois é só exportar o ambiente (o script imprime as linhas prontas):
+#
+#   export ANDROID_HOME="$HOME/Android"
+#   export ANDROID_SDK_ROOT="$ANDROID_HOME"
+#   export JAVA_HOME="$ANDROID_HOME/jdk"
+#   export PATH="$ANDROID_HOME/platform-tools:$JAVA_HOME/bin:$PATH"
+#
+# Sem o toolchain o RASPilot continua funcionando: os checks usam o
+# método "frida" (veja `--hook-method` / `--emulator-method`).
+#
+# Dependências de pip do projeto: veja requirements.txt na raiz.

@@ -24,6 +24,9 @@ coletadas.
 - `adb` (Android Platform Tools) no `PATH`
 - Frida — o `frida-server` compatível é baixado automaticamente na versão
   do pacote `frida` instalado localmente
+- Android SDK (`build-tools` + `platform`) e um JDK — **apenas** para compilar
+  o módulo de instrumentação descrito abaixo. Sem eles, o RASPilot continua
+  funcionando com o método `frida` (veja *Módulo de instrumentação*).
 
 ### No dispositivo Android
 
@@ -124,6 +127,9 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--mode MODE` | não | Modo: `detect` (só observação), `bypass` (observação+bypass) ou `stealth` (bootstrap nativo antes do resume) |
 | `--no-java` | não | Não carrega hooks Java; útil em apps com RASP que bloqueia a bridge |
 | `--java-timeout SEG` | não | Tempo máximo de carga dos scripts Java (default `30`). A carga da bridge é dominada pela inicialização do runtime Java no alvo e pela varredura de classloaders |
+| `--hook-method MÉTODO` | não | Bypass anti-hook: `frida` (agente injetado), `module` (APK de hooking no dispositivo, limitado ao pacote alvo) ou `auto` (default: usa o módulo quando há framework disponível) |
+| `--emulator-method MÉTODO` | não | Probe/bypass anti-emulador: `frida`, `module` ou `auto` (default) |
+| `--module-apk PATH` | não | APK pré-construído do módulo de instrumentação (dispensa o build, que exige o SDK do Android) |
 | `--js-runtime RUNTIME` | não | Runtime JavaScript do Frida: `qjs` (default) ou `v8` |
 | `--verbose` | não | Logging em nível DEBUG |
 | `--skip CHECK...` | não | Checks a pular (`anti_root`, `anti_frida`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
@@ -270,6 +276,12 @@ observação é declarada **inconclusiva**: a morte não é atribuída à
 detecção de emulador, e o bypass fica como `SKIP` com o motivo
 registrado.
 
+Com `--emulator-method module` (default quando há framework de hooking no
+dispositivo), o probe e a máscara são executados **sem** instrumentação
+externa: o app é executado normalmente enquanto o módulo faz o spoof. Isso
+elimina a morte do agente como fator de confusão — o veredito passa a
+refletir a reação do app ao ambiente emulado, e não à ferramenta.
+
 ### 4. Anti-Hooking (`checks/anti_hooking.py`)
 
 Verifica se o app detecta frameworks de hooking (Xposed, LSPosed,
@@ -305,6 +317,13 @@ independentes consolidadas em `protection_detected` + `bypass_successful`:
 `protection_detected=False` ⇒ o app não possui checagens anti-hook
 observáveis (falha de RASP). `bypass_successful=True` ⇒ a proteção existe,
 mas o bypass venceu.
+
+Com `--hook-method module` (default quando há framework de hooking no
+dispositivo), a observação e o bypass rodam **sem** instrumentação externa:
+o módulo é limitado ao pacote alvo, registra as consultas anti-hook do app
+e as neutraliza. O veredito passa a se apoiar na reação do app ao
+framework de hooking do próprio dispositivo — que é o vetor que a
+proteção de fato fiscaliza.
 
 ### 5. SSL Pinning (`checks/ssl_pinning.py`)
 
@@ -358,6 +377,82 @@ booleanos devolvem "nada errado".
 O catálogo de SDKs conhecidos fica em `rasp_vendors.py` — é dado, não
 código: tokens de logcat, pacotes e classes de cada SDK. O mesmo
 catálogo alimenta a detecção estática no APK e a correlação de logcat.
+
+---
+
+## Módulo de instrumentação (APK de hooking) — opcional
+
+Tudo nesta seção é **opcional**: sem um framework de hooking no dispositivo
+o RASPilot usa o método `frida` e o comportamento é o de sempre.
+
+### Por que
+
+O bypass via Frida injeta um **agente** no processo do app. Para um app com
+proteção anti-hook, esse agente é o que mata a auditoria: o app encontra o
+`frida-agent` no mapa de memória ou no stack trace antes de qualquer
+checagem anti-hook acontecer.
+
+Um **módulo (APK) de hooking** troca o Instrumento: em vez de um agente
+injetado, o próprio dispositivo carrega o framework de hooking no processo
+do app — exatamente o ambiente que a proteção anti-hook procura detectar.
+O módulo neutraliza as consultas do app e o auditor observa o resultado
+**sem** deixar rastro de injeção externa. É também o que permite medir o
+anti-emulador sem depender da instrumentação: o app enxerga um emulador
+enquanto roda normalmente.
+
+### Como funciona
+
+1. **Build** — `instrumentation/build.sh` compila o módulo com `aapt2`/`d8`/
+   `apksigner` do SDK do Android (sem Gradle e sem rede). Os fontes ficam em
+   `instrumentation/xposed/`.
+2. **Instalação** — `adb install -r` do APK.
+3. **Habilitação e escopo** — o módulo é habilitado e o escopo é definido
+   **apenas para o pacote alvo** (`--package`), pelo cli do framework
+   (`modules enable`, `scope set`).
+4. **Configuração** — o modo da fase (`observe`, `bypass`, `probe`, `mask`)
+   é escrito em uma propriedade do sistema, lida pelo módulo no início do
+   processo: trocar de fase não exige reinstalar o APK.
+5. **Execução** — o app é iniciado normalmente (sem Frida), e a evidência
+   emitida pelo módulo é lida do logcat (`RASPilotModule: EVT|...`).
+6. **Restauração** — o escopo original é devolvido, o módulo é desabilitado
+   e o APK é removido do dispositivo.
+
+### Requisitos
+
+- dispositivo com **root** e um framework de hooking instalado (LSPosed,
+  Vector, EdXposed) com cli de configuração disponível
+- SDK do Android (`build-tools`, `platform`) e um JDK no host — ou um APK
+  pronto com `--module-apk`
+
+O toolchain de build é instalado sem privilégios de sistema:
+
+```bash
+./instrumentation/setup_toolchain.sh
+```
+
+Os requisitos detalhados estão em `instrumentation/requirements.txt`.
+
+```bash
+export ANDROID_HOME="$HOME/Android"
+export JAVA_HOME="$HOME/Android/jdk"
+
+# padrão: usa o módulo quando há framework no dispositivo
+python main.py --package com.example.app
+
+# força o módulo (falha se não houver framework)
+python main.py --package com.example.app --hook-method module
+
+# usa um APK já compilado
+python main.py --package com.example.app --module-apk ./module.apk
+```
+
+### Cobertura e limitações
+
+O módulo atua na **camada Java** do app: `Build`, `SystemProperties`,
+`TelephonyManager`, `Settings.Secure` e `File.exists`. Verificações em
+código nativo (leitura de `/proc/self/maps`, buscas de string) **não são
+cobertas** — o relatório registra essa limitação em `coverage` e lista os
+artefatos do framework que continuam visíveis no processo alvo.
 
 ---
 
@@ -468,6 +563,12 @@ raspilot/
 ├── device_manager.py           # ADB (USB/Wi-Fi) + frida-server + logcat/baseline
 ├── logcat_analyzer.py          # Correlação de mortes/segurança/TLS no logcat
 ├── reporter.py                 # Relatórios JSON/HTML (Jinja2)
+├── instrumentation/            # Módulo de instrumentação (APK de hooking)
+│   ├── manager.py              # Preparação, escopo no framework e evidência
+│   ├── build.sh                # Build do APK (aapt2/d8/apksigner, sem Gradle)
+│   ├── setup_toolchain.sh      # Instala SDK do Android + JDK em ~/Android
+│   ├── requirements.txt        # Requisitos do toolchain de build
+│   └── xposed/                 # Fontes do módulo (anti-hook + spoof de emulador)
 ├── checks/
 │   ├── anti_root.py            # Detecção de root multi-vetor
 │   ├── anti_frida.py           # Presença/detecção de Frida
@@ -504,6 +605,13 @@ anti-hooking em APKs sintéticos, o modelo de evidência (confiança alta
 vs contexto), a camada de bypass e o pipeline completo de ponta a ponta
 (com `DeviceManager` mockado). Nenhum dispositivo físico é necessário
 para os testes.
+
+O módulo de instrumentação tem testes próprios
+(`tests/test_instrumentation.py` para o gerenciador e
+`tests/test_instrumentation_checks.py` para a integração com os checks):
+configuração, leitura da evidência no logcat, aplicação e
+restauração do escopo no framework, e as fases de bypass/probe por
+módulo nos checks de hooking e de emulador.
 
 Cada teste tem um teto de tempo: um teste que trava vira falha com o
 stack de todas as threads, em vez de segurar a máquina indefinidamente.
@@ -559,6 +667,8 @@ resultado do baseline) para que a execução possa ser reproduzida.
 | Verificação curta demais para apps lentos | Splash longa ou RASP tardio | Aumente com `--window 20` (ou mais) |
 | `SKIP` com `skip_reason` no bypass | A camada Java não ficou ativa a tempo | Aumente `--java-timeout`; veja *Limitações conhecidas* |
 | App morre logo após o resume | Auto-destruição do app ao detectar a instrumentação | A camada nativa neutraliza `abort`/sinais; as ações neutralizadas aparecem em `neutralized_actions` |
+| `framework de hooking indisponível` | Nenhum framework com cli de configuração no aparelho | Use `--hook-method frida --emulator-method frida` |
+| `build do módulo falhou` | SDK do Android ou JDK ausentes no host | Instale `build-tools` + `platform` em `$ANDROID_HOME` e um JDK, ou use `--module-apk` |
 
 ---
 
@@ -590,6 +700,13 @@ que deixa de responder — e o sintoma é uma sessão que trava sem erro.
 Por isso a camada nativa se concentra nas funções de baixo volume
 (`strstr`, `raise`, `kill`, `abort`, `exit`); a comparação exata de
 nomes continua coberta pela camada Java e pelo filtro de `/proc`.
+
+**O módulo de instrumentação atua na camada Java do app.**
+Quando o bypass (ou o probe) roda pelo módulo, as consultas nativas do app
+(leitura de `/proc/self/maps`, buscas de string em código nativo) não são
+cobertas: o módulo não tem componente nativo. A limitação fica registrada
+em `coverage.not_covered`, e os artefatos do framework que continuam
+visíveis no processo alvo são listados em `framework_artifacts`.
 
 **As classes geradas pela camada Java dependem do diretório de cache.**
 A bridge grava a classe temporária em um diretório próprio; o padrão

@@ -1,0 +1,69 @@
+package de.robv.android.xposed;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Member;
+import java.lang.reflect.Method;
+
+public class XposedHelpers {
+
+    private XposedHelpers() {
+    }
+
+    public static Class<?> findClass(String className, ClassLoader classLoader) {
+        return null;
+    }
+
+    public static Class<?> findClassIfExists(String className, ClassLoader classLoader) {
+        return null;
+    }
+
+    public static XC_MethodHook.Unhook findAndHookMethod(
+            String className, ClassLoader classLoader, String methodName,
+            Object... parameterTypesAndCallback) {
+        return null;
+    }
+
+    public static XC_MethodHook.Unhook findAndHookMethod(
+            Class<?> clazz, String methodName,
+            Object... parameterTypesAndCallback) {
+        return null;
+    }
+
+    public static XC_MethodHook.Unhook findAndHookConstructor(
+            Class<?> clazz, Object... parameterTypesAndCallback) {
+        return null;
+    }
+
+    public static Object callMethod(Object obj, String methodName, Object... args) {
+        return null;
+    }
+
+    public static Object callStaticMethod(Class<?> clazz, String methodName,
+                                          Object... args) {
+        return null;
+    }
+
+    public static Object getObjectField(Object obj, String fieldName) {
+        return null;
+    }
+
+    public static void setObjectField(Object obj, String fieldName, Object value) {
+    }
+
+    public static Object getStaticObjectField(Class<?> clazz, String fieldName) {
+        return null;
+    }
+
+    public static void setStaticObjectField(Class<?> clazz, String fieldName, Object value) {
+    }
+
+    public static Field findField(Class<?> clazz, String fieldName) {
+        return null;
+    }
+
+    public static Method findMethodExact(
+            String className, ClassLoader classLoader, String methodName,
+            Class<?>... parameterTypes) {
+        return null;
+    }
+}

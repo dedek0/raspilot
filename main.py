@@ -42,6 +42,7 @@ from device_manager import (
 )
 from reporter import Reporter
 from script_loader import safe_detach, set_js_runtime
+from instrumentation import XposedManager
 
 # Console rich global — único ponto de saída visual do CLI.
 console = Console()
@@ -147,6 +148,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-java",
         action="store_true",
         help="Não carrega hooks Java (evita bridge em apps com RASP agressivo)",
+    )
+    parser.add_argument(
+        "--hook-method",
+        choices=("frida", "module", "auto"),
+        default="auto",
+        help=(
+            "Método do bypass anti-hook: frida=agente injetado; "
+            "module=módulo (APK) de hooking no dispositivo, limitado ao "
+            "pacote alvo; auto=usa o módulo quando há framework disponível"
+        ),
+    )
+    parser.add_argument(
+        "--emulator-method",
+        choices=("frida", "module", "auto"),
+        default="auto",
+        help=(
+            "Método do probe/bypass anti-emulador: frida=agente injetado; "
+            "module=módulo (APK) de hooking no dispositivo; "
+            "auto=usa o módulo quando há framework disponível"
+        ),
+    )
+    parser.add_argument(
+        "--module-apk",
+        default=None,
+        metavar="PATH",
+        help=(
+            "APK pré-construído do módulo de instrumentação (dispensa o "
+            "build, que exige o SDK do Android)"
+        ),
     )
     parser.add_argument(
         "--java-timeout",
@@ -374,6 +404,9 @@ def _build_run_context(args: argparse.Namespace, dm: "DeviceManager") -> dict:
             "skip": list(args.skip or []),
             "device_id": args.device_id,
             "wifi": args.wifi,
+            "hook_method": getattr(args, "hook_method", "auto"),
+            "emulator_method": getattr(args, "emulator_method", "auto"),
+            "module_apk": getattr(args, "module_apk", None),
             "avd": {
                 "enabled": bool(getattr(args, "avd", False)),
                 "config_path": getattr(args, "avd_config", None),
@@ -541,6 +574,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
     session = None
     pid = None
+    xposed: Optional[XposedManager] = None
     try:
         # 4) Anti-Root (não requer app rodando).
         _run_step(
@@ -580,6 +614,35 @@ def run_pipeline(args: argparse.Namespace) -> int:
         frida_logcat_mark = dm.logcat_mark()
         frida_detection = None
         hook_detection = None
+        hook_method = getattr(args, "hook_method", "auto")
+        emulator_method = getattr(args, "emulator_method", "auto")
+
+        # Módulo de instrumentação: usado pelos checks de hooking e de
+        # emulador quando o método escolhido é "module" ou "auto".
+        if hook_method != "frida" or emulator_method != "frida":
+            xposed = XposedManager(
+                dm,
+                args.package,
+                apk_path=getattr(args, "module_apk", None),
+            )
+            framework = xposed.detect()
+            reporter.run_context["xposed"] = {
+                "framework": framework.get("name"),
+                "version": framework.get("version"),
+                "available": bool(framework.get("available")),
+                "details": framework.get("details"),
+            }
+            if framework.get("available"):
+                console.print(
+                    f"[green]✓[/] Framework de hooking: "
+                    f"{framework.get('name')} {framework.get('version') or ''}"
+                )
+            else:
+                console.print(
+                    "[yellow]![/] Framework de hooking indisponível "
+                    f"({framework.get('details')}) — usando Frida"
+                )
+
         need_combined = any(
             check not in args.skip for check in ("anti_frida", "anti_hooking")
         )
@@ -633,6 +696,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             and "ssl_pinning" not in args.skip
             and args.mode != "detect"
             and not args.no_java
+            and hook_method == "frida"
         ):
             with console.status("[cyan]Executando bypass combinado...[/]"):
                 hooking_bypass, ssl_bypass = run_combined_bypass(
@@ -646,7 +710,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
             reporter,
             "anti_hooking",
             lambda: AntiHookingCheck(
-                dm, mode=args.mode, no_java=args.no_java
+                dm, mode=args.mode, no_java=args.no_java,
+                method=hook_method, xposed=xposed,
             ).run_all(
                 args.package,
                 window=args.window,
@@ -680,6 +745,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             lambda: AntiEmulatorCheck(
                 dm, mode=args.mode, no_java=args.no_java,
                 java_timeout=args.java_timeout,
+                method=emulator_method, xposed=xposed,
             ).run_all(args.package, window=args.window),
             skipped="anti_emulator" in args.skip,
         )
@@ -694,6 +760,15 @@ def run_pipeline(args: argparse.Namespace) -> int:
             safe_detach(session)
         except Exception:
             logger.debug("Falha ao detach da sessão final", exc_info=True)
+        if xposed is not None:
+            try:
+                for action in xposed.finish():
+                    logger.info(
+                        "Cleanup do módulo (%s): ok=%s %s",
+                        action.get("step"), action.get("ok"), action.get("detail"),
+                    )
+            except Exception:
+                logger.warning("Falha no cleanup do módulo", exc_info=True)
         try:
             dm.remove_frida_server()
             dm.run_shell(f"am force-stop {args.package}", timeout=10)
