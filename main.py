@@ -356,8 +356,13 @@ def run_pipeline(args: argparse.Namespace) -> int:
     """Executa o pipeline completo de auditoria RASP.
 
     Fluxo: conexão ADB → info do dispositivo → frida-server →
-    anti_root → anti_emulator → spawn do app → anti_frida →
-    anti_hooking → ssl_pinning → relatórios → tabela final → cleanup.
+    anti_root → baseline → spawn do app → anti_frida → bypass combinado
+    → anti_hooking → ssl_pinning → anti_emulador (probe + bypass) →
+    relatórios → tabela final → cleanup.
+
+    O anti-emulador roda por último e com spawns próprios: o probe faz o
+    app enxergar um emulador, o que contaminaria a observação dos demais
+    checks.
 
     Args:
         args: Argumentos já parseados.
@@ -412,20 +417,12 @@ def run_pipeline(args: argparse.Namespace) -> int:
             skipped="anti_root" in args.skip,
         )
 
-        # 5) Anti-Emulador (não requer app rodando).
-        _run_step(
-            reporter,
-            "anti_emulator",
-            lambda: AntiEmulatorCheck(dm).run_all(),
-            skipped="anti_emulator" in args.skip,
-        )
-
-        # 6) Baseline sem instrumentação (antes de qualquer spawn Frida):
+        # 5) Baseline sem instrumentação (antes de qualquer spawn Frida):
         #    estabelece se o app já morre sozinho, evitando classificar
         #    crash/lifecycle normal como reação do RASP.
         dynamic = any(
             check not in args.skip
-            for check in ("anti_frida", "anti_hooking", "ssl_pinning")
+            for check in ("anti_frida", "anti_hooking", "ssl_pinning", "anti_emulator")
         )
         if dynamic and not args.no_baseline:
             with console.status("[cyan]Executando baseline sem instrumentação...[/]"):
@@ -536,8 +533,25 @@ def run_pipeline(args: argparse.Namespace) -> int:
             ),
             skipped="ssl_pinning" in args.skip,
         )
+
+        # 12) Anti-Emulador (detecção + bypass).
+        #
+        # Roda por último e com spawns próprios: o probe faz o app
+        # enxergar um emulador, e o bypass oculta os artefatos decisivos.
+        # Um spawn compartilhado com a observação combinada contaminaria
+        # os outros checks — o app reagiria ao ambiente emulado, não à
+        # instrumentação.
+        _run_step(
+            reporter,
+            "anti_emulator",
+            lambda: AntiEmulatorCheck(
+                dm, mode=args.mode, no_java=args.no_java,
+                java_timeout=args.java_timeout,
+            ).run_all(args.package, window=args.window),
+            skipped="anti_emulator" in args.skip,
+        )
     finally:
-        # 10) Cleanup — nunca deixar resíduos no dispositivo.
+        # 13) Cleanup — nunca deixar resíduos no dispositivo.
         try:
             dm.stop_logcat_capture()
         except Exception:
@@ -557,7 +571,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         except Exception:
             logger.warning("Falha no cleanup final do dispositivo", exc_info=True)
 
-    # 11) Relatórios.
+    # 14) Relatórios.
     json_path, html_path = reporter.save()
     print_summary_table(reporter)
     console.print(f"\n[green]✓[/] Relatório JSON: [bold]{json_path}[/]")

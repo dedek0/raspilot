@@ -143,14 +143,14 @@ independent evidence source to correlate deaths (`SIGKILL`, `SIGSEGV`,
 Before any Frida spawn, an **uninstrumented baseline** checks whether the
 app already dies by itself, so instrumentation crashes or normal app
 lifecycle are not mistaken for a RASP reaction.
-Anti-Frida + anti-hooking observation runs in a **single session**, and anti-hooking/SSL bypasses share another spawn. The APK cache lives in `~/.raspilot/cache/apk` (disable with `RASPILOT_APK_CACHE=0`).
+Anti-Frida + anti-hooking observation runs in a **single session**, and anti-hooking/SSL bypasses share another spawn. The anti-emulator check runs **last**, with its own spawns: the probe makes the app see an emulator, and a shared spawn would contaminate the other checks. The APK cache lives in `~/.raspilot/cache/apk` (disable with `RASPILOT_APK_CACHE=0`).
 
 Status semantics:
 
 | Status | Meaning |
 |---|---|
-| `OK` | Environment/protection OK (e.g. physical device, SSL pinning resisted the bypass, app detected and blocked Frida/hooking) |
-| `FALHOU` | Threat present or bypass won (e.g. root/emulator in the environment, pinning circumvented, app failed to detect Frida or anti-hook checks) |
+| `OK` | Environment/protection OK (e.g. SSL pinning resisted the bypass, app detected and blocked Frida/hooking/emulator) |
+| `FALHOU` | Threat present or bypass won (e.g. root in the environment, pinning circumvented, app failed to detect Frida or anti-hook/anti-emulator checks) |
 | `N/A` | Not applicable: the protection being measured does not exist (e.g. no SSL pinning) |
 | `SKIP` | A step did not run: skipped via `--skip`, or the bypass was not evaluated even though the protection exists (reason in `skip_reason`) |
 | `ERROR` | Check could not conclude (pipeline continues) — includes inconclusive observation |
@@ -227,11 +227,44 @@ The corresponding bypass lives in `scripts/anti_frida_bypass.js`.
 
 ### 3. Anti-Emulator (`checks/anti_emulator.py`)
 
-Combines QEMU properties, kernel files, CPU architecture (x86 without
-Chromebook), sensor count, placeholder Bluetooth MAC and specific detection
-for Genymotion/LDPlayer/BlueStacks/Nox/Waydroid. Classifies
-`emulator_type` (`qemu_avd`, `genymotion`, `ldplayer`, `bluestacks`,
-`nox`, `waydroid`) with confidence.
+Answers two questions about the **target app** — not about the machine
+running the audit:
+
+1. does the app implement anti-emulator protection?
+2. can that protection be circumvented?
+
+Phases:
+
+- **Device context**: QEMU properties, kernel files, CPU architecture (x86
+  without Chromebook), sensor count, placeholder Bluetooth MAC and specific
+  detection for Genymotion/LDPlayer/BlueStacks/Nox/Waydroid. It is
+  **informative**: it tells which kind of machine the audit ran on, not
+  whether the app is protected.
+- **Static detection**: pulls the APK and scans for anti-emulator
+  signatures (detection methods/classes of RASP SDKs and fingerprint
+  strings such as `ro.kernel.qemu`, `goldfish`, `sdk_gphone`).
+- **Dynamic detection (probe)**: suspended spawn with
+  `scripts/emulator_spoof.js` in `probe` mode — the app starts to **see an
+  emulator** (`Build.*`, `SystemProperties`, `/dev/qemu_pipe`, IMEI,
+  `ANDROID_ID`). Every query the app makes to an emulator-sensitive
+  primitive is recorded, and the verdict relies on the app's reaction
+  (detection verdict, process death, threat log).
+- **Bypass (mask)**: another spawn in `mask` mode — the **decisive**
+  artifacts (Build, `ro.kernel.qemu`, `/dev/qemu_pipe`) are hidden while
+  the **secondary** ones a real emulator still exposes (zeroed IMEI,
+  emulator `ANDROID_ID`, carrier "Android") stay visible. That is the
+  realistic "emulator with a stealth layer" scenario: if the app still
+  reacts, it consults a channel that was not hidden — and the report says
+  which one.
+
+`protection_detected=False` ⇒ the app has no observable anti-emulator
+checks (RASP failure). `bypass_successful=True` ⇒ the protection exists,
+but the bypass won.
+
+When the app kills the **instrumentation agent** (anti-Frida), the
+observation is declared **inconclusive**: the death is not attributed to
+emulator detection, and the bypass is reported as `SKIP` with the reason
+recorded.
 
 ### 4. Anti-Hooking (`checks/anti_hooking.py`)
 
@@ -296,7 +329,7 @@ raspilot/
 ├── checks/
 │   ├── anti_root.py            # Multi-vector root detection
 │   ├── anti_frida.py           # Frida presence/detection
-│   ├── anti_emulator.py        # Emulator classification
+│   ├── anti_emulator.py        # Anti-emulator detection + bypass
 │   ├── anti_hooking.py         # Anti-hooking detection + bypass
 │   ├── combined.py             # Single-session observation/bypass
 │   ├── stealth.py              # Native bootstrap before resume
@@ -306,6 +339,7 @@ raspilot/
 │   ├── ssl_bypass.js           # Universal SSL pinning bypass (Frida)
 │   ├── anti_frida_bypass.js    # Frida detection bypass (Frida)
 │   ├── anti_hooking_bypass.js  # Hooking detection bypass (Frida)
+│   ├── emulator_spoof.js       # Emulator spoof: probe and mask (Frida)
 │   ├── verdict_hook.js         # Neutralises the RASP threat callback
 │   └── anti_root_bypass.js     # Root detection bypass (Frida)
 ├── rasp_vendors.py             # Catalogue of known RASP SDKs
@@ -356,7 +390,7 @@ be wrapped as MCP tools with `FastMCP`:
 | `raspilot_start_assessment(package_name, device_id=None) -> dict` | `DeviceManager.connect_adb()` + `setup_frida_server()` + pipeline |
 | `raspilot_check_anti_root(device_id) -> dict` | `AntiRootCheck(dm).run_all()` |
 | `raspilot_check_anti_frida(device_id) -> dict` | `AntiFridaCheck(dm).run_all(session, pid)` |
-| `raspilot_check_anti_emulator(device_id) -> dict` | `AntiEmulatorCheck(dm).run_all()` |
+| `raspilot_check_anti_emulator(device_id, package_name) -> dict` | `AntiEmulatorCheck(dm).run_all(package)` |
 | `raspilot_check_anti_hooking(device_id, package_name) -> dict` | `AntiHookingCheck(dm).run_all(package)` |
 | `raspilot_bypass_ssl_pinning(device_id, package_name) -> dict` | `SSLPinningCheck(dm).run_all(package)` |
 | `raspilot_get_report() -> dict` | `Reporter.generate_json()` |

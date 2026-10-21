@@ -38,9 +38,10 @@ RESULTS = {
         "timestamp": "2026-10-14T12:00:01+00:00",
     },
     "anti_emulator": {
-        "is_emulator": True,
-        "emulator_type": "qemu_avd",
-        "confidence": "high",
+        "protection_detected": True,
+        "bypass_successful": False,
+        "device_is_emulator": False,
+        "emulator_type": None,
         "checks": {},
         "timestamp": "2026-10-14T12:00:02+00:00",
     },
@@ -97,8 +98,8 @@ class TestGenerateJson:
                     "status": "FALHOU", "vulnerable": True, "frida_present": True,
                 },
                 "anti_emulator": {
-                    "status": "FALHOU", "is_emulator": True,
-                    "emulator_type": "qemu_avd", "confidence": "high",
+                    "status": "OK", "protection_detected": True,
+                    "bypass_successful": False, "device_is_emulator": False,
                 },
                 "ssl_pinning": {
                     "status": "FALHOU", "pinning_detected": True,
@@ -127,14 +128,38 @@ class TestGenerateJson:
         assert summary["anti_frida"]["status"] == "OK"
 
     def test_status_anti_emulator(self):
-        """Emulador detectado => FALHOU; dispositivo físico => OK."""
+        """Sem proteção => FALHOU; proteção que resiste => OK."""
         rep = Reporter(device_info=DEVICE, package_name="pkg")
-        rep.collect("anti_emulator", {"is_emulator": True, "emulator_type": "qemu_avd"})
+        rep.collect("anti_emulator", {"protection_detected": False})
         assert rep.generate_json()["summary"]["anti_emulator"]["status"] == "FALHOU"
 
         rep2 = Reporter(device_info=DEVICE, package_name="pkg")
-        rep2.collect("anti_emulator", {"is_emulator": False})
+        rep2.collect("anti_emulator", {
+            "protection_detected": True,
+            "bypass_successful": False,
+        })
         assert rep2.generate_json()["summary"]["anti_emulator"]["status"] == "OK"
+
+    def test_status_anti_emulator_bypass_won(self):
+        """Proteção existe, mas o bypass venceu => FALHOU."""
+        rep = Reporter(device_info=DEVICE, package_name="pkg")
+        rep.collect("anti_emulator", {
+            "protection_detected": True,
+            "bypass_successful": True,
+        })
+        assert rep.generate_json()["summary"]["anti_emulator"]["status"] == "FALHOU"
+
+    def test_status_anti_emulator_bypass_not_evaluated(self):
+        """Proteção existe, bypass não avaliado => SKIP (não OK)."""
+        rep = Reporter(device_info=DEVICE, package_name="pkg")
+        rep.collect("anti_emulator", {
+            "protection_detected": True,
+            "bypass_successful": None,
+            "bypass_skipped_reason": "modo detect: bypass não executado",
+        })
+        summary = rep.generate_json()["summary"]["anti_emulator"]
+        assert summary["status"] == "SKIP"
+        assert "detect" in summary["skip_reason"]
 
     def test_status_error_when_check_fails(self):
         """Check com error => status ERROR."""

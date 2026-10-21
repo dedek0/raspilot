@@ -11,6 +11,7 @@ from unittest import mock
 
 import pytest
 
+import checks.anti_emulator as anti_emulator_mod
 import checks.anti_frida as anti_frida_mod
 import checks.anti_hooking as anti_hooking_mod
 import checks.combined as combined_mod
@@ -97,6 +98,7 @@ def fast_windows():
     """Encurta as janelas de observação (sleeps) dos checks."""
     with mock.patch.object(anti_frida_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
          mock.patch.object(anti_hooking_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
+         mock.patch.object(anti_emulator_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
          mock.patch.object(ssl_pinning_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
          mock.patch.object(combined_mod, "OBSERVATION_POLL_INTERVAL", 0.0):
         yield
@@ -163,7 +165,9 @@ def test_pipeline_end_to_end(tmp_path, fast_windows, runtime_mocks, capsys):
     assert doc["summary"]["anti_root"]["status"] == "FALHOU"
     assert doc["summary"]["anti_frida"]["status"] == "FALHOU"
     assert doc["summary"]["ssl_pinning"]["status"] == "FALHOU"
-    assert doc["summary"]["anti_emulator"]["status"] == "OK"
+    # Cenário mockado: sem APK e sem reação do app ao ambiente emulado,
+    # o check não encontra proteção anti-emulador.
+    assert doc["summary"]["anti_emulator"]["status"] == "FALHOU"
     assert doc["summary"]["anti_hooking"]["status"] == "FALHOU"
 
     html = htmls[0].read_text(encoding="utf-8")

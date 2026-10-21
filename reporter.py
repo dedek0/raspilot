@@ -24,9 +24,20 @@ from device_manager import TOOL_NAME, TOOL_VERSION
 # Versão do schema do documento JSON. Incrementada quando a forma do
 # relatório muda de modo incompatível, para que um consumidor possa
 # detectar a mudança em vez de interpretar campos ausentes.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 logger = logging.getLogger("raspilot.reporter")
+
+# Ordem de apresentação dos checks no relatório. A execução dos checks
+# dinâmicos não segue essa ordem (o anti-emulador precisa de spawns
+# próprios e roda por último), mas o relatório mantém a ordem estável.
+REPORT_ORDER = (
+    "anti_root",
+    "anti_emulator",
+    "anti_frida",
+    "anti_hooking",
+    "ssl_pinning",
+)
 
 # Diretório dos templates Jinja2 (relativo a este arquivo).
 TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
@@ -132,15 +143,34 @@ class Reporter:
             return ("FALHOU" if vulnerable else "OK"), summary
 
         if check_name == "anti_emulator":
-            is_emulator = bool(result.get("is_emulator"))
-            return (
-                "FALHOU" if is_emulator else "OK",
-                {
-                    "is_emulator": is_emulator,
-                    "emulator_type": result.get("emulator_type"),
-                    "confidence": result.get("confidence"),
-                },
-            )
+            # Semântica igual à do anti_hooking: o que interessa é a
+            # proteção do APP, e não o tipo de máquina da auditoria.
+            # O contexto do dispositivo vai no resumo como informação.
+            protected = bool(result.get("protection_detected"))
+            bypass = result.get("bypass_successful")
+            summary = {
+                "protection_detected": protected,
+                "bypass_successful": bypass,
+                "device_is_emulator": bool(result.get("device_is_emulator")),
+            }
+            blocked = bool((result.get("bypass_details") or {}).get("blocked"))
+            if blocked:
+                summary["blocked_reason"] = (
+                    "o app bloqueou a auditoria durante o bypass"
+                )
+            if not protected:
+                status = "FALHOU"  # app sem proteção anti-emulador
+            elif bypass is True:
+                status = "FALHOU"  # proteção existe, mas o bypass venceu
+            elif bypass is False:
+                status = "OK"  # proteção resistiu ao bypass
+            else:
+                status = "SKIP"
+                summary["skip_reason"] = (
+                    result.get("bypass_skipped_reason")
+                    or "bypass não avaliado"
+                )
+            return status, summary
 
         if check_name == "anti_hooking":
             # Sem proteção anti-hook o RASP falha (mesma lógica do
@@ -226,6 +256,20 @@ class Reporter:
             status, resumo = self._status_for(check_name, result)
             resumo["status"] = status
             summary[check_name] = resumo
+
+        # Ordem estável: os checks dinâmicos podem ser executados fora
+        # da ordem canônica (o anti-emulador faz spawns próprios), mas o
+        # relatório é lido como uma sequência de verificações.
+        if len(summary) > 1:
+            ordered = {
+                name: summary[name]
+                for name in REPORT_ORDER
+                if name in summary
+            }
+            for name, value in summary.items():
+                if name not in ordered:
+                    ordered[name] = value
+            summary = ordered
 
         metadata: Dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,

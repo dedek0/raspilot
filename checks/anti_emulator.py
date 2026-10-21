@@ -1,31 +1,93 @@
-"""RASPilot — Verificação Anti-Emulador.
+"""RASPilot — Verificação Anti-Emulador (detecção e bypass).
 
-Detecta se o ambiente de execução é um emulador (AVD/QEMU, Genymotion,
-LDPlayer, BlueStacks, Nox, Waydroid) combinando múltiplos vetores
-(propriedades do build, arquivos do kernel, arquitetura de CPU,
-sensores, MAC de Bluetooth e packages específicos) e classifica o tipo
-de emulador com nível de confiança.
+O objetivo deste check é responder duas perguntas sobre o **app alvo**:
+
+1. O app implementa proteção anti-emulador? (detecção)
+2. Essa proteção pode ser contornada? (bypass)
+
+A versão anterior do check media outra coisa: ela classificava o
+**dispositivo de auditoria** como emulador ou não. Isso não diz nada
+sobre a proteção do app — e produzia o veredito invertido (auditar de um
+emulador marcava ``FALHOU`` mesmo para apps sem proteção alguma).
+
+O check atual tem três fases:
+
+1. **Contexto do dispositivo**: os vetores de classificação de emulador
+   (propriedades, arquivos de kernel, ABI, sensores, MAC de Bluetooth,
+   Genymotion/BlueStacks/Nox/Waydroid) passam a ser *contexto* — dizem
+   em que tipo de máquina a auditoria rodou, e não se o app é ou não
+   protegido.
+2. **Detecção estática**: assinaturas anti-emulador no APK (SDKs de
+   RASP, métodos de detecção e strings de fingerprint).
+3. **Detecção dinâmica + bypass**: um *probe* que faz o app enxergar um
+   emulador (modo ``probe``) e um *bypass* que esconde os artefatos
+   decisivos de emulador (modo ``mask``).
+
+O bypass usa o mesmo mecanismo do probe com a camada de máscara: no
+modo ``mask`` os artefatos **decisivos** (Build, ``ro.kernel.qemu``,
+``/dev/qemu_pipe``...) ficam ocultos, enquanto os artefatos
+**secundários** que um emulador real deixa expostos (IMEI zerado,
+``ANDROID_ID`` de emulador, telco "Android") continuam visíveis. É o
+cenário realista de "emulador com camada de stealth": se o app ainda
+reage, é porque consulta um canal que não foi ocultado — e o relatório
+diz qual.
 
 Marca: RASPilot — Piloto Automático de Auditoria RASP para Android.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+import tempfile
+import time
+import zipfile
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+from checks.apk_utils import pull_apk, scan_apk
+from checks.stealth import load_stealth, unload_stealth
+from logcat_analyzer import (
+    HIGH_CONFIDENCE_CATEGORIES,
+    analyze_since,
+    format_evidence,
+    get_logcat_mark,
+)
+from script_loader import load_script_file, safe_detach, safe_unload
 
 if TYPE_CHECKING:  # evita import circular em tempo de importação
     from device_manager import DeviceManager
 
 logger = logging.getLogger("raspilot.checks.anti_emulator")
 
+# Intervalo entre as consultas feitas durante a janela de observacao.
+# Exposto como constante para que os testes nao dependam de esperar
+# tempo real.
+OBSERVATION_POLL_INTERVAL = 1.0
+
+# Script de spoof de emulador (probe/mask).
+SPOOF_SCRIPT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "scripts",
+    "emulator_spoof.js",
+)
+
+# Script de rastreio de morte do processo.
+KILL_TRACE_SCRIPT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "scripts",
+    "kill_trace.js",
+)
+
+# ----------------------------------------------------------------------
+# Classificação do dispositivo (contexto da auditoria)
+# ----------------------------------------------------------------------
 # Arquivos típicos de emuladores (QEMU, Genymotion, etc.).
 EMULATOR_FILES = [
     "/dev/qemu_pipe",
     "/dev/socket/qemud",
-    "/dev/socket/genyd",
     "/system/lib/libc_malloc_debug_qemu.so",
     "/system/lib64/libc_malloc_debug_qemu.so",
     "/sys/qemu_trace",
@@ -43,7 +105,86 @@ QEMU_PROPS = {
 }
 QEMU_HARDWARE = ("goldfish", "ranchu", "vbox86")
 EMULATOR_MANUFACTURERS = ("unknown", "genymotion")
-EMULATOR_MODELS = ("sdk", "emulator", "android sdk built for x86", "android sdk built for x86_64")
+EMULATOR_MODELS = (
+    "sdk",
+    "sdk_gphone",
+    "sdk_gphone32",
+    "sdk_gphone64",
+    "sdk_gphone64_x86_64",
+    "emulator",
+    "android sdk built for x86",
+    "android sdk built for x86_64",
+)
+
+# ----------------------------------------------------------------------
+# Detecção estática no APK
+# ----------------------------------------------------------------------
+# Assinaturas anti-emulador no APK: (tipo, [(needle_bytes, descrição)]).
+#
+# "emulator_sdk" são nomes de métodos/classes de detecção — a presença
+# deles é evidência forte de que o app checa emulador. "emulator_strings"
+# são marcadores de fingerprint: a presença é um indício (o app pode
+# apenas carregá-los), e por isso fica separada.
+STATIC_SIGNATURES: List[Tuple[str, List[Tuple[bytes, str]]]] = [
+    ("emulator_sdk", [
+        (b"DexGuardEmulatorDetected", "DexGuard: detecção de emulador"),
+        (b"DexGuardVirtualEnvDetected", "DexGuard: ambiente virtual"),
+        (b"SecurityEnvironment_EmulatorBuild", "SecurityEnvironment: build de emulador"),
+        (b"EmulatorAbiDetected", "detecção de ABI de emulador"),
+        (b"GoogleEmulatorDetected", "detecção de emulador Google"),
+        (b"EmulatorFound", "EmulatorFound"),
+        (b"isProbablyAnEmulator", "isProbablyAnEmulator"),
+        (b"isRunningOnStockEmulator", "isRunningOnStockEmulator"),
+        (b"isRunningOnEmulator", "isRunningOnEmulator"),
+        (b"deviceIsEmulator", "deviceIsEmulator"),
+        (b"isOnEmulator", "isOnEmulator"),
+        (b"isEmulatorSync", "isEmulatorSync"),
+        (b"EmulatorCapability", "EmulatorCapability"),
+        (b"EmulatorUtilities", "EmulatorUtilities"),
+    ]),
+    ("emulator_strings", [
+        (b"ro.kernel.qemu", "propriedade ro.kernel.qemu"),
+        (b"/dev/qemu_pipe", "path /dev/qemu_pipe"),
+        (b"/dev/socket/qemud", "path /dev/socket/qemud"),
+        (b"goldfish", "string goldfish"),
+        (b"ranchu", "string ranchu"),
+        (b"sdk_gphone", "string sdk_gphone"),
+        (b"generic_x86", "string generic_x86"),
+        (b"Android SDK built for", "string 'Android SDK built for'"),
+        (b"vbox86", "string vbox86"),
+    ]),
+]
+
+# Prioridade do tipo principal quando há várias assinaturas no APK.
+STATIC_PRIORITY = ["emulator_sdk", "emulator_strings"]
+
+# ----------------------------------------------------------------------
+# Reação do app ao ambiente emulado
+# ----------------------------------------------------------------------
+# Linhas de logcat que indicam que o app identificou o emulador.
+#
+# O critério é objetivo: a linha cita um nome de ameaça de SDK de RASP,
+# ou uma afirmação explícita de detecção de emulador. Termos genéricos
+# ("emulator") sozinho não bastam: apps imprimem "emulator" em mensagens
+# de erro comuns.
+EMULATOR_THREAT_PATTERNS = (
+    re.compile(
+        r"\b(DexGuardEmulatorDetected|GoogleEmulatorDetected|"
+        r"EmulatorAbiDetected|EmulatorFound|isProbablyAnEmulator)\b"
+    ),
+    re.compile(
+        r"\b(emulator detected|detected emulator|detecting emulator|"
+        r"emulator build|emulatorbuild|is an emulator)\b",
+        re.I,
+    ),
+    re.compile(r"\b(virtual environment|virtualenv)\b", re.I),
+    re.compile(r"\b(ro\.kernel\.qemu|goldfish|ranchu|vbox86|sdk_gphone)\b", re.I),
+)
+
+# Canais do probe: 'decisive' (nenhum device real tem) e 'secondary'
+# (artefatos que um emulador real deixa expostos).
+DECISIVE_CHANNEL = "decisive"
+SECONDARY_CHANNEL = "secondary"
 
 
 def _now_iso() -> str:
@@ -56,15 +197,29 @@ def _now_iso() -> str:
 
 
 class AntiEmulatorCheck:
-    """Detecta emuladores Android por combinação de evidências."""
+    """Detecta proteção anti-emulador do app e testa o bypass."""
 
-    def __init__(self, dm: "DeviceManager") -> None:
+    def __init__(
+        self,
+        dm: "DeviceManager",
+        mode: str = "bypass",
+        no_java: bool = False,
+        java_timeout: float = 30.0,
+    ) -> None:
         """Inicializa o check com o gerenciador de dispositivo.
 
         Args:
             dm: Instância conectada de ``DeviceManager``.
+            mode: ``detect``, ``bypass`` ou ``stealth``.
+            no_java: Se True, não tenta carregar hooks Java.
+            java_timeout: Tempo máximo de carga dos scripts Java, em
+                segundos. A bridge Java domina o tempo de carga e um
+                limite curto descarta o script no meio da execução.
         """
         self.dm = dm
+        self.mode = mode
+        self.no_java = no_java
+        self.java_timeout = java_timeout
 
     # ------------------------------------------------------------------
     # Helpers
@@ -81,8 +236,36 @@ class AntiEmulatorCheck:
         res = self.dm.run_shell(f"getprop {prop}", timeout=10)
         return res["stdout"].strip() if res["ok"] else ""
 
+    def _shell(self, command: str, timeout: int = 20) -> dict:
+        """Executa um comando shell e retorna a resposta estruturada."""
+        return self.dm.run_shell(command, timeout=timeout)
+
+    def _baseline(self) -> Optional[dict]:
+        """Retorna o baseline somente se ele for um dict válido."""
+        value = getattr(self.dm, "baseline", None)
+        return value if isinstance(value, dict) else None
+
+    def _script_replacements(self, mode: str, java_only: bool = False) -> Dict[str, str]:
+        """Placeholders de configuração injetados nos scripts Frida.
+
+        Args:
+            mode: ``probe`` (app enxerga emulador) ou ``mask`` (artefatos
+                decisivos ocultos).
+            java_only: True para a fase Java.
+
+        Returns:
+            Mapa de placeholders.
+        """
+        return {
+            # O modo é uma string: o placeholder é substituído por um
+            # literal JS entre aspas, e não por um identificador.
+            "__RASPILOT_EMU_MODE__": json.dumps(mode),
+            "__RASPILOT_JAVA_ONLY__": "true" if java_only else "false",
+            "__RASPILOT_PACKAGE_NAME__": getattr(self.dm, "last_spawn_package", None) or "",
+        }
+
     # ------------------------------------------------------------------
-    # Vetores
+    # Fase 1 — contexto do dispositivo
     # ------------------------------------------------------------------
     def check_emulator_props(self) -> dict:
         """Compara propriedades do build com padrões de emulador.
@@ -164,7 +347,7 @@ class AntiEmulatorCheck:
 
         ``x86``/``x86_64`` em Android é forte indício de emulador (AVD,
         BlueStacks, Nox, LDPlayer) — exceto Chromebooks (verificados via
-        ``ro.boot.hardware.chromebook`` ou fingerprint 'hatch'/'octopus').
+        ``ro.boot.hardware`` ou fingerprint 'hatch'/'octopus').
 
         Returns:
             Dict com ``detected``, ``evidence``, ``details`` e
@@ -196,14 +379,20 @@ class AntiEmulatorCheck:
     def check_sensors(self) -> dict:
         """Conta sensores via ``dumpsys sensorservice``.
 
-        Emuladores normalmente expõem menos de 3 sensores (faltam
-        acelerômetro/giroscópio reais).
+        O formato da saída mudou no Android 10: a lista passou a usar
+        ``0x00000001) nome | fabricante | ...`` em vez de ``- Nome``. O
+        parser antigo (que só entendia o formato antigo) deixava o
+        vetor permanentemente "indisponível" — e um vetor indisponível
+        não é evidência de nada.
+
+        Emuladores com menos de 3 sensores (ou com sensores de nome
+        virtual) são indício de ambiente emulado.
 
         Returns:
             Dict com ``detected`` (True se < 3 sensores), ``evidence``,
             ``sensor_count`` e ``details``.
         """
-        res = self.dm.run_shell("dumpsys sensorservice 2>/dev/null | grep -E '^\\s+- '")
+        res = self.dm.run_shell("dumpsys sensorservice 2>/dev/null")
         if not res["ok"] and not res["stdout"]:
             return {
                 "detected": False,
@@ -213,20 +402,85 @@ class AntiEmulatorCheck:
                 "error": res["stderr"] or f"rc={res['rc']}",
             }
 
-        sensors = [line.strip() for line in res["stdout"].splitlines() if line.strip().startswith("-")]
+        stdout = res["stdout"] or ""
+        sensors = self._parse_sensors(stdout)
         count = len(sensors)
-        detected = 0 < count < 3
+
+        # Nomes de sensor de emulador/virtual (goldfish, AOSP Emulator).
+        virtual = [s for s in sensors if self._is_virtual_sensor(s)]
+        detected = bool(virtual) or (0 < count < 3)
+
+        evidence: List[str] = []
+        if count:
+            evidence.append(f"{count} sensores: {', '.join(sensors[:5])}")
+        if virtual:
+            evidence.append(f"sensores virtuais: {', '.join(virtual[:5])}")
+
         result = {
             "detected": detected,
             "sensor_count": count,
-            "evidence": [f"{count} sensores: {', '.join(sensors[:5])}"],
+            "evidence": evidence,
             "details": (
-                f"Apenas {count} sensores — típico de emulador" if detected
+                f"{count} sensores — típico de emulador" if detected
                 else f"{count} sensores — plausível para dispositivo físico"
             ),
         }
         logger.debug("check_sensors: count=%s detected=%s", count, detected)
         return result
+
+    @staticmethod
+    def _parse_sensors(output: str) -> List[str]:
+        """Extrai os nomes dos sensores da saída do ``dumpsys sensorservice``.
+
+        Entende os dois formatos: o antigo (``- Nome``) e o atual
+        (``0x00000001) Nome | fabricante | ...``). No formato atual, só a
+        seção ``Sensor List:`` é contada — a seção ``Sensor Device:``
+        lista clientes, não sensores.
+
+        Args:
+            output: Saída completa do comando.
+
+        Returns:
+            Lista com os nomes dos sensores.
+        """
+        names: List[str] = []
+        in_list = False
+        for raw in output.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if line.lower().startswith("sensor list"):
+                in_list = True
+                continue
+            if line.lower().startswith("sensor device"):
+                in_list = False
+                continue
+            # Formato atual: "0x00000001) accelerometer_stk8321 | ..."
+            match = re.match(r"^0x[0-9a-fA-F]{8}\)\s*([^|]+)", line)
+            if match:
+                if in_list:
+                    names.append(match.group(1).strip())
+                continue
+            # Formato antigo: "- LSM6DSO Accelerometer"
+            if line.startswith("- "):
+                names.append(line[2:].strip())
+        return names
+
+    @staticmethod
+    def _is_virtual_sensor(name: str) -> bool:
+        """Indica se o nome do sensor denuncia um ambiente virtual.
+
+        Args:
+            name: Nome do sensor.
+
+        Returns:
+            True para nomes típicos de emulador.
+        """
+        low = name.lower()
+        return any(
+            marker in low
+            for marker in ("goldfish", "aosp emulator", "android emulator", "virtual")
+        )
 
     def check_bluetooth_mac(self) -> dict:
         """Verifica o MAC de Bluetooth via ``settings``.
@@ -299,7 +553,6 @@ class AntiEmulatorCheck:
             Dict com ``detected``, ``types`` (lista), ``evidence`` e
             ``details``.
         """
-        # tipo: [(regex de marker, descrição), ...]
         signatures: Dict[str, List[Tuple[str, str]]] = {
             "ldplayer": [
                 (r"ldplayer|dnplayer|flysilkworm", "LDPlayer"),
@@ -308,8 +561,6 @@ class AntiEmulatorCheck:
                 (r"bluestacks|bstlauncher", "BlueStacks"),
             ],
             "nox": [
-                # negative lookbehind/lookahead evitam substrings como
-                # "knox"; "noxd"/"noxroid" continuam casando.
                 (r"(?<![a-zA-Z])nox(d|roid)?(?![a-zA-Z])|com\.bignox", "Nox"),
             ],
             "waydroid": [
@@ -343,64 +594,12 @@ class AntiEmulatorCheck:
         logger.debug("check_third_party_emulators: types=%s", found_types)
         return result
 
-    # ------------------------------------------------------------------
-    # Consolidação
-    # ------------------------------------------------------------------
-    def _classify(
-        self,
-        props: dict,
-        files: dict,
-        genymotion: dict,
-        third_party: dict,
-        cpu: dict,
-    ) -> Tuple[Optional[str], int]:
-        """Classifica o tipo de emulador e pontua a confiança.
-
-        Args:
-            props: Resultado de ``check_emulator_props``.
-            files: Resultado de ``check_emulator_files``.
-            genymotion: Resultado de ``check_genymotion``.
-            third_party: Resultado de ``check_third_party_emulators``.
-            cpu: Resultado de ``check_cpu_architecture``.
+    def classify_device(self) -> dict:
+        """Classifica o dispositivo de auditoria (contexto, não veredito).
 
         Returns:
-            Tupla ``(emulator_type, pontuação)`` — o tipo é ``None``
-            quando não classificado; a pontuação alimenta a confiança.
-        """
-        evidence_blob = " ".join(
-            list(props.get("evidence", []))
-            + list(files.get("evidence", []))
-            + list(genymotion.get("evidence", []))
-            + list(third_party.get("evidence", []))
-        ).lower()
-
-        # Ordem importa: genymotion/terceiros antes do fallback QEMU.
-        if genymotion.get("detected"):
-            return "genymotion", 3
-        for emu_type in third_party.get("types", []):
-            return emu_type, 3
-        if props.get("detected") or files.get("detected"):
-            # Combinação de props + files ⇒ QEMU/AVD (alta confiança).
-            if props.get("detected") and files.get("detected"):
-                return "qemu_avd", 3
-            if cpu.get("detected"):
-                return "qemu_avd", 2
-            return "qemu_avd", 2
-        if cpu.get("detected"):
-            # x86 sem demais sinais: indício médio (pode ser Chromebook/Win11 ARM).
-            return None, 1
-        if evidence_blob:
-            return None, 1
-        return None, 0
-
-    def run_all(self) -> dict:
-        """Executa todos os vetores anti-emulador e consolida o veredito.
-
-        Returns:
-            Dict com ``is_emulator`` (bool), ``emulator_type``
-            ('qemu_avd'|'genymotion'|'ldplayer'|'bluestacks'|'nox'|
-            'waydroid'|None), ``confidence`` ('high'|'medium'|'low'),
-            ``checks`` (por vetor) e ``timestamp`` (ISO8601).
+            Dict com ``is_emulator``, ``emulator_type``, ``confidence``,
+            ``checks`` (por vetor) e ``details``.
         """
         checks = {
             "emulator_props": self.check_emulator_props(),
@@ -412,60 +611,845 @@ class AntiEmulatorCheck:
             "third_party_emulators": self.check_third_party_emulators(),
         }
 
-        emulator_type, score = self._classify(
-            checks["emulator_props"],
-            checks["emulator_files"],
-            checks["genymotion"],
-            checks["third_party_emulators"],
-            checks["cpu_architecture"],
-        )
+        props = checks["emulator_props"]
+        files = checks["emulator_files"]
+        cpu = checks["cpu_architecture"]
+        geny = checks["genymotion"]
+        third = checks["third_party_emulators"]
 
-        # Sinais fortes diretos (props QEMU, genymotion, terceiros) ⇒ high.
-        strong = (
-            checks["emulator_props"].get("detected")
-            or checks["emulator_files"].get("detected")
-            or checks["genymotion"].get("detected")
-            or checks["third_party_emulators"].get("detected")
-        )
-        # Sinais fracos (sensores, MAC placeholder) somam à decisão.
-        weak = checks["sensors"].get("detected") or checks["bluetooth_mac"].get("detected")
-
-        is_emulator = bool(strong or (checks["cpu_architecture"].get("detected") and weak))
-
-        # Sem vetor efetivamente avaliado não há conclusão: um device
-        # inacessível não pode ser declarado "físico".
-        evaluated = [
-            name for name, res in checks.items() if not res.get("error")
-        ]
-        failed = [name for name, res in checks.items() if res.get("error")]
-
-        if is_emulator and strong:
-            confidence = "high"
-        elif is_emulator:
-            confidence = "medium"
-        elif not evaluated:
-            confidence = "none"
-        elif weak or checks["cpu_architecture"].get("detected"):
-            confidence = "low"
+        if geny.get("detected"):
+            emulator_type = "genymotion"
+        elif third.get("types"):
+            emulator_type = third["types"][0]
+        elif props.get("detected") or files.get("detected"):
+            emulator_type = "qemu_avd"
+        elif cpu.get("detected"):
+            emulator_type = None  # x86 sem demais sinais: pode ser outro ambiente
         else:
-            confidence = "high"  # todos os vetores negativos = confiante: físico
+            emulator_type = None
+
+        strong = bool(
+            props.get("detected") or files.get("detected")
+            or geny.get("detected") or third.get("detected")
+        )
+        is_emulator = bool(
+            strong or (cpu.get("detected") and checks["sensors"].get("detected"))
+        )
+        if not is_emulator:
+            confidence = "high"
+        elif strong:
+            confidence = "high"
+        else:
+            confidence = "medium"
 
         result = {
             "is_emulator": is_emulator,
             "emulator_type": emulator_type if is_emulator else None,
             "confidence": confidence,
-            "evaluated_vectors": evaluated,
-            "failed_vectors": failed,
             "checks": checks,
+            "details": (
+                f"Dispositivo de auditoria emulado ({emulator_type})" if is_emulator
+                else "Dispositivo de auditoria físico"
+            ),
+        }
+        logger.info(
+            "Contexto do dispositivo: is_emulator=%s type=%s",
+            is_emulator, result["emulator_type"],
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Fase 2 — detecção estática
+    # ------------------------------------------------------------------
+    def detect_static(self, package_name: str, apk_path: Optional[str] = None) -> dict:
+        """Detecta assinaturas anti-emulador no APK do app.
+
+        Procura classes/métodos de detecção de emulador e strings de
+        fingerprint de emulador.
+
+        Args:
+            package_name: Package name do app alvo.
+            apk_path: Caminho opcional de um APK local (pula o ``adb pull``).
+
+        Returns:
+            Dict com ``static_detected``, ``types``, ``primary``,
+            ``evidence``, ``confidence`` e, em falha de pull, ``error``.
+        """
+        with tempfile.TemporaryDirectory(prefix="raspilot_emu_") as tmp:
+            if apk_path:
+                apks = [apk_path]
+            else:
+                apks = pull_apk(self.dm, package_name, tmp)
+                if not apks:
+                    return {
+                        "static_detected": False,
+                        "types": [],
+                        "primary": None,
+                        "evidence": [],
+                        "error": f"Não foi possível obter o APK de {package_name}",
+                    }
+
+            all_found: Dict[str, List[str]] = {}
+            for apk in apks:
+                try:
+                    found = scan_apk(apk, STATIC_SIGNATURES)
+                except zipfile.BadZipFile as exc:
+                    logger.warning("APK inválido: %s", exc)
+                    continue
+                for sig_type, evidences in found.items():
+                    all_found.setdefault(sig_type, []).extend(evidences)
+
+        if not all_found:
+            return {
+                "static_detected": False,
+                "types": [],
+                "primary": None,
+                "evidence": [],
+                "confidence": "none",
+                "details": "Nenhuma assinatura anti-emulador no APK",
+            }
+
+        chosen = sorted(
+            all_found.keys(),
+            key=lambda t: STATIC_PRIORITY.index(t) if t in STATIC_PRIORITY else 99,
+        )[0]
+        evidence = [f"[{t}] {e}" for t, items in all_found.items() for e in items]
+        confidence = "high" if "emulator_sdk" in all_found else "medium"
+
+        result = {
+            "static_detected": True,
+            "types": sorted(all_found.keys()),
+            "primary": chosen,
+            "evidence": evidence,
+            "confidence": confidence,
+            "details": f"Assinaturas anti-emulador no APK (principal: {chosen})",
+        }
+        logger.info("Assinaturas anti-emulador detectadas: type=%s", chosen)
+        return result
+
+    # ------------------------------------------------------------------
+    # Fase 3 — observação dinâmica (probe)
+    # ------------------------------------------------------------------
+    def check_emulator_detection_in_app(
+        self,
+        session: object,
+        on_script_loaded: Optional[object] = None,
+        window: int = 12,
+        pid: Optional[int] = None,
+        package_name: Optional[str] = None,
+        logcat_mark: Optional[int] = None,
+    ) -> dict:
+        """Observa se o app detecta o ambiente emulado (probe).
+
+        Injeta um script que faz o app **enxergar um emulador** e
+        registra as consultas que ele faz às primitivas sensíveis. O
+        veredito se apoia na reação do app (veredito de detecção, morte
+        do processo, log de ameaça) — não no simples fato de o hook ter
+        sido instalado.
+
+        Args:
+            session: Sessão Frida ativa sobre o app alvo.
+            on_script_loaded: Callback chamado logo após ``script.load()``
+                — usado para ``resume`` de spawn suspenso.
+            window: Janela de observação em segundos.
+            pid: PID do processo alvo (para monitorar se o app morre).
+            package_name: Package name do app alvo.
+            logcat_mark: Marcador de logcat tirado antes do spawn.
+
+        Returns:
+            Dict com ``detected``, ``detection_methods_found``,
+            ``strong_signals``, ``weak_signals``, ``channels``,
+            ``app_alive_at_end`` e ``observation_status``.
+        """
+        found: List[str] = []
+        strong: List[str] = []
+        weak: List[str] = []
+        channels: Dict[str, List[str]] = {DECISIVE_CHANNEL: [], SECONDARY_CHANNEL: []}
+        spoofed: List[str] = []
+        script = None
+        java_script = None
+        kill_script = None
+        java_load_error: Optional[str] = None
+        stealth_loaded: List[tuple] = []
+        resumed = False
+        died_after: Optional[int] = None
+        notes: List[str] = []
+
+        def add_signal(method: str, detail: str, strong_signal: bool) -> None:
+            entry = f"{method}: {detail}"
+            if entry not in found:
+                found.append(entry)
+                (strong if strong_signal else weak).append(entry)
+                logger.info("App consultou primitiva de emulador -> %s", entry)
+
+        def on_message(message, data):  # noqa: ANN001 - assinatura frida
+            if message.get("type") == "send":
+                payload = message.get("payload", {})
+                ptype = payload.get("type")
+                if ptype == "emulator-detection":
+                    channel = payload.get("channel", SECONDARY_CHANNEL)
+                    method = payload.get("method", "?")
+                    detail = payload.get("detail", "")
+                    kind = payload.get("kind", "query")
+                    entry = f"{method}: {detail}"
+                    if kind == "spoof":
+                        # A instrumentação trocou o valor: isso é
+                        # diagnóstico do spoof, não consulta do app.
+                        if entry not in spoofed:
+                            spoofed.append(entry)
+                        return
+                    if kind == "mask":
+                        if entry not in spoofed:
+                            spoofed.append(entry)
+                        return
+                    if channel not in channels:
+                        channels[channel] = []
+                    if entry not in channels[channel]:
+                        channels[channel].append(entry)
+                    # O veredito do próprio app (isEmulated, onEmulatorDetected)
+                    # é a evidência mais forte: a checagem foi exercitada.
+                    is_verdict = method.startswith("verdict:")
+                    is_strong = is_verdict or channel == DECISIVE_CHANNEL
+                    add_signal(method, detail, is_strong)
+                    return
+                if ptype == "emulator-note":
+                    msg = payload.get("message", "")
+                    if msg and msg not in notes:
+                        notes.append(msg)
+                    return
+                if ptype == "emulator-error":
+                    msg = payload.get("message", "")
+                    if msg and msg not in notes:
+                        notes.append(msg)
+                    return
+                if ptype == "app-kill":
+                    msg = payload.get("message", "")
+                    # "kill-trace carregado" é o carregamento do
+                    # observador de kill, não um kill.
+                    if not msg or "carregado" in msg:
+                        return
+                    add_signal("app_kill", msg, True)
+                    return
+                if ptype == "raspilot-script-error":
+                    msg = str(payload.get("message", ""))
+                    if msg and msg not in notes:
+                        notes.append(msg)
+                    logger.warning("Erro em script de observação: %s", msg)
+                    return
+            elif message.get("type") == "error":
+                logger.debug("Erro no script anti-emulador: %s", message.get("description"))
+
+        try:
+            # A evasão anti-Frida é carregada para que a reação observada
+            # seja do ambiente emulado, e não da instrumentação: um app
+            # com anti-Frida morreria no probe por um motivo alheio ao
+            # que estamos medindo.
+            stealth_loaded = load_stealth(
+                session,
+                on_message=on_message,
+                replacements=self._script_replacements("probe"),
+                include_proc_filter=True,
+            )
+            # Fase 1 (antes do resume): hooks nativos do spoof.
+            script = load_script_file(
+                session, SPOOF_SCRIPT, on_message=on_message,
+                replacements=self._script_replacements("probe", java_only=False),
+                with_java_bridge=False, load_timeout=5.0,
+            )
+            if on_script_loaded is not None:
+                on_script_loaded()
+                resumed = True
+            # Fase 2 (após o resume): hooks Java do spoof.
+            if not self.no_java:
+                try:
+                    java_script = load_script_file(
+                        session, SPOOF_SCRIPT, on_message=on_message,
+                        replacements=self._script_replacements("probe", java_only=True),
+                        with_java_bridge=True, load_timeout=self.java_timeout,
+                    )
+                except Exception as exc:
+                    java_load_error = str(exc)
+                    logger.warning("Hooks Java anti-emulador não carregaram: %s", exc)
+                    safe_detach(session)
+            if java_load_error is None and not self.no_java:
+                try:
+                    kill_script = load_script_file(
+                        session, KILL_TRACE_SCRIPT, on_message=on_message,
+                        load_timeout=3.0,
+                    )
+                except Exception:
+                    logger.debug("kill_trace.js indisponível na observação", exc_info=True)
+            for elapsed in range(max(1, int(window))):
+                time.sleep(OBSERVATION_POLL_INTERVAL)
+                if pid is not None and not self.dm.is_app_alive(pid):
+                    died_after = elapsed + 1
+                    logger.info(
+                        "Processo %s encerrou durante o probe anti-emulador (~%ss)",
+                        pid, died_after,
+                    )
+                    break
+        except Exception as exc:
+            logger.warning("Falha ao observar checagens anti-emulador", exc_info=True)
+            return {
+                "detected": False,
+                "detection_methods_found": [],
+                "strong_signals": [],
+                "weak_signals": [],
+                "channels": channels,
+                "app_alive_at_end": None,
+                "observed": False,
+                "observation_status": "error",
+                "error": str(exc),
+            }
+        finally:
+            safe_unload(script)
+            safe_unload(java_script)
+            safe_unload(kill_script)
+            unload_stealth(stealth_loaded)
+            if not resumed and on_script_loaded is not None:
+                try:
+                    on_script_loaded()
+                except Exception:
+                    logger.debug("Falha no resume de emergência", exc_info=True)
+
+        if died_after is None and pid is not None:
+            try:
+                if not self.dm.is_app_alive(pid):
+                    died_after = max(1, int(window))
+                    logger.info("Processo %s morreu após a janela do probe", pid)
+            except Exception:
+                logger.debug("Falha na rechecagem de vida", exc_info=True)
+
+        logcat = analyze_since(self.dm, logcat_mark, package_name, pid)
+        baseline = self._baseline()
+
+        # Reação do app no logcat: o app dizendo que detectou emulador.
+        for line in self._emulator_threat_lines(logcat):
+            add_signal("logcat_emulator", line, True)
+
+        death_cause = None
+        death_classification = None
+        app_alive = died_after is None
+        if not app_alive:
+            try:
+                death_cause = self.dm.capture_death_cause(
+                    pid=pid, package=package_name
+                )
+            except Exception:
+                logger.debug("Falha ao capturar causa da morte", exc_info=True)
+            death_classification = self._classify_death(logcat, baseline, app_alive)
+            if death_classification in ("rasp_kill", "rasp_reaction"):
+                add_signal(
+                    "app_terminated",
+                    f"processo encerrou ~{died_after}s após resume "
+                    f"({death_classification})",
+                    True,
+                )
+
+        observation_status = "ok"
+        error: Optional[str] = None
+        if not app_alive and death_classification == "instrumentation_crash" and not strong:
+            # O app matou o agente de instrumentação. A morte não diz
+            # nada sobre emulador: sem a observação, a conclusão sobre
+            # a proteção anti-emulador seria inventada.
+            observation_status = "instrumentation_crash"
+            error = (
+                "o app encerrou o agente de instrumentação antes que as "
+                "checagens anti-emulador pudessem ser observadas; a morte "
+                "não é atribuível à detecção de emulador"
+            )
+        elif not app_alive and death_classification == "baseline_death" and not strong:
+            observation_status = "baseline_death"
+            error = (
+                "app encerrou no baseline sem instrumentação; a observação "
+                "anti-emulador é inconclusiva"
+            )
+        elif app_alive and self.no_java and not strong:
+            observation_status = "native_only"
+            error = (
+                "hooks Java desativados (--no-java); a observação nativa não "
+                "encontrou checagem anti-emulador"
+            )
+        elif app_alive and java_load_error and not strong:
+            observation_status = "error"
+            error = (
+                "hooks Java de observação não carregaram e nenhuma checagem "
+                f"anti-emulador foi observada: {java_load_error}"
+            )
+
+        detected = bool(strong)
+        result = {
+            "detected": detected,
+            "detection_methods_found": found,
+            "strong_signals": strong,
+            "weak_signals": weak,
+            "channels": channels,
+            "spoofed_values": spoofed,
+            "app_alive_at_end": app_alive,
+            "observed": True,
+            "observation_status": observation_status,
+            "death_cause": death_cause,
+            "death_classification": death_classification,
+            "baseline": baseline,
+            "logcat": logcat,
+            "logcat_evidence": format_evidence(logcat),
+            "java_load_error": java_load_error,
+            "notes": notes,
+            "details": (
+                f"App reagiu ao ambiente emulado: {'; '.join(strong[:5])}"
+                if strong
+                else (
+                    "App consultou primitivas de emulador, sem reação"
+                    if weak
+                    else "Nenhuma checagem anti-emulador observada"
+                )
+            ),
+        }
+        if error:
+            result["error"] = error
+        logger.info(
+            "check_emulator_detection_in_app: detected=%s strong=%s weak=%s",
+            detected, len(strong), len(weak),
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Fase 3 — bypass (mask)
+    # ------------------------------------------------------------------
+    def attempt_bypass(self, package_name: str, window: int = 12) -> dict:
+        """Tenta ocultar do app os artefatos de emulador.
+
+        Spawna o app com o script de spoof no modo ``mask``: os canais
+        decisivos (Build, ``ro.kernel.qemu``, ``/dev/qemu_pipe``) ficam
+        ocultos, enquanto os artefatos secundários que um emulador real
+        deixa expostos (IMEI zerado, ``ANDROID_ID`` de emulador, telco
+        "Android") continuam visíveis.
+
+        O bypass só é considerado vencedor quando o app **não reage** ao
+        ambiente emulado com os artefatos decisivos ocultos — é o
+        diferencial em relação ao probe.
+
+        Args:
+            package_name: Package name do app alvo.
+            window: Janela de observação em segundos.
+
+        Returns:
+            Dict com ``success``, ``bypass_logs``, ``masked_channels``,
+            ``exposed_channels``, ``app_alive_at_end`` e ``error``.
+        """
+        logs: List[str] = []
+        masked_channels: List[str] = []
+        exposed_channels: List[str] = []
+        spoofed_channels: List[str] = []
+        session = None
+        script = None
+        java_script = None
+        kill_script = None
+        java_load_error: Optional[str] = None
+        stealth_loaded: List[tuple] = []
+        died_after: Optional[int] = None
+        pid: Optional[int] = None
+        signals: List[str] = []
+        logcat_mark = get_logcat_mark(self.dm)
+
+        def on_message(message, data):  # noqa: ANN001 - assinatura frida
+            if message.get("type") == "send":
+                payload = message.get("payload", {})
+                ptype = payload.get("type")
+                if ptype == "emulator-detection":
+                    method = payload.get("method", "?")
+                    detail = payload.get("detail", "")
+                    entry = f"{method}: {detail}"
+                    kind = payload.get("kind", "query")
+                    if kind in ("spoof", "mask"):
+                        if entry not in spoofed_channels:
+                            spoofed_channels.append(entry)
+                        return
+                    if payload.get("masked"):
+                        if entry not in masked_channels:
+                            masked_channels.append(entry)
+                    else:
+                        if entry not in exposed_channels:
+                            exposed_channels.append(entry)
+                        if method.startswith("verdict:"):
+                            if entry not in signals:
+                                signals.append(entry)
+                    return
+                if ptype == "app-kill":
+                    msg = payload.get("message", "")
+                    # "kill-trace carregado" é o carregamento do
+                    # observador de kill, não um kill.
+                    if not msg or "carregado" in msg:
+                        return
+                    entry = "app-kill: " + msg
+                    if entry not in logs:
+                        logs.append(entry)
+                    if entry not in signals:
+                        signals.append(entry)
+                    return
+                if ptype == "emulator-note":
+                    msg = "[nota] " + payload.get("message", "")
+                    if msg not in logs:
+                        logs.append(msg)
+                    return
+                if ptype == "raspilot-script-error":
+                    msg = "[script-error] " + payload.get("message", "")
+                    if msg not in logs:
+                        logs.append(msg)
+                    return
+            elif message.get("type") == "error":
+                desc = message.get("description", "")
+                if desc:
+                    entry = f"[script-error] {desc}"
+                    if entry not in logs:
+                        logs.append(entry)
+
+        try:
+            session = self.dm.spawn_app(package_name, resume=False)
+            stealth_loaded = load_stealth(
+                session,
+                on_message=on_message,
+                replacements=self._script_replacements("mask"),
+                include_proc_filter=True,
+            )
+            script = load_script_file(
+                session, SPOOF_SCRIPT, on_message=on_message,
+                replacements=self._script_replacements("mask", java_only=False),
+                with_java_bridge=False, load_timeout=5.0,
+            )
+            self.dm.resume_app()
+            pid = self.dm.last_spawn_pid or self.dm.get_app_pid(package_name)
+            if not self.no_java:
+                try:
+                    java_script = load_script_file(
+                        session, SPOOF_SCRIPT, on_message=on_message,
+                        replacements=self._script_replacements("mask", java_only=True),
+                        with_java_bridge=True, load_timeout=self.java_timeout,
+                    )
+                except Exception as exc:
+                    java_load_error = str(exc)
+                    logger.warning("Hooks Java do bypass anti-emulador não carregaram: %s", exc)
+                    safe_detach(session)
+            if java_load_error is None and not self.no_java:
+                try:
+                    kill_script = load_script_file(
+                        session, KILL_TRACE_SCRIPT, on_message=on_message,
+                        load_timeout=3.0,
+                    )
+                except Exception:
+                    logger.debug("kill_trace.js indisponível no bypass", exc_info=True)
+            for elapsed in range(max(1, int(window))):
+                time.sleep(OBSERVATION_POLL_INTERVAL)
+                if pid is not None and not self.dm.is_app_alive(pid):
+                    died_after = elapsed + 1
+                    logger.info(
+                        "Processo %s encerrou durante o bypass anti-emulador (~%ss)",
+                        pid, died_after,
+                    )
+                    break
+        except Exception as exc:
+            logger.warning("Bypass anti-emulador falhou", exc_info=True)
+            logs.append(f"[script-error] {exc}")
+        finally:
+            safe_unload(script)
+            safe_unload(java_script)
+            safe_unload(kill_script)
+            unload_stealth(stealth_loaded)
+            if session is not None:
+                safe_detach(session)
+
+        logcat = analyze_since(self.dm, logcat_mark, package_name, pid)
+        baseline = self._baseline()
+        alive = died_after is None
+
+        # Reação do app com os artefatos decisivos ocultos.
+        for line in self._emulator_threat_lines(logcat):
+            entry = f"logcat_emulator: {line}"
+            if entry not in signals:
+                signals.append(entry)
+
+        death_cause = None
+        death_classification = None
+        if not alive:
+            try:
+                death_cause = self.dm.capture_death_cause(
+                    pid=pid, package=package_name
+                )
+            except Exception:
+                logger.debug("Falha ao capturar causa da morte", exc_info=True)
+            death_classification = self._classify_death(logcat, baseline, alive)
+            if death_classification in ("rasp_kill", "rasp_reaction"):
+                # A morte só é reação do app quando é atribuível ao RASP.
+                entry = f"app_terminated: processo encerrou ~{died_after}s após resume"
+                if entry not in signals:
+                    signals.append(entry)
+
+        # O bypass venceu quando o app NÃO reagiu ao ambiente emulado
+        # com os artefatos decisivos ocultos.
+        success = bool(alive) and not signals
+        inconclusive = False
+        error: Optional[str] = None
+        if not alive and death_classification == "instrumentation_crash":
+            # O app matou o agente de instrumentação: a morte não prova
+            # que a proteção anti-emulador resistiu ao bypass.
+            inconclusive = True
+            error = (
+                "o app encerrou o agente de instrumentação antes que o "
+                "bypass anti-emulador pudesse ser avaliado"
+            )
+        elif not alive and death_classification == "baseline_death":
+            inconclusive = True
+            error = (
+                "app encerrou no baseline sem instrumentação; o bypass "
+                "anti-emulador é inconclusivo"
+            )
+        elif not alive:
+            success = False
+            error = (
+                "o app bloqueou o bypass: encerrou durante a execução do "
+                "bypass anti-emulador"
+            )
+        elif java_load_error:
+            success = False
+            error = (
+                "hooks Java do bypass anti-emulador não carregaram: "
+                f"{java_load_error}"
+            )
+
+        result = {
+            "success": success,
+            "inconclusive": inconclusive,
+            "blocked": bool(not alive and not inconclusive and death_classification
+                            in ("rasp_kill", "rasp_reaction")),
+            "bypass_logs": logs,
+            "masked_channels": masked_channels,
+            "exposed_channels": exposed_channels,
+            "spoofed_values": spoofed_channels,
+            "detection_signals": signals,
+            "app_alive_at_end": alive,
+            "death_cause": death_cause,
+            "death_classification": death_classification,
+            "logcat": logcat,
+            "logcat_evidence": format_evidence(logcat),
+            "java_load_error": java_load_error,
+            "error": error,
+        }
+        logger.info(
+            "Bypass anti-emulador: success=%s ocultados=%s expostos=%s",
+            success, len(masked_channels), len(exposed_channels),
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Helpers de evidência
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _emulator_threat_lines(logcat: dict) -> List[str]:
+        """Extrai do logcat as linhas que indicam detecção de emulador.
+
+        Args:
+            logcat: Resultado de ``analyze_since``.
+
+        Returns:
+            Lista de linhas (sem repetição) que denunciam a detecção.
+        """
+        lines: List[str] = []
+        candidates: List[str] = []
+        for item in logcat.get("target_lines", []) or []:
+            candidates.append(str(item))
+        for item in logcat.get("vendor_signals", []) or []:
+            candidates.append(str(item))
+        for line in candidates:
+            if any(p.search(line) for p in EMULATOR_THREAT_PATTERNS):
+                if line not in lines:
+                    lines.append(line)
+        return lines[:10]
+
+    def _classify_death(
+        self, logcat: dict, baseline: Optional[dict], app_alive: bool
+    ) -> Optional[str]:
+        """Classifica a morte do processo durante o probe.
+
+        Só uma morte atribuível ao RASP conta como reação do app: um
+        crash da instrumentação não é proteção anti-emulador.
+
+        O caso mais delicado é o app que mata o **agente de
+        instrumentação** (anti-Frida): o processo morre com o agente no
+        backtrace, mas nada diz respeito ao emulador. Nessas condições a
+        observação é inconclusiva — afirmar proteção anti-emulador a
+        partir de uma morte causada pela própria ferramenta seria falso.
+
+        Args:
+            logcat: Resultado da análise do logcat.
+            baseline: Baseline sem instrumentação.
+            app_alive: True se o processo estava vivo.
+
+        Returns:
+            ``rasp_kill``, ``rasp_reaction``, ``baseline_death``,
+            ``instrumentation_crash``, ``unclassified_death`` ou None.
+        """
+        if app_alive:
+            return None
+        baseline_died = bool(
+            baseline and baseline.get("available") and baseline.get("alive_at_end") is False
+        )
+        baseline_healthy = bool(
+            baseline and baseline.get("available") and baseline.get("alive_at_end") is True
+        )
+        if baseline_died:
+            return "baseline_death"
+        # O agente morreu dentro do processo: a morte é da ferramenta.
+        if logcat.get("agent_terminated"):
+            return "instrumentation_crash"
+        logcat_rasp = any(
+            category in (logcat.get("categories") or {})
+            for category in HIGH_CONFIDENCE_CATEGORIES
+        )
+        if logcat_rasp:
+            return "rasp_reaction"
+        death = logcat.get("death") or {}
+        if logcat.get("available") and death.get("kind") in ("crash", "anr"):
+            if baseline_healthy and logcat.get("crash_origin") != "instrumentation":
+                return "rasp_reaction"
+            return "instrumentation_crash"
+        return "unclassified_death"
+
+    # ------------------------------------------------------------------
+    # Consolidação
+    # ------------------------------------------------------------------
+    def run_all(
+        self,
+        package_name: str,
+        window: int = 12,
+        apk_path: Optional[str] = None,
+        precomputed_detection: Optional[dict] = None,
+        precomputed_bypass: Optional[dict] = None,
+    ) -> dict:
+        """Combina contexto do dispositivo, detecção (estática + dinâmica)
+        e bypass.
+
+        Semântica do veredito:
+
+        - ``protection_detected=True`` e ``bypass_successful=True`` ⇒ o
+          app tem proteção anti-emulador, mas o bypass venceu (falha de
+          RASP).
+        - ``protection_detected=True`` e ``bypass_successful=False`` ⇒ a
+          proteção resistiu ao bypass (OK).
+        - ``protection_detected=False`` ⇒ o app não possui checagens
+          anti-emulador observáveis (falha de RASP).
+
+        Args:
+            package_name: Package name do app alvo.
+            window: Janela de observação (segundos) do probe e do bypass.
+            apk_path: Caminho opcional de APK local para a análise estática.
+            precomputed_detection: Detecção pré-calculada (opcional).
+            precomputed_bypass: Bypass pré-calculado (opcional).
+
+        Returns:
+            Dict com ``protection_detected``, ``bypass_successful``,
+            ``device_environment``, ``checks``, ``static_detection``,
+            ``app_detection``, ``bypass_details`` e ``timestamp``.
+        """
+        device = self.classify_device()
+        static = self.detect_static(package_name, apk_path=apk_path)
+
+        # Fase dinâmica: usa a detecção pré-calculada quando fornecida;
+        # caso contrário, cria um spawn próprio (uso standalone).
+        session = None
+        pid: Optional[int] = None
+        app_detection: dict = {}
+        if precomputed_detection is not None:
+            app_detection = precomputed_detection
+        else:
+            logcat_mark = get_logcat_mark(self.dm)
+            try:
+                session = self.dm.spawn_app(package_name, resume=False)
+                pid = self.dm.last_spawn_pid or self.dm.get_app_pid(package_name)
+            except Exception as exc:
+                logger.warning("Spawn para o probe anti-emulador falhou", exc_info=True)
+                app_detection = {
+                    "detected": False,
+                    "detection_methods_found": [],
+                    "strong_signals": [],
+                    "weak_signals": [],
+                    "app_alive_at_end": None,
+                    "error": str(exc),
+                }
+            else:
+                try:
+                    app_detection = self.check_emulator_detection_in_app(
+                        session,
+                        on_script_loaded=self.dm.resume_app,
+                        window=window,
+                        pid=pid,
+                        package_name=package_name,
+                        logcat_mark=logcat_mark,
+                    )
+                finally:
+                    safe_detach(session)
+
+        protection_detected = bool(static.get("static_detected")) or bool(
+            app_detection.get("detected")
+        )
+
+        phase_errors: List[str] = []
+        static_error = static.get("error")
+        dynamic_error = app_detection.get("error")
+        if not protection_detected and dynamic_error:
+            # A análise estática é evidência positiva; a prova de que não
+            # há proteção é o app não ter reagido ao ambiente emulado.
+            # Sem essa observação, não dá para afirmar ausência de
+            # proteção — o check não pôde concluir.
+            phase_errors.append(f"dinâmico: {dynamic_error}")
+            if static_error:
+                phase_errors.append(f"estático: {static_error}")
+
+        bypass_details: Optional[dict] = None
+        bypass_successful: Optional[bool] = None
+        bypass_skipped_reason: Optional[str] = None
+        if self.mode == "detect":
+            bypass_skipped_reason = "modo detect: bypass não executado"
+        elif self.no_java:
+            bypass_skipped_reason = "--no-java: hooks Java necessários ao bypass"
+        elif protection_detected:
+            if precomputed_bypass is not None:
+                bypass_details = precomputed_bypass
+            else:
+                bypass_details = self.attempt_bypass(package_name, window=window)
+            if bypass_details.get("blocked"):
+                # O app bloqueou o bypass: a proteção resistiu.
+                bypass_successful = False
+            elif bypass_details.get("inconclusive"):
+                # A etapa não pôde ser avaliada (o app derrubou a
+                # instrumentação): não é conclusão sobre a proteção.
+                bypass_skipped_reason = f"bypass inconclusivo: {bypass_details.get('error')}"
+            elif bypass_details.get("error"):
+                bypass_skipped_reason = f"bypass: {bypass_details['error']}"
+            else:
+                bypass_successful = bool(bypass_details.get("success"))
+
+        result: dict = {
+            "protection_detected": protection_detected,
+            "bypass_successful": bypass_successful,
+            "device_is_emulator": bool(device.get("is_emulator")),
+            "emulator_type": device.get("emulator_type"),
+            "checks": device.get("checks", {}),
+            "device_environment": device,
+            "static_detection": static,
+            "app_detection": app_detection,
+            "bypass_details": bypass_details,
+            "bypass_skipped_reason": bypass_skipped_reason,
             "timestamp": _now_iso(),
         }
-        if not evaluated:
-            result["error"] = (
-                "nenhum vetor anti-emulador pôde ser avaliado: "
-                f"falhas em {', '.join(failed) or 'todos os vetores'}"
-            )
+        if static_error and not protection_detected:
+            # A análise estática falhou mas a observação dinâmica rodou:
+            # o veredito se apoia nela, e a falha fica registrada.
+            result["static_error"] = static_error
+        if phase_errors:
+            result["error"] = "; ".join(phase_errors)
+
         logger.info(
-            "Anti-Emulador: is_emulator=%s type=%s confidence=%s",
-            is_emulator, result["emulator_type"], confidence,
+            "Anti-Emulador: protection_detected=%s bypass_successful=%s device_is_emulator=%s",
+            protection_detected, bypass_successful, result["device_is_emulator"],
         )
         return result
