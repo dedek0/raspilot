@@ -179,6 +179,29 @@ class TestDeviceVectors:
         assert "/data/adb/modules/zygisk_lsposed" in res["evidence"]
         assert any("lspd" in e for e in res["evidence"])
 
+    def test_module_keywords_cover_zygisk_frameworks(self):
+        """Frameworks usados como módulo Zygisk entram nos vetores."""
+        from checks.anti_hooking import HOOK_MODULE_KEYWORDS
+
+        for name in ("zygisk_lsposed", "zygisk_vector", "shamiko", "lspatch"):
+            assert any(k in name.lower() for k in HOOK_MODULE_KEYWORDS), name
+
+    def test_module_prop_version_evidence(self, fake_dm_factory):
+        """O module.prop do módulo detectado vira evidência com versão."""
+        dm = fake_dm_factory({
+            "ls /data/adb/modules 2>/dev/null": "zygisk_vector\nunrelated-module",
+            "module.prop": (
+                "name=Vector Zygisk Module\nversion=2.2\nversionCode=22\n"
+            ),
+            "ls /data/adb/lspd 2>/dev/null": "",
+        })
+        res = AntiHookingCheck(dm).check_hook_modules_on_device()
+        assert res["detected"] is True
+        assert "/data/adb/modules/zygisk_vector (Vector Zygisk Module 2.2)" in res["evidence"]
+        assert res["frameworks"] == ["Vector Zygisk Module 2.2"]
+        # Módulo sem tema de hooking não entra.
+        assert not any("unrelated-module" in e for e in res["evidence"])
+
     def test_hook_modules_absent(self, fake_dm_factory):
         """Sem /data/adb de hooking o vetor é negativo."""
         dm = fake_dm_factory({})
@@ -529,6 +552,126 @@ class TestAttemptBypass:
         assert "Module.findExportByName" not in source
 
 
+class TestAttemptModuleBypass:
+    """Bypass via módulo Xposed: evidência obrigatória (sem falso positivo).
+
+    O bug coberto aqui: "app vivo no fim da janela" **não** é evidência
+    de bypass — se nenhuma checagem anti-hook foi observada ou
+    neutralizada, o resultado é inconclusivo (success=None), nunca
+    sucesso. Kills assíncronos de RASP (após a janela) também invalidam
+    a conclusão.
+    """
+
+    @staticmethod
+    def _manager(observe=None, neutralize=None, alive=True):
+        """Gerenciador falso: observe/bypass devolvem runs determinísticos."""
+        mgr = mock.MagicMock()
+
+        def run_phase(config, window=12, keep_enabled=False):
+            if config.hook == "observe":
+                return {"ok": True, "run": {
+                    "observed": list(observe or []),
+                    "app_alive_at_end": True,
+                    "module_ready": True,
+                    "lines": [], "pid": 42,
+                }}
+            return {"ok": True, "run": {
+                "neutralized": list(neutralize or []),
+                "app_alive_at_end": alive,
+                "module_ready": True,
+                "lines": [], "pid": 42,
+            }}
+
+        mgr.run_phase.side_effect = run_phase
+        mgr.detect.return_value = {"available": True, "framework": "vector"}
+        mgr.framework_artifacts.return_value = []
+        mgr.scoped_modules_for.return_value = []
+        return mgr
+
+    @staticmethod
+    def _check(mgr, alive=True):
+        dm = mock.MagicMock()
+        dm.is_app_alive.return_value = alive
+        return AntiHookingCheck(dm, xposed=mgr), dm
+
+    def test_alive_without_evidence_is_inconclusive(self):
+        """Vivo sem nada observado/neutralizado => success=None, não True."""
+        mgr = self._manager(observe=[], neutralize=[], alive=True)
+        check, dm = self._check(mgr)
+        res = check.attempt_module_bypass("com.app", window=3)
+        assert res["success"] is None
+        assert res["blocked"] is False
+        assert res["error"] is None
+        assert "não exercitado" in res["skipped_reason"]
+
+    def test_neutralized_with_alive_is_success(self):
+        """Neutralização registrada + app vivo => success=True."""
+        mgr = self._manager(
+            neutralize=[{"method": "File.exists", "detail": "/data/local/tmp -> false"}],
+            alive=True,
+        )
+        check, dm = self._check(mgr)
+        res = check.attempt_module_bypass("com.app", window=3)
+        assert res["success"] is True
+        assert res["app_alive_at_end"] is True
+
+    def test_observed_only_with_alive_is_success(self):
+        """App consultou artefatos (observe) e sobreviveu => success=True."""
+        mgr = self._manager(
+            observe=[{"method": "Class.forName", "detail": "XposedBridge"}],
+            neutralize=[], alive=True,
+        )
+        check, dm = self._check(mgr)
+        res = check.attempt_module_bypass("com.app", window=3)
+        assert res["success"] is True
+
+    def test_post_window_death_overrides_success(self):
+        """Morte logo após a janela (kill assíncrono) anula o sucesso."""
+        mgr = self._manager(
+            neutralize=[{"method": "File.exists", "detail": "x -> false"}],
+            alive=True,  # run_phase achou vivo...
+        )
+        check, dm = self._check(mgr, alive=False)  # ...a re-checagem, não
+        with mock.patch("checks.anti_hooking.classify_failure",
+                        return_value={"is_rasp": False, "kind": "instrumentation_crash"}):
+            res = check.attempt_module_bypass("com.app", window=3)
+        assert res["success"] is False
+        assert res["app_alive_at_end"] is False
+        assert res["blocked"] is False
+        assert any("logo após a janela" in log for log in res["bypass_logs"])
+
+    def test_post_window_rasp_death_is_blocked(self):
+        """Morte pós-janela classificada como RASP => blocked=True."""
+        mgr = self._manager(
+            neutralize=[{"method": "File.exists", "detail": "x -> false"}],
+            alive=True,
+        )
+        check, dm = self._check(mgr, alive=False)
+        with mock.patch("checks.anti_hooking.classify_failure",
+                        return_value={"is_rasp": True, "kind": "rasp_reaction"}):
+            res = check.attempt_module_bypass("com.app", window=3)
+        assert res["blocked"] is True
+        assert res["success"] is False
+
+    def test_run_all_maps_inconclusive_to_skip(self, tmp_path):
+        """success=None no bypass de módulo => bypass_successful=None + reason."""
+        apk = _make_apk(str(tmp_path / "x.apk"), {
+            "classes.dex": b"de.robv.android.xposed.XposedBridge\x00",
+        })
+        dm = mock.MagicMock()
+        dm.run_shell.return_value = {"ok": True, "rc": 0, "stdout": "", "stderr": ""}
+        dm.run_shell_root.return_value = {"ok": True, "rc": 0, "stdout": "", "stderr": ""}
+        dm.spawn_app.return_value = FakeSession()
+        dm.last_spawn_pid = 42
+        dm.is_app_alive.return_value = True
+        check = AntiHookingCheck(dm, xposed=self._manager(observe=[], neutralize=[]))
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
+            res = check.run_all("com.app", apk_path=apk, window=3)
+        assert res["protection_detected"] is True
+        assert res["bypass_successful"] is None
+        assert "não exercitado" in res["bypass_skipped_reason"]
+
+
 class TestRunAll:
     """Consolidação: vetores + estático + dinâmico + bypass."""
 
@@ -568,6 +711,32 @@ class TestRunAll:
         assert res["protection_detected"] is True
         assert res["bypass_successful"] is True
         assert res["static_detection"]["static_detected"] is True
+
+    def test_run_all_expoem_framework_runtime(self, tmp_path):
+        """O framework identificado pelo gerenciador (nome/versão) entra nos checks.
+
+        Antes isso só aparecia enterrado nos steps do bypass; agora é
+        vetor de detecção com evidência própria.
+        """
+        apk = _make_apk(str(tmp_path / "x.apk"), {
+            "classes.dex": b"de.robv.android.xposed.XposedBridge\x00",
+        })
+        dm = self._mock_dm()
+        mgr = mock.MagicMock()
+        mgr.detect.return_value = {
+            "available": True, "name": "Vector", "version": "2.2",
+            "details": "Vector 2.2 (módulos de framework: zygisk_vector)",
+            "modules": ["zygisk_vector"],
+        }
+        check = AntiHookingCheck(dm, mode="detect", xposed=mgr)
+        with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
+            res = check.run_all("com.app", apk_path=apk)
+        runtime = res["checks"]["hook_framework_runtime"]
+        assert runtime["detected"] is True
+        assert runtime["evidence"] == ["Vector 2.2"]
+        assert "Vector 2.2" in runtime["details"]
+        assert res["hook_frameworks_present"] is True
+        assert res["bypass_successful"] is None  # modo detect
 
     def test_dynamic_protection_resists_bypass(self, tmp_path):
         """Detecção só em runtime e bypass sem evidência => OK (False)."""

@@ -1212,10 +1212,16 @@ class AntiEmulatorCheck:
                     signals.append(entry)
 
         # O bypass venceu quando o app NÃO reagiu ao ambiente emulado
-        # com os artefatos decisivos ocultos.
-        success = bool(alive) and not signals
+        # com os artefatos decisivos ocultos — mas só há conclusão se o
+        # bypass foi exercitado: ao menos um canal de emulador precisou
+        # ser observado/neutralizado na janela. Vivo sem nenhum sinal de
+        # exercício não é sucesso (pode ser janela curda, checks nativos
+        # opacos ou ausência real de artefatos): é inconclusivo.
+        exercised = bool(masked_channels) or bool(spoofed_channels) or bool(exposed_channels)
+        success: Optional[bool] = bool(alive) and not signals
         inconclusive = False
         error: Optional[str] = None
+        skipped_reason: Optional[str] = None
         if not alive and death_classification == "instrumentation_crash":
             # O app matou o agente de instrumentação: a morte não prova
             # que a proteção anti-emulador resistiu ao bypass.
@@ -1242,10 +1248,17 @@ class AntiEmulatorCheck:
                 "hooks Java do bypass anti-emulador não carregaram: "
                 f"{java_load_error}"
             )
+        elif not signals and not exercised:
+            success = None
+            skipped_reason = (
+                "bypass não exercitado: nenhuma consulta de emulador "
+                "observada, mascarada ou exposta durante a janela"
+            )
 
         result = {
             "success": success,
             "inconclusive": inconclusive,
+            "skipped_reason": skipped_reason,
             "blocked": bool(not alive and not inconclusive and death_classification
                             in ("rasp_kill", "rasp_reaction")),
             "bypass_logs": logs,
@@ -1573,6 +1586,19 @@ class AntiEmulatorCheck:
 
         pid = run.get("pid")
         alive = bool(run.get("app_alive_at_end"))
+
+        # Re-checagem de vida: o run_phase só amostra até o fim da
+        # janela; reação de RASP costuma ser assíncrona. Morte logo após
+        # a janela invalida a conclusão de "app vivo".
+        post_window_death = False
+        if alive and pid is not None:
+            try:
+                if not self.dm.is_app_alive(pid):
+                    alive = False
+                    post_window_death = True
+            except Exception:
+                logger.debug("Re-checagem de vida do app falhou", exc_info=True)
+
         logcat = analyze_logcat(run.get("lines", []), package=package_name, pid=pid)
         baseline = self._baseline()
         conflicts = manager.scoped_modules_for(package_name)
@@ -1596,9 +1622,15 @@ class AntiEmulatorCheck:
                 if entry not in signals:
                     signals.append(entry)
 
-        success = bool(alive) and not signals
+        # Evidência obrigatória (mesmo rigor do caminho Frida): o bypass
+        # só "venceu" quando o app exercitou suas checagens anti-emulador
+        # (consultas observadas e/ou valores spoofados) e não reagiu.
+        # Vivo sem nada exercitado é inconclusivo.
+        exercised = bool(queries) or bool(spoofs)
+        success: Optional[bool] = bool(alive) and not signals
         inconclusive = False
         error: Optional[str] = None
+        skipped_reason: Optional[str] = None
         if not alive and death_classification == "instrumentation_crash":
             inconclusive = True
             error = (
@@ -1618,10 +1650,17 @@ class AntiEmulatorCheck:
             )
         elif run.get("error"):
             error = str(run["error"])
+        elif not signals and not exercised:
+            success = None
+            skipped_reason = (
+                "bypass não exercitado: nenhuma consulta anti-emulador "
+                "observada ou mascarada durante a janela"
+            )
 
         result = {
             "success": success,
             "inconclusive": inconclusive,
+            "skipped_reason": skipped_reason,
             "blocked": bool(
                 not alive and not inconclusive
                 and death_classification in ("rasp_kill", "rasp_reaction")
@@ -1635,6 +1674,7 @@ class AntiEmulatorCheck:
             ],
             "detection_signals": signals,
             "app_alive_at_end": alive,
+            "post_window_death": post_window_death,
             "death_cause": death_cause,
             "death_classification": death_classification,
             "logcat": logcat,
@@ -1644,12 +1684,17 @@ class AntiEmulatorCheck:
             "steps": phase.get("steps", []),
             "other_modules_in_scope": conflicts,
             "details": (
-                "nenhum artefato de emulador no dispositivo: o app enxergou "
-                "o device real"
-                if not masked and not exposed
+                "nenhuma consulta anti-emulador observada: o bypass não foi "
+                "exercitado na janela"
+                if not exercised
                 else (
-                    f"artefatos ocultos: {len(masked)}; "
-                    f"artefatos secundários expostos: {len(exposed)}"
+                    "nenhum artefato de emulador a ocultar: o app enxergou "
+                    "o device real"
+                    if not masked and not exposed
+                    else (
+                        f"artefatos ocultos: {len(masked)}; "
+                        f"artefatos secundários expostos: {len(exposed)}"
+                    )
                 )
             ),
             "error": error,
@@ -1780,6 +1825,14 @@ class AntiEmulatorCheck:
                 bypass_skipped_reason = f"bypass inconclusivo: {bypass_details.get('error')}"
             elif bypass_details.get("error"):
                 bypass_skipped_reason = f"bypass: {bypass_details['error']}"
+            elif bypass_details.get("success") is None:
+                # Bypass não exercitado: nenhuma consulta anti-emulador
+                # observada/neutralizada na janela — inconclusivo, não
+                # derrota da proteção.
+                bypass_skipped_reason = str(
+                    bypass_details.get("skipped_reason")
+                    or "bypass não exercitado: sem evidência durante a janela"
+                )
             else:
                 bypass_successful = bool(bypass_details.get("success"))
 

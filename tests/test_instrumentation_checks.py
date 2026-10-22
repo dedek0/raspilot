@@ -161,7 +161,37 @@ def test_bypass_modulo_sem_gerenciador(clean_dm):
 
 
 def test_run_all_usa_modulo_no_bypass(clean_dm):
-    """O run_all delega o bypass ao módulo quando ele está disponível."""
+    """O run_all delega o bypass ao módulo quando ele está disponível.
+
+    Com evidência de neutralização e app vivo, o bypass vence — a
+    delegação e o veredito são verificados juntos.
+    """
+    manager = FakeXposed(phases={
+        ("observe", "off"): _run(),
+        ("bypass", "off"): _run(evidence=[
+            {"kind": "neutralize", "channel": "hook", "method": "File.exists",
+             "detail": "/data/local/tmp/frida-server -> false"},
+        ]),
+    })
+    check = AntiHookingCheck(clean_dm, method="module", xposed=manager)
+    with mock.patch.object(
+        AntiHookingCheck, "detect_static", return_value={
+            "static_detected": True, "types": ["xposed"], "primary": "xposed",
+            "evidence": ["[xposed] classe XposedBridge"],
+        }
+    ):
+        result = check.run_all("com.example.app", window=1)
+    assert result["bypass_method"] == "module"
+    assert result["bypass_successful"] is True
+
+
+def test_run_all_modulo_sem_evidencia_e_inconclusivo(clean_dm):
+    """App vivo mas nada observado/neutralizado => inconclusivo, não True.
+
+    Regrava o cenário do falso positivo: módulo carregado, app vivo ao
+    fim da janela, zero checagens exercitadas — o veredito não pode ser
+    'bypass venceu'.
+    """
     manager = FakeXposed(phases={
         ("observe", "off"): _run(),
         ("bypass", "off"): _run(),
@@ -175,7 +205,8 @@ def test_run_all_usa_modulo_no_bypass(clean_dm):
     ):
         result = check.run_all("com.example.app", window=1)
     assert result["bypass_method"] == "module"
-    assert result["bypass_successful"] is True
+    assert result["bypass_successful"] is None
+    assert "não exercitado" in result["bypass_skipped_reason"]
 
 
 # ----------------------------------------------------------------------
@@ -238,3 +269,62 @@ def test_bypass_emulador_modulo_com_app_morto(clean_dm):
     result = check.attempt_module_bypass("com.example.app", window=1)
     assert result["success"] is False
     assert result["app_alive_at_end"] is False
+
+
+def test_bypass_emulador_modulo_sem_evidencia_e_inconclusivo(clean_dm):
+    """App vivo mas nenhuma consulta anti-emulador exercitada => None.
+
+    Regrava o falso positivo: no device físico, sem consultas observadas
+    e sem spoof, o app "sobreviver" não prova que o bypass venceu.
+    """
+    manager = FakeXposed(phases={("bypass", "mask"): _run()})
+    check = AntiEmulatorCheck(clean_dm, method="module", xposed=manager)
+    result = check.attempt_module_bypass("com.example.app", window=1)
+    assert result["success"] is None
+    assert result["blocked"] is False
+    assert "não exercitado" in result["skipped_reason"]
+    assert result["details"].startswith("nenhuma consulta anti-emulador")
+
+
+def test_bypass_emulador_modulo_morte_pos_janela(clean_dm):
+    """Morte logo após a janela (kill assíncrono) invalida o sucesso."""
+    dm = mock.MagicMock()
+    dm.baseline = None
+    dm.is_app_alive.return_value = False  # re-checagem pós-janela
+    dm.capture_death_cause.return_value = {"summary": "sinal fatal", "evidence": []}
+    manager = FakeXposed(phases={
+        ("bypass", "mask"): _run(evidence=[
+            {"kind": "neutralize", "channel": "emulator:decisive",
+             "method": "File.exists", "detail": "/dev/qemu_pipe (oculto)"},
+        ]),
+    })
+    check = AntiEmulatorCheck(dm, method="module", xposed=manager)
+    result = check.attempt_module_bypass("com.example.app", window=1)
+    assert result["post_window_death"] is True
+    assert result["app_alive_at_end"] is False
+    assert result["success"] is False
+
+
+def test_run_all_emulador_modulo_sem_evidencia_vira_skip(clean_dm):
+    """run_all mapeia success=None do módulo para bypass_successful=None."""
+    manager = FakeXposed(phases={
+        ("bypass", "probe"): _run(evidence=[
+            {"kind": "neutralize", "channel": "emulator:secondary",
+             "method": "TelephonyManager.getNetworkOperatorName", "detail": "Android"},
+        ]),
+        ("bypass", "mask"): _run(),
+    })
+    check = AntiEmulatorCheck(clean_dm, method="module", xposed=manager)
+    with mock.patch.object(
+        AntiEmulatorCheck, "detect_static", return_value={
+            "static_detected": True, "types": ["emulator_sdk"], "primary": "emulator_sdk",
+            "evidence": ["[emulator_sdk] isProbablyAnEmulator"],
+        }
+    ), mock.patch.object(
+        AntiEmulatorCheck, "classify_device",
+        return_value={"is_emulator": False, "emulator_type": None, "checks": {}, "confidence": "high"},
+    ):
+        result = check.run_all("com.example.app", window=1)
+    assert result["protection_detected"] is True
+    assert result["bypass_successful"] is None
+    assert "não exercitado" in result["bypass_skipped_reason"]

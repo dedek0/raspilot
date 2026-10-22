@@ -84,6 +84,8 @@ HOOK_PACKAGE_KEYWORDS = (
     "lspd",
     "taichi",
     "tai_chi",
+    "lspatch",
+    "edxp",
 )
 
 # Substrings que identificam libs/módulos de frameworks de hooking.
@@ -107,6 +109,14 @@ HOOK_MODULE_KEYWORDS = (
     "xhook",
     "bytehook",
     "shadowhook",
+    # Zygote-injection: módulos Zygisk são injeção no zygote por
+    # definição (ex: zygisk_lsposed, zygisk_vector — o framework
+    # "Vector" usado como módulo Zygisk).
+    "zygisk",
+    "shamiko",
+    "lspatch",
+    "taichi",
+    "pine",
 )
 
 # Assinaturas estáticas no APK: (tipo, [(needle_bytes, descrição), ...]).
@@ -703,20 +713,45 @@ class AntiHookingCheck:
         """Detecta módulos de frameworks de hooking em ``/data/adb``.
 
         Lista ``/data/adb/modules`` (módulos Magisk/Zygisk com tema de
-        hooking, ex: ``zygisk_lsposed``) e verifica o diretório de dados
-        do LSPosed (``/data/adb/lspd``).
+        hooking, ex: ``zygisk_lsposed``), verifica o diretório de dados
+        do LSPosed (``/data/adb/lspd``) e, para cada módulo encontrado,
+        lê o ``module.prop`` (raiz) para reportar nome/versão — evidência
+        que costuma faltar no relatório quando só o path aparece.
 
         Returns:
-            Dict com ``detected``, ``evidence`` (paths) e ``details``.
+            Dict com ``detected``, ``evidence`` (paths com versão quando
+            disponível), ``frameworks`` (nomes/versões) e ``details``.
         """
         evidence: List[str] = []
+        frameworks: List[str] = []
 
         res = self._shell_root("ls /data/adb/modules 2>/dev/null")
+        matched_dirs: List[str] = []
         if res["ok"] and res["stdout"]:
             for line in res["stdout"].splitlines():
                 name = line.strip()
                 if name and any(k in name.lower() for k in HOOK_MODULE_KEYWORDS):
-                    evidence.append(f"/data/adb/modules/{name}")
+                    matched_dirs.append(name)
+
+        for name in matched_dirs:
+            entry = f"/data/adb/modules/{name}"
+            prop = self._shell_root(
+                f"grep -E '^(name|version)=' /data/adb/modules/{name}/module.prop "
+                "2>/dev/null"
+            )
+            if prop["ok"] and prop["stdout"]:
+                fields = {}
+                for line in prop["stdout"].splitlines():
+                    key, sep, value = line.partition("=")
+                    if sep:
+                        fields[key.strip()] = value.strip()
+                label = " ".join(
+                    v for v in (fields.get("name"), fields.get("version")) if v
+                ).strip()
+                if label:
+                    entry = f"{entry} ({label})"
+                    frameworks.append(label)
+            evidence.append(entry)
 
         res = self._shell_root("ls /data/adb/lspd 2>/dev/null")
         if res["ok"] and res["stdout"]:
@@ -726,6 +761,7 @@ class AntiHookingCheck:
         result = {
             "detected": detected,
             "evidence": evidence,
+            "frameworks": frameworks,
             "details": (
                 f"Módulos de hooking no dispositivo: {'; '.join(evidence)}"
                 if detected
@@ -1701,6 +1737,21 @@ class AntiHookingCheck:
         death_cause = None
         death_classification = None
         logcat = analyze_logcat(run.get("lines", []), package=package_name, pid=pid)
+
+        # Re-checagem de vida: o run_phase só amostra até o fim da
+        # janela, mas reação de RASP costuma ser assíncrona (kill ~15s
+        # após o resume). Uma morte logo após a janela invalida a
+        # conclusão de "app vivo".
+        if alive and pid is not None:
+            try:
+                if not self.dm.is_app_alive(pid):
+                    alive = False
+                    logs.append(
+                        "[bypass] app encerrou logo após a janela de observação"
+                    )
+            except Exception:
+                logger.debug("Re-checagem de vida do app falhou", exc_info=True)
+
         if not alive:
             try:
                 death_cause = self.dm.capture_death_cause(pid=pid, package=package_name)
@@ -1712,17 +1763,36 @@ class AntiHookingCheck:
         else:
             is_rasp = False
 
-        success = False
+        # Evidência real (mesmo rigor do caminho Frida, que exige logs de
+        # neutralização + app vivo): o bypass só "venceu" quando houve
+        # sinal de que as checagens anti-hook foram exercitadas — o app
+        # consultou artefatos de framework (observe) e/ou o módulo
+        # neutralizou consultas (bypass). Vivo sem nenhum sinal não é
+        # sucesso: é inconclusivo (a ausência de logs pode significar
+        # janela curta, checks nativos opacos ou kill assíncrono tardio).
+        exercised = bool(neutralized) or bool(observed)
+        success: Optional[bool] = False
         blocked = False
         error: Optional[str] = None
+        skipped_reason: Optional[str] = None
         if alive:
-            # O app continuou vivo com o framework de hooking presente: a
-            # proteção não interrompeu a auditoria.
-            success = True
-            if not neutralized:
-                logs.append(
-                    "[bypass] nenhuma checagem anti-hook foi neutralizada em Java"
+            if exercised:
+                # O app continuou vivo com o framework de hooking presente
+                # e as checagens anti-hook exercitadas: a proteção não
+                # interrompeu a auditoria.
+                success = True
+                if not neutralized:
+                    logs.append(
+                        "[bypass] checagens observadas sem neutralização em Java "
+                        "na janela de bypass"
+                    )
+            else:
+                success = None
+                skipped_reason = (
+                    "bypass não exercitado: nenhuma checagem anti-hook "
+                    "observada ou neutralizada durante a janela"
                 )
+                logs.append(f"[bypass] {skipped_reason}")
         elif is_rasp:
             blocked = True
             error = (
@@ -1746,6 +1816,7 @@ class AntiHookingCheck:
             "app_alive_at_end": alive,
             "death_cause": death_cause,
             "death_classification": death_classification,
+            "skipped_reason": skipped_reason,
             "observed_checks": observed,
             "neutralized": [
                 f"{item['method']}: {item['detail']}" for item in neutralized
@@ -1808,6 +1879,33 @@ class AntiHookingCheck:
             "hook_framework_packages": self.check_hook_framework_packages(),
             "hook_modules_on_device": self.check_hook_modules_on_device(),
         }
+
+        # Framework em runtime: identificação/nome/versão direto do
+        # gerenciador do framework (ex: "Vector 2.2") — antes isso só
+        # aparecia enterrado nos steps do bypass.
+        if self.xposed is not None:
+            try:
+                fw = self.xposed.detect() or {}
+                available = bool(fw.get("available"))
+                label = " ".join(
+                    str(v) for v in (fw.get("name"), fw.get("version")) if v
+                ).strip()
+                checks["hook_framework_runtime"] = {
+                    "detected": available,
+                    "evidence": [label] if (available and label) else [],
+                    "details": str(
+                        fw.get("details")
+                        or (f"Framework de hooking ativo: {label}" if label else "")
+                        or "framework não identificado"
+                    ),
+                    "modules": list(fw.get("modules") or []),
+                }
+            except Exception as exc:
+                checks["hook_framework_runtime"] = {
+                    "detected": False,
+                    "evidence": [],
+                    "details": f"falha ao identificar o framework: {exc}",
+                }
 
         static = self.detect_static(package_name, apk_path=apk_path)
 
@@ -1925,6 +2023,14 @@ class AntiHookingCheck:
                 # conclusão sobre a proteção: o veredito da detecção
                 # continua válido.
                 bypass_skipped_reason = f"bypass: {bypass_details['error']}"
+            elif bypass_details.get("success") is None:
+                # Bypass não exercitado: nenhuma checagem anti-hook
+                # observada/neutralizada durante a janela — inconclusivo,
+                # não derrota da proteção.
+                bypass_skipped_reason = str(
+                    bypass_details.get("skipped_reason")
+                    or "bypass não exercitado: sem evidência durante a janela"
+                )
             else:
                 bypass_successful = bool(bypass_details.get("success"))
 
