@@ -37,6 +37,7 @@ REPORT_ORDER = (
     "anti_frida",
     "anti_hooking",
     "ssl_pinning",
+    "revoked_ca",
 )
 
 # Diretório dos templates Jinja2 (relativo a este arquivo).
@@ -241,6 +242,44 @@ class Reporter:
                 status = "N/A"  # sem pinning — bypass não aplicável
             else:
                 status = "OK"
+            return status, summary
+
+        if check_name == "revoked_ca":
+            # CA comprometida (eMudhra emSign G3): dois vetores decidem o
+            # veredito. "FALHOU" = o ambiente confia em CA comprometida
+            # (backend usando intermediário comprometido OU runtime
+            # aceitando a cadeia no probe) — MITM possível sem instalar
+            # CA. "OK" = o probe comprovou rejeição. "N/A" = probe não
+            # avaliado e nenhum host comprometido encontrado.
+            server_hit = bool(result.get("server_uses_compromised_ca"))
+            probe = result.get("probe_accepted")
+            summary = {
+                "server_uses_compromised_ca": server_hit,
+                "hosts_checked": len(result.get("hosts_checked") or []),
+                "probe_accepted": probe,
+            }
+            cas = result.get("compromised_cas") or []
+            if cas:
+                summary["compromised_ca"] = list(cas)
+            if server_hit:
+                status = "FALHOU"
+                summary["detail"] = (
+                    "backend do app usa intermediário eMudhra comprometido/revogado"
+                )
+            elif probe is True:
+                status = "FALHOU"
+                summary["detail"] = (
+                    "o runtime do app aceitou cadeia de CA comprometida "
+                    "(MITM sem instalar CA)"
+                )
+            elif probe is False:
+                status = "OK"  # trust path rejeitou a cadeia comprometida
+            else:
+                status = "N/A"
+                summary["skip_reason"] = (
+                    result.get("bypass_skipped_reason")
+                    or "teste de aceitação não avaliado"
+                )
             return status, summary
 
         # Check desconhecido não pode ser reportado como sucesso.

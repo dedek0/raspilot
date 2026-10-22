@@ -131,8 +131,9 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--emulator-method MÉTODO` | não | Probe/bypass anti-emulador: `frida`, `module` ou `auto` (default) |
 | `--module-apk PATH` | não | APK pré-construído do módulo de instrumentação (dispensa o build, que exige o SDK do Android) |
 | `--js-runtime RUNTIME` | não | Runtime JavaScript do Frida: `qjs` (default) ou `v8` |
+| `--audit-host HOST` | não | Host da API do app para o check `revoked_ca` (`HOST`, `HOST:PORTA` ou URL). Pode ser repetido; hosts observados no tráfego também são inspecionados |
 | `--verbose` | não | Logging em nível DEBUG |
-| `--skip CHECK...` | não | Checks a pular (`anti_root`, `anti_frida`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
+| `--skip CHECK...` | não | Checks a pular (`anti_root`, `anti_frida`, `anti_emulator`, `anti_hooking`, `ssl_pinning`, `revoked_ca`) |
 | `--avd` | não | Audita contra o AVD configurado em vez do device físico (sobe o emulador, espera o boot e o encerra no final) |
 | `--avd-config PATH` | não | Configuração JSON do ambiente emulado (default `~/.raspilot/avd.json` ou `$RASPILOT_AVD_CONFIG`) |
 | `--avd-name NOME` | não | Nome do AVD, sobrescrevendo a configuração |
@@ -363,7 +364,43 @@ proteção de fato fiscaliza.
   `tests/device_smoke.py`, que exige que a requisição **falhe** sem o
   bypass e **passe** com ele.
 
-### 6. Hook de veredito (`scripts/verdict_hook.js`)
+### 6. CA comprometida — eMudhra emSign G3 (`checks/revoked_ca.py`)
+
+Audita o vetor do incidente **Mozilla bug 2083449** (out/2026): 8
+intermediários eMudhra emSign ECC G3 foram gerados com chaves privadas de
+escalar mínimo (`d` ∈ {4, 56, 66, 115, 155, 156, 230, 237}). Como os
+certificados são públicos, qualquer um recupera a chave e assina leaf
+certs arbitrários ancorados em raízes presentes no trust store — **sem
+instalar CA no dispositivo**. Todos foram revogados (`caCompromise`), mas
+clientes sem checagem de revogação continuam aceitando.
+
+- **Chain** (host-side): para cada host observado no tráfego (ou
+  informado via `--audit-host`), captura a chain TLS apresentada e
+  compara SPKI/serial contra os 8 intermediários comprometidos
+  (catálogo vendado em `scripts/emudhra/`). Se o backend do app usa um
+  deles, o tráfego está diretamente exposto a MITM. A detecção por SPKI
+  cobre as 16 certificações (as variantes emitidas pela eMudhra e
+  cross-signed pela Sectigo compartilham a mesma chave).
+- **Probe de aceitação** (device-side): recupera a chave fraca em
+  runtime (só aritmética ECC — a chave nunca é persistida), emite um
+  leaf efêmero (SAN `localhost`/`127.0.0.1`), serve via TLS local
+  exposto ao device com `adb reverse` e injeta
+  `scripts/emudhra_probe.js` no processo do app. O probe mede dois
+  caminhos: o trust store de **plataforma** (cacerts) e o
+  `SSLContext.getDefault()` do **app**. `accepted` = o ambiente
+  aceitaria MITM sem instalar CA; `rejected` = a CA já saiu do trust
+  store.
+
+- **Veredito**: `FALHOU` se o backend usa intermediário comprometido
+  **ou** o runtime aceitou a cadeia; `OK` se o probe comprovou
+  rejeição; `N/A` se o probe não foi avaliado (modo `detect`,
+  `--no-java`) e nenhum host comprometido foi encontrado.
+
+> **Escopo**: verificação defensiva de auditoria — mede se o
+> app/dispositivo rejeita certificados de CAs comprometidas. As chaves
+> derivadas e o leaf efêmero existem só em memória durante o probe.
+
+### 7. Hook de veredito (`scripts/verdict_hook.js`)
 Enganar as primitivas de detecção não é o bastante: o SDK ainda
 comunica a decisão ao app — por um callback de ameaça ou por um método
 que devolve um veredito — e o app reage a partir dali.
@@ -577,9 +614,13 @@ raspilot/
 │   ├── combined.py             # Observação/bypass em sessão única
 │   ├── stealth.py              # Bootstrap nativo antes do resume
 │   ├── apk_utils.py            # Helpers compartilhados + cache de APK
+│   ├── revoked_ca.py           # CA comprometida (eMudhra): chain + probe
 │   └── ssl_pinning.py          # Detecção + bypass de SSL pinning
 ├── scripts/
 │   ├── ssl_bypass.js           # Bypass universal de SSL pinning (Frida)
+│   ├── emudhra_probe.js        # Probe de aceitação de cadeia comprometida
+│   ├── emudhra_intermediates.json  # Catálogo dos 8 intermediários (SPKI, serial, d)
+│   ├── emudhra/                # PEMs públicos dos intermediários (bug 2083449)
 │   ├── anti_frida_bypass.js    # Bypass de detecção de Frida (Frida)
 │   ├── anti_hooking_bypass.js  # Bypass de detecção de hooking (Frida)
 │   ├── emulator_spoof.js       # Spoof de emulador: probe e máscara (Frida)

@@ -486,6 +486,48 @@ class DeviceManager:
             return res["stdout"].splitlines()
         return []
 
+    def reverse_port(self, device_port: int, host_port: int, timeout: int = DEFAULT_ADB_TIMEOUT) -> bool:
+        """Mapeia uma porta do dispositivo para o host (``adb reverse``).
+
+        Usado pelo check ``revoked_ca`` para expor o TLS de teste ao
+        processo do app sem proxy global. Nunca levanta exceção.
+
+        Args:
+            device_port: Porta escutada no device (``tcp:<device_port>``).
+            host_port: Porta correspondente no host.
+            timeout: Timeout em segundos.
+
+        Returns:
+            True se o mapeamento foi criado.
+        """
+        try:
+            self._run_adb(
+                ["reverse", f"tcp:{device_port}", f"tcp:{host_port}"], timeout=timeout
+            )
+            return True
+        except DeviceConnectionError:
+            logger.debug(
+                "adb reverse tcp:%s -> tcp:%s falhou", device_port, host_port, exc_info=True
+            )
+            return False
+
+    def remove_reverse(self, device_port: int, timeout: int = DEFAULT_ADB_TIMEOUT) -> bool:
+        """Remove um mapeamento ``adb reverse``. Nunca levanta exceção.
+
+        Args:
+            device_port: Porta a desmapear no device.
+            timeout: Timeout em segundos.
+
+        Returns:
+            True se o mapeamento foi removido.
+        """
+        try:
+            self._run_adb(["reverse", "--remove", f"tcp:{device_port}"], timeout=timeout)
+            return True
+        except DeviceConnectionError:
+            logger.debug("adb reverse --remove tcp:%s falhou", device_port, exc_info=True)
+            return False
+
     def run_app_baseline(self, package_name: str, window: int = 5) -> dict:
         """Executa o app sem instrumentação para estabelecer um baseline.
 
@@ -940,6 +982,34 @@ class DeviceManager:
         self.frida_ready = True
         logger.info("frida-server ativo e validado (porta %s)", FRIDA_PORT)
         return True
+
+    def ensure_frida_server(self, ready_timeout: int = 3) -> bool:
+        """Garante que o frida-server está respondendo; reinstala se morreu.
+
+        Leve quando já saudável: só valida o health check curto. Se o
+        servidor não responder (ex: derrubado pelo RASP do app durante
+        uma execução anterior), refaz o pipeline completo de
+        :meth:`setup_frida_server`. Pensado para checks dinâmicos que
+        precisam de um servidor vivo entre spawns.
+
+        Args:
+            ready_timeout: Timeout do health check curto, em segundos.
+
+        Returns:
+            True se o frida-server está respondendo ao final.
+
+        Raises:
+            FridaSetupError: se a reinstalação for necessária e falhar.
+        """
+        if self._wait_frida_ready(timeout=ready_timeout):
+            self.frida_ready = True
+            return True
+        logger.warning("frida-server sem resposta; reinstalando...")
+        try:
+            return self.setup_frida_server()
+        except FridaSetupError:
+            self.frida_ready = False
+            raise
 
     def _wait_frida_ready(self, timeout: int = 15) -> bool:
         """Aguarda o frida-server ficar acessível pelo host (via forward).

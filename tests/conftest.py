@@ -15,6 +15,7 @@ from checks.anti_emulator import AntiEmulatorCheck
 from checks.anti_frida import AntiFridaCheck
 from checks.anti_hooking import AntiHookingCheck
 from checks.anti_root import AntiRootCheck
+from checks.revoked_ca import RevokedCACheck
 from checks.ssl_pinning import SSLPinningCheck
 
 ShellResponse = Union[str, Dict[str, object]]
@@ -169,3 +170,9 @@ def anti_hooking(clean_dm):
 def ssl_pinning(clean_dm):
     """SSLPinningCheck sobre dispositivo limpo."""
     return SSLPinningCheck(clean_dm)
+
+
+@pytest.fixture
+def revoked_ca(clean_dm):
+    """RevokedCACheck sobre dispositivo limpo."""
+    return RevokedCACheck(clean_dm)

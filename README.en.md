@@ -136,7 +136,8 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--module-apk PATH` | no | Pre-built instrumentation module APK (skips the build, which requires the Android SDK) |
 | `--js-runtime RUNTIME` | no | Frida JavaScript runtime: `qjs` (default) or `v8` |
 | `--verbose` | no | DEBUG-level logging |
-| `--skip CHECK...` | no | Checks to skip (`anti_root`, `anti_frida`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
+| `--skip CHECK...` | no | Checks to skip (`anti_root`, `anti_frida`, `anti_emulator`, `anti_hooking`, `ssl_pinning`, `revoked_ca`) |
+| `--audit-host HOST` | no | App API host for the `revoked_ca` check (`HOST`, `HOST:PORT` or URL). Repeatable; hosts observed in the traffic are also inspected |
 | `--avd` | no | Audit against the configured AVD instead of the physical device (boots the emulator, waits for boot and shuts it down afterwards) |
 | `--avd-config PATH` | no | JSON configuration of the emulated environment (default `~/.raspilot/avd.json` or `$RASPILOT_AVD_CONFIG`) |
 | `--avd-name NAME` | no | AVD name, overriding the configuration |
@@ -342,6 +343,39 @@ vector the protection actually inspects.
   hook-install/native-config logs are diagnostics only. Logcat is attached
   to corroborate TLS/pinning errors.
 
+### 6. Compromised CA — eMudhra emSign G3 (`checks/revoked_ca.py`)
+
+Audits the **Mozilla bug 2083449** vector (Oct 2026): 8 eMudhra emSign ECC
+G3 intermediates were generated with tiny-integer private keys
+(`d` ∈ {4, 56, 66, 115, 155, 156, 230, 237}). Since the certificates are
+public, anyone recovers the key and signs arbitrary leaf certificates
+anchored in roots that are **already trusted — no CA install on the
+device**. All were revoked (`caCompromise`), but clients without revocation
+checking still accept them.
+
+- **Chain** (host-side): for each host observed in the traffic (or given
+  via `--audit-host`), the presented TLS chain is captured and compared
+  by SPKI/serial against the 8 compromised intermediates (catalog vendored
+  in `scripts/emudhra/`). If the app's backend uses one, its traffic is
+  directly exposed to MITM. SPKI matching covers all 16 certificates (the
+  eMudhra-issued and Sectigo cross-signed variants share the same key).
+- **Acceptance probe** (device-side): recovers the weak key at runtime
+  (ECC arithmetic only — the key is never persisted), issues an ephemeral
+  leaf (SAN `localhost`/`127.0.0.1`), serves it from a local TLS server
+  exposed to the device via `adb reverse` and injects
+  `scripts/emudhra_probe.js` into the app process. The probe measures two
+  paths: the **platform** trust store (cacerts) and the app's
+  `SSLContext.getDefault()`. `accepted` = the environment would allow
+  MITM without installing a CA; `rejected` = the CA left the trust store.
+- **Verdict**: `FALHOU` if the backend uses a compromised intermediate
+  **or** the runtime accepted the chain; `OK` if the probe proved
+  rejection; `N/A` if the probe was not evaluated (`detect` mode,
+  `--no-java`) and no compromised host was found.
+
+> **Scope**: defensive audit verification — it measures whether the
+> app/device rejects certificates from compromised CAs. Derived keys and
+> the ephemeral leaf exist only in memory during the probe.
+
 ---
 
 ## Instrumentation module (hooking APK) — optional
@@ -544,9 +578,13 @@ raspilot/
 │   ├── combined.py             # Single-session observation/bypass
 │   ├── stealth.py              # Native bootstrap before resume
 │   ├── apk_utils.py            # Shared APK helpers + APK cache
+│   ├── revoked_ca.py           # Compromised CA (eMudhra): chain + probe
 │   └── ssl_pinning.py          # SSL pinning detection + bypass
 ├── scripts/
 │   ├── ssl_bypass.js           # Universal SSL pinning bypass (Frida)
+│   ├── emudhra_probe.js        # Compromised-chain acceptance probe
+│   ├── emudhra_intermediates.json  # Catalogue of the 8 intermediates (SPKI, serial, d)
+│   ├── emudhra/                # Public intermediate PEMs (bug 2083449)
 │   ├── anti_frida_bypass.js    # Frida detection bypass (Frida)
 │   ├── anti_hooking_bypass.js  # Hooking detection bypass (Frida)
 │   ├── emulator_spoof.js       # Emulator spoof: probe and mask (Frida)

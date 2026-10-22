@@ -32,6 +32,7 @@ from checks.anti_frida import AntiFridaCheck
 from checks.anti_hooking import AntiHookingCheck
 from checks.anti_root import AntiRootCheck
 from checks.combined import run_combined_bypass, run_combined_observation
+from checks.revoked_ca import RevokedCACheck
 from checks.ssl_pinning import SSLPinningCheck
 from device_manager import (
     TOOL_NAME,
@@ -50,7 +51,10 @@ console = Console()
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] %(message)s"
 
 # Checks conhecidos — usado para validar --skip e nomear o relatório.
-KNOWN_CHECKS = ("anti_root", "anti_frida", "anti_emulator", "anti_hooking", "ssl_pinning")
+KNOWN_CHECKS = (
+    "anti_root", "anti_frida", "anti_emulator", "anti_hooking",
+    "ssl_pinning", "revoked_ca",
+)
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -118,6 +122,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="CHECK",
         help=f"Checks a pular ({', '.join(KNOWN_CHECKS)})",
+    )
+    parser.add_argument(
+        "--audit-host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help=(
+            "Host da API do app para o check revoked_ca (aceita HOST, "
+            "HOST:PORTA ou URL). Pode ser repetido; hosts observados no "
+            "tráfego do app também são inspecionados automaticamente"
+        ),
     )
     parser.add_argument(
         "--window",
@@ -589,7 +604,9 @@ def run_pipeline(args: argparse.Namespace) -> int:
         #    crash/lifecycle normal como reação do RASP.
         dynamic = any(
             check not in args.skip
-            for check in ("anti_frida", "anti_hooking", "ssl_pinning", "anti_emulator")
+            for check in (
+                "anti_frida", "anti_hooking", "ssl_pinning", "anti_emulator", "revoked_ca",
+            )
         )
         if dynamic and not args.no_baseline:
             with console.status("[cyan]Executando baseline sem instrumentação...[/]"):
@@ -722,7 +739,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         )
 
         # 11) SSL Pinning (usa bypass combinado quando houver).
-        _run_step(
+        ssl_report = _run_step(
             reporter,
             "ssl_pinning",
             lambda: SSLPinningCheck(dm, mode=args.mode, no_java=args.no_java).run_all(
@@ -730,6 +747,25 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 precomputed_bypass=ssl_bypass,
             ),
             skipped="ssl_pinning" in args.skip,
+        )
+
+        # 11b) CA comprometida (eMudhra emSign G3 — bug Mozilla 2083449).
+        #
+        # Roda com spawns próprios (probe de aceitação no processo do
+        # app). Usa os hosts observados no bypass de SSL Pinning como
+        # alvos do diagnóstico de chain, somados aos --audit-host.
+        observed_hosts = list(args.audit_host or [])
+        if ssl_report:
+            observed_hosts += list(
+                (ssl_report.get("bypass_details") or {}).get("intercepted_hosts") or []
+            )
+        _run_step(
+            reporter,
+            "revoked_ca",
+            lambda: RevokedCACheck(dm, mode=args.mode, no_java=args.no_java).run_all(
+                args.package, window=args.window, hosts=observed_hosts,
+            ),
+            skipped="revoked_ca" in args.skip,
         )
 
         # 12) Anti-Emulador (detecção + bypass).

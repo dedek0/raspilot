@@ -352,6 +352,42 @@ class TestFridaStealth:
         assert len(data) == src.stat().st_size
 
 
+class TestEnsureFridaServer:
+    """Restauração leve do frida-server entre spawns de checks."""
+
+    def test_healthy_server_skips_reinstall(self):
+        """Servidor respondendo: só o health check, sem reinstalar."""
+        dm = DeviceManager()
+        with mock.patch.object(dm, "_wait_frida_ready", return_value=True), \
+                mock.patch.object(dm, "setup_frida_server") as setup:
+            assert dm.ensure_frida_server() is True
+        setup.assert_not_called()
+        assert dm.frida_ready is True
+
+    def test_dead_server_is_reinstalled(self):
+        """Servidor sem resposta: refaz o pipeline completo."""
+        dm = DeviceManager()
+        dm.frida_ready = True  # estado anterior stale
+        with mock.patch.object(dm, "_wait_frida_ready", return_value=False), \
+                mock.patch.object(dm, "setup_frida_server", return_value=True) as setup:
+            assert dm.ensure_frida_server() is True
+        setup.assert_called_once()
+
+    def test_failed_reinstall_clears_flag_and_raises(self):
+        """Falha na reinstalação propaga e limpa o estado."""
+        from device_manager import FridaSetupError
+
+        dm = DeviceManager()
+        with mock.patch.object(dm, "_wait_frida_ready", return_value=False), \
+                mock.patch.object(
+                    dm, "setup_frida_server",
+                    side_effect=FridaSetupError("sem binário"),
+                ):
+            with pytest.raises(FridaSetupError):
+                dm.ensure_frida_server()
+        assert dm.frida_ready is False
+
+
 class TestFridaHelpers:
     """Helpers do frida-server (sem download real)."""
 

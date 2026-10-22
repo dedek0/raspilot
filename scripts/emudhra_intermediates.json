@@ -1,0 +1,110 @@
+{
+  "_comment": "Intermediarios eMudhra emSign ECC G3 com chave privada fragil (escalar minimo), bug Mozilla 2083449. Certificados publicos vendados para auditoria; as chaves sao derivadas em runtime e nunca persistidas. As variantes emitidas pela emSign compartilham a mesma SPKI — a deteccao por SPKI cobre as 16 certificacoes.",
+  "_reference": "https://bugzilla.mozilla.org/show_bug.cgi?id=2083449",
+  "intermediates": [
+    {
+      "id": "01_EM-DV-TLS-CA-G3B",
+      "cn": "EM DV TLS CA - G3B",
+      "organization": "eMudhra BV",
+      "issuer_cn": "AAA Certificate Services",
+      "serial_hex": "A024FDF4BA665C785CE4A020483858B7",
+      "cert_sha256": "45A883F349AEDFD5F3A649B5498FFB121712BA8B448F3F2A91DBC5A766FCDDBE",
+      "spki_sha256": "EBED6475C2C2D80FCB199F3FE8DD6E6B3CE60B77EB15D4E42C3DEC0C6F5B5105",
+      "not_before": "2025-05-14T00:00:00Z",
+      "not_after": "2028-12-31T23:59:59Z",
+      "recovered_d": 156,
+      "pem_file": "emudhra/01_EM-DV-TLS-CA-G3B.pem"
+    },
+    {
+      "id": "02_EM-DV-TLS-CA-G3C",
+      "cn": "EM DV TLS CA - G3C",
+      "organization": "eMudhra Inc",
+      "issuer_cn": "AAA Certificate Services",
+      "serial_hex": "91F347F1A5B7D39962B95E0EE4E299D1",
+      "cert_sha256": "62B7F9868263F72F6911FC78CEAF72C1979158B7368BF648683BB2AA39B02E72",
+      "spki_sha256": "49DD353DC2B919A3770645117D0E60C16115E7D1BC259EEFE734B00EA434FE5F",
+      "not_before": "2025-05-14T00:00:00Z",
+      "not_after": "2028-12-31T23:59:59Z",
+      "recovered_d": 230,
+      "pem_file": "emudhra/02_EM-DV-TLS-CA-G3C.pem"
+    },
+    {
+      "id": "03_EM-EV-TLS-CA-G3B",
+      "cn": "EM EV TLS CA - G3B",
+      "organization": "eMudhra BV",
+      "issuer_cn": "AAA Certificate Services",
+      "serial_hex": "D8F8685E4F2BD9D82402A85A1C1EB731",
+      "cert_sha256": "579480AEA166290BD3C643589E795FC0D0E54E86505D180F1DFF99EFD3199512",
+      "spki_sha256": "E0254C7FCDC265E2F0F8A428DABB75AB4AE039B4872D62F5EE57F0877D5A8A41",
+      "not_before": "2025-05-14T00:00:00Z",
+      "not_after": "2028-12-31T23:59:59Z",
+      "recovered_d": 115,
+      "pem_file": "emudhra/03_EM-EV-TLS-CA-G3B.pem"
+    },
+    {
+      "id": "04_EM-EV-TLS-CA-G3C",
+      "cn": "EM EV TLS CA - G3C",
+      "organization": "eMudhra Inc",
+      "issuer_cn": "AAA Certificate Services",
+      "serial_hex": "5F078752DECE7A1BB8595D303167171",
+      "cert_sha256": "FD9D5C2DBBD4995AB69B8D50C439D9527B00529199C2FD01B2174EB58F07021F",
+      "spki_sha256": "5C0660A2B164910D8FF589C18E14552E9E0EC237DCEFE2CB736D41A4811F81A0",
+      "not_before": "2025-05-14T00:00:00Z",
+      "not_after": "2028-12-31T23:59:59Z",
+      "recovered_d": 56,
+      "pem_file": "emudhra/04_EM-EV-TLS-CA-G3C.pem"
+    },
+    {
+      "id": "05_EM-OV-CS-CA-G3B",
+      "cn": "EM OV CS CA - G3B",
+      "organization": "eMudhra BV",
+      "issuer_cn": "AAA Certificate Services",
+      "serial_hex": "41E32B73AC185D6CE0D7480BACF84E69",
+      "cert_sha256": "A496E23AC0CAB8155FC9B117B97EAE368EFCBB9041AEC8804D5A308D2D01C2D8",
+      "spki_sha256": "EC4FFA1AD0AC88081314B7AAFFEF6A91F97CD57291BB5BA686C5415F5EB4F6B6",
+      "not_before": "2025-05-14T00:00:00Z",
+      "not_after": "2028-12-31T23:59:59Z",
+      "recovered_d": 66,
+      "pem_file": "emudhra/05_EM-OV-CS-CA-G3B.pem"
+    },
+    {
+      "id": "06_EM-OV-CS-CA-G3C",
+      "cn": "EM OV CS CA - G3C",
+      "organization": "eMudhra Inc",
+      "issuer_cn": "AAA Certificate Services",
+      "serial_hex": "D6A5EF613B390F32EF9CDF349F772841",
+      "cert_sha256": "84112972B8E59D14560AE7E7119654474AAD119990CF3722BFC1E3B91615E1FD",
+      "spki_sha256": "92C063D67E8F14DB71D288E11266FFDAF69CBF115F7BAB14F3BC2F68D25E0E30",
+      "not_before": "2025-05-14T00:00:00Z",
+      "not_after": "2028-12-31T23:59:59Z",
+      "recovered_d": 237,
+      "pem_file": "emudhra/06_EM-OV-CS-CA-G3C.pem"
+    },
+    {
+      "id": "07_EM-OV-TLS-CA-G3B",
+      "cn": "EM OV TLS CA - G3B",
+      "organization": "eMudhra BV",
+      "issuer_cn": "AAA Certificate Services",
+      "serial_hex": "E94223BDE92F914E5AB9ACABFDAC3710",
+      "cert_sha256": "5F1DED4DD590AF74631290CF073B122A2AAC6A1FA479778A0BD43579BD832699",
+      "spki_sha256": "43BFFA19D6EF651451F6841E019931E96F6F2EAEFF28AB4B6F1CE4576DE2717B",
+      "not_before": "2025-05-14T00:00:00Z",
+      "not_after": "2028-12-31T23:59:59Z",
+      "recovered_d": 155,
+      "pem_file": "emudhra/07_EM-OV-TLS-CA-G3B.pem"
+    },
+    {
+      "id": "08_EM-OV-TLS-CA-G3C",
+      "cn": "EM OV TLS CA - G3C",
+      "organization": "eMudhra Inc",
+      "issuer_cn": "AAA Certificate Services",
+      "serial_hex": "8D5A4811939EF447D77111CDD9849AE9",
+      "cert_sha256": "7485B51C0ED192878FA1D2F948FB529AE1842CC5086C4B67F7BE5B2039DE9489",
+      "spki_sha256": "63ECEFEE431D49523BC1136C4E72D0206A477086CAF606CD5CF025686C109CF8",
+      "not_before": "2025-05-14T00:00:00Z",
+      "not_after": "2028-12-31T23:59:59Z",
+      "recovered_d": 4,
+      "pem_file": "emudhra/08_EM-OV-TLS-CA-G3C.pem"
+    }
+  ]
+}
