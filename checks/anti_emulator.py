@@ -1850,7 +1850,26 @@ class AntiEmulatorCheck:
                     or "bypass não exercitado: sem evidência durante a janela"
                 )
             else:
-                bypass_successful = bool(bypass_details.get("success"))
+                success = bool(bypass_details.get("success"))
+                # Só existe conclusão de "bypass venceu" quando a
+                # proteção foi observada em runtime no probe ou quando a
+                # janela de bypass exercitou um canal decisivo. Consultas
+                # apenas a canais secundários (telefonia, android_id) têm
+                # uso legítimo e não provam que a checagem anti-emulador
+                # do app foi exercitada.
+                dynamic_protection = bool(app_detection.get("detected"))
+                decisive_exercised = bool(
+                    bypass_details.get("masked_channels")
+                )
+                if success and not dynamic_protection and not decisive_exercised:
+                    bypass_successful = None
+                    bypass_skipped_reason = (
+                        "bypass não exercitado: a proteção foi vista apenas "
+                        "no APK e nenhuma consulta a canal decisivo de "
+                        "emulador ocorreu na janela"
+                    )
+                else:
+                    bypass_successful = success
 
         result: dict = {
             "protection_detected": protection_detected,

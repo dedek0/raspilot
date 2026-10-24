@@ -351,6 +351,23 @@ def _bypass_entry(trace: List[dict], check_name: str, result: dict) -> None:
     else:
         outcome = "resisted"
 
+    # O resultado do bypass pode ter sido rebaixado pelo check (ex.: o
+    # bypass rodou, mas nenhuma checagem decisiva foi exercitada). A
+    # trilha precisa mostrar o que foi REPORTADO, não só o retorno
+    # bruto da camada de bypass.
+    reported_bypass = result.get("bypass_successful")
+    if reported_bypass is None and reason:
+        outcome = "inconclusive"
+    elif reported_bypass is True:
+        outcome = "success"
+    elif reported_bypass is False:
+        if details.get("blocked"):
+            outcome = "blocked"
+        elif details.get("error"):
+            outcome = "error"
+        else:
+            outcome = "resisted"
+
     parts: List[str] = []
 
     def _add_detail(value: Any) -> None:

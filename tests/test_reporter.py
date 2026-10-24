@@ -160,6 +160,35 @@ class TestGenerateJson:
         assert root["outcome"] == "error" and root["reported_status"] == "ERROR"
         assert "adb offline" in root["details"]
 
+    def test_execution_log_reflects_demoted_bypass(self):
+        """Bypass bruto bem-sucedido pode ser reportado como inconclusivo.
+
+        O check rebaixa o bypass quando nenhuma checagem decisiva foi
+        exercitada; a trilha precisa refletir o que foi reportado, e não
+        apenas o retorno da camada de bypass.
+        """
+        rep = Reporter(device_info=DEVICE, package_name="pkg")
+        rep.collect("anti_emulator", {
+            "protection_detected": True,
+            "bypass_successful": None,
+            "bypass_skipped_reason": (
+                "bypass não exercitado: a proteção foi vista apenas no APK "
+                "e nenhuma consulta a canal decisivo ocorreu"
+            ),
+            "bypass_details": {
+                "success": True,
+                "masked_channels": [],
+                "exposed_channels": ["TelephonyManager.getNetworkOperatorName: Android"],
+                "app_alive_at_end": True,
+            },
+        })
+        log = rep.generate_json()["execution_log"]
+        bypass = [s for s in log if s["phase"] == "bypass"][0]
+        assert bypass["outcome"] == "inconclusive"
+        assert "canal decisivo" in bypass["details"]
+        verdict = [s for s in log if s["phase"] == "verdict"][0]
+        assert verdict["reported_status"] == "SKIP"
+
     def test_status_ok_when_protection_wins(self):
         """Anti-frida que bloqueou o Frida => status OK."""
         rep = Reporter(device_info=DEVICE, package_name="pkg")

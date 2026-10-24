@@ -347,3 +347,35 @@ def test_run_all_emulador_modulo_sem_evidencia_vira_skip(clean_dm):
     assert result["protection_detected"] is True
     assert result["bypass_successful"] is None
     assert "não exercitado" in result["bypass_skipped_reason"]
+
+
+def test_run_all_emulador_so_canal_secundario_vira_skip(clean_dm):
+    """Consulta apenas a canais secundários não comprova bypass.
+
+    O app pode ler telefonia ou android_id por motivo legítimo. Se a
+    proteção só foi vista no APK e o probe dinâmico não a observou, o
+    bypass não pode ser creditado como vencido apenas por esses sinais.
+    """
+    secondary = {"kind": "neutralize", "channel": "emulator:secondary",
+                 "method": "TelephonyManager.getNetworkOperatorName",
+                 "detail": "Android"}
+    manager = FakeXposed(phases={
+        ("bypass", "probe"): _run(evidence=[secondary]),
+        ("bypass", "mask"): _run(evidence=[secondary]),
+    })
+    check = AntiEmulatorCheck(clean_dm, method="module", xposed=manager)
+    with mock.patch.object(
+        AntiEmulatorCheck, "detect_static", return_value={
+            "static_detected": True, "types": ["emulator_sdk"],
+            "primary": "emulator_sdk",
+            "evidence": ["[emulator_sdk] isProbablyAnEmulator"],
+        }
+    ), mock.patch.object(
+        AntiEmulatorCheck, "classify_device",
+        return_value={"is_emulator": False, "emulator_type": None,
+                      "checks": {}, "confidence": "high"},
+    ):
+        result = check.run_all("com.example.app", window=1)
+    assert result["protection_detected"] is True
+    assert result["bypass_successful"] is None
+    assert "canal decisivo" in result["bypass_skipped_reason"]
