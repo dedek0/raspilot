@@ -280,7 +280,8 @@ class TestBypassEvidence:
             res = check.attempt_bypass("com.example.app", window=1)
         assert res["bypass_logs"], "os logs do script devem ser coletados"
         assert res["effective_logs"] == []
-        assert res["success"] is False
+        assert res["success"] is None
+        assert "não exercitado" in res["skipped_reason"]
 
     def test_exercised_check_is_evidence(self):
         """Uma checagem do app neutralizada é evidência de bypass."""

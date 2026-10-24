@@ -387,6 +387,29 @@ class TestReliability:
         assert res["bypass_successful"] is None
         assert "não exercido" in res["bypass_skipped_reason"]
 
+    def test_bypass_without_any_signal_is_inconclusive(self):
+        """Sem host e sem log de configuração, nada foi exercitado.
+
+        Não há como afirmar que o pinning resistiu ao bypass: o bypass
+        pode simplesmente não ter interceptado nenhuma conexão.
+        """
+        dm = mock.MagicMock()
+        dm.spawn_app.return_value = TestAttemptBypass._FakeSession([])
+        dm.last_spawn_pid = 42
+        dm.is_app_alive.return_value = True
+        with mock.patch("checks.ssl_pinning.OBSERVATION_POLL_INTERVAL", 0.0), \
+             mock.patch.object(
+                 SSLPinningCheck, "detect_pinning",
+                 return_value={
+                     "pinning_detected": True, "type": "okhttp",
+                     "evidence": ["[okhttp] classe okhttp3.CertificatePinner"],
+                 },
+             ):
+            res = SSLPinningCheck(dm).run_all("com.app", window=2)
+        assert res["bypass_successful"] is None
+        assert res["bypass_details"]["evidence_strength"] == "none"
+        assert "não exercido" in res["bypass_skipped_reason"]
+
     def test_success_requires_alive_app_and_host(self):
         """Host interceptado com app morto não é sucesso."""
         dm = mock.MagicMock()

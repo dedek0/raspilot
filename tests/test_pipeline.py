@@ -15,7 +15,6 @@ import checks.anti_emulator as anti_emulator_mod
 import checks.anti_frida as anti_frida_mod
 import checks.anti_hooking as anti_hooking_mod
 import checks.combined as combined_mod
-import checks.revoked_ca as revoked_ca_mod
 import checks.ssl_pinning as ssl_pinning_mod
 import main as mainmod
 from device_manager import DeviceManager
@@ -101,7 +100,6 @@ def fast_windows():
          mock.patch.object(anti_hooking_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
          mock.patch.object(anti_emulator_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
          mock.patch.object(ssl_pinning_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
-         mock.patch.object(revoked_ca_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
          mock.patch.object(combined_mod, "OBSERVATION_POLL_INTERVAL", 0.0):
         yield
 

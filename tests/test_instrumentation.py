@@ -111,6 +111,44 @@ def test_config_fingerprint_estavel():
     assert a.fingerprint() != c.fingerprint()
 
 
+def test_source_digest_invalida_build_antigo(tmp_path, monkeypatch):
+    """Mudar o código-fonte do módulo muda o diretório de cache do APK.
+
+    O cache era indexado só pela configuração: uma correção no Java
+    continuava executando o APK antigo no dispositivo.
+    """
+    import instrumentation.manager as manager_mod
+
+    src = tmp_path / "src"
+    src.mkdir()
+    source = src / "Module.java"
+    source.write_text("class Module { }", encoding="utf-8")
+    monkeypatch.setattr(manager_mod, "MODULE_SRC_DIR", str(src))
+
+    first = manager_mod.XposedManager._source_digest()
+    source.write_text("class Module { int fixed; }", encoding="utf-8")
+    second = manager_mod.XposedManager._source_digest()
+    assert first != second
+
+
+def test_mask_spoofs_secondary_and_hides_decisive():
+    """O modo mask mantém os canais secundários expostos.
+
+    O bypass precisa exercitar o app: sem o spoof dos canais
+    secundários, o app veria o device físico e o módulo não teria
+    nenhuma consulta para observar.
+    """
+    from instrumentation.manager import MODULE_SRC_DIR
+
+    source = open(
+        f"{MODULE_SRC_DIR}/src/com/raspilot/module/EmulatorShield.java",
+        encoding="utf-8",
+    ).read()
+    assert "hookTelephony(probe || mask)" in source
+    assert "hookAndroidId(probe || mask)" in source
+    assert "if (!probe && !mask)" in source
+
+
 # ----------------------------------------------------------------------
 # Evidência
 # ----------------------------------------------------------------------

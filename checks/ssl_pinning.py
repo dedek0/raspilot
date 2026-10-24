@@ -477,12 +477,11 @@ class SSLPinningCheck:
         # O app bloqueou a auditoria: encerrou com a instrumentação e a
         # causa é atribuível ao RASP. Isso é uma conclusão sobre a
         # proteção (ela resistiu), não uma etapa que não rodou.
-        blocked = bool(
-            not alive
-            and classify_failure(
-                logcat, getattr(self.dm, "baseline", None)
-            ).get("is_rasp")
+        failure = classify_failure(
+            logcat, getattr(self.dm, "baseline", None)
         )
+        blocked = bool(not alive and failure.get("is_rasp"))
+        death_kind = str(failure.get("kind", "unknown"))
         error: Optional[str] = None
         if alive and java_load_error and not intercepted_hosts:
             # OkHttp/TrustManager são Java; sem esses hooks o bypass não
@@ -490,13 +489,25 @@ class SSLPinningCheck:
             success = False
             error = f"hooks Java de SSL não carregaram: {java_load_error}"
         elif not alive:
-            # O app encerrou durante o bypass: o bypass não venceu — o
-            # app bloqueou a auditoria.
+            # O app encerrou durante o bypass. Só é "bloqueou a
+            # auditoria" quando a morte é atribuível ao RASP; caso
+            # contrário o bypass fica inconclusivo.
             success = False
-            error = (
-                "o app bloqueou o bypass de SSL: encerrou durante a execução "
-                "do bypass"
-            )
+            if blocked:
+                error = (
+                    "o app bloqueou o bypass de SSL: encerrou durante a "
+                    "execução do bypass (reação do RASP)"
+                )
+            elif death_kind == "instrumentation_crash":
+                error = (
+                    "o app encerrou o agente de instrumentação durante o "
+                    "bypass de SSL; resultado inconclusivo"
+                )
+            else:
+                error = (
+                    "app encerrou durante o bypass de SSL sem reação RASP "
+                    f"atribuível ({death_kind}); resultado inconclusivo"
+                )
 
         result = {
             "success": success,
@@ -603,7 +614,7 @@ class SSLPinningCheck:
         not_exercised = (
             not bypass.get("success")
             and bypass_error is None
-            and strength == "config_only"
+            and strength in ("config_only", "none")
         )
         result = {
             "pinning_detected": True,

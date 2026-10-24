@@ -20,11 +20,12 @@ from typing import Any, Dict, Optional, Tuple
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from device_manager import TOOL_NAME, TOOL_VERSION
+from execution_log import build_execution_log
 
 # Versão do schema do documento JSON. Incrementada quando a forma do
 # relatório muda de modo incompatível, para que um consumidor possa
 # detectar a mudança em vez de interpretar campos ausentes.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 logger = logging.getLogger("raspilot.reporter")
 
@@ -37,7 +38,6 @@ REPORT_ORDER = (
     "anti_frida",
     "anti_hooking",
     "ssl_pinning",
-    "revoked_ca",
 )
 
 # Diretório dos templates Jinja2 (relativo a este arquivo).
@@ -96,6 +96,33 @@ class Reporter:
     # Semântica de status
     # ------------------------------------------------------------------
     @staticmethod
+    def _protection_sources(result: dict) -> list:
+        """Lista de onde veio a evidência de proteção do app.
+
+        A distinção importa: uma assinatura estática no APK prova que o
+        código referencia a checagem, enquanto a observação dinâmica
+        prova que o app a executou na janela. O relatório mostra as duas
+        coisas separadamente para não sugerir mais do que foi medido.
+
+        Args:
+            result: Resultado de um check de proteção (hooking/emulador).
+
+        Returns:
+            Lista com ``static_apk``, ``dynamic`` e/ou ``module``.
+        """
+        sources = []
+        static = result.get("static_detection") or {}
+        if static.get("static_detected"):
+            sources.append("static_apk")
+        app_detection = result.get("app_detection") or {}
+        if app_detection.get("detected"):
+            sources.append("dynamic")
+        module = result.get("module_detection") or {}
+        if module.get("detection_methods_found"):
+            sources.append("module")
+        return sources
+
+    @staticmethod
     def _status_for(check_name: str, result: dict) -> Tuple[str, Dict[str, Any]]:
         """Deriva o status textual e o resumo de um check.
 
@@ -118,22 +145,34 @@ class Reporter:
 
         if check_name == "anti_root":
             is_rooted = bool(result.get("is_rooted"))
+            positive = list(result.get("positive_vectors") or [])
+            evaluated = list(result.get("evaluated_vectors") or [])
             return (
                 "FALHOU" if is_rooted else "OK",
                 {
                     "is_rooted": is_rooted,
                     "confidence": result.get("confidence"),
+                    "positive_vectors": positive,
+                    "evaluated_vectors": len(evaluated),
                 },
             )
 
         if check_name == "anti_frida":
             raw_vulnerable = result.get("vulnerable")
+            app_detection = result.get("app_detection") or {}
             # O conjunto de chaves do resumo é o mesmo em todos os status:
             # um consumidor não pode falhar com KeyError justamente nos
             # casos inconclusivos.
             summary = {
                 "vulnerable": None if raw_vulnerable is None else bool(raw_vulnerable),
-                "frida_present": bool(result.get("frida_present")),
+                # A presença do Frida é injetada pela própria ferramenta;
+                # o nome deixa isso explícito para não ser lido como
+                # descoberta sobre o ambiente.
+                "frida_injected_by_tool": bool(result.get("frida_present")),
+                "observation_status": app_detection.get("observation_status"),
+                "detection_signals": list(
+                    app_detection.get("detection_methods_found") or []
+                )[:6],
             }
             if raw_vulnerable is None:
                 # Observação inconclusiva (crash da instrumentação, morte no
@@ -153,6 +192,7 @@ class Reporter:
                 "protection_detected": protected,
                 "bypass_successful": bypass,
                 "device_is_emulator": bool(result.get("device_is_emulator")),
+                "protection_sources": Reporter._protection_sources(result),
             }
             if result.get("probe_method"):
                 summary["probe_method"] = result.get("probe_method")
@@ -186,6 +226,7 @@ class Reporter:
                 "protection_detected": protected,
                 "bypass_successful": bypass,
                 "hook_frameworks_present": bool(result.get("hook_frameworks_present")),
+                "protection_sources": Reporter._protection_sources(result),
             }
             if result.get("bypass_method"):
                 summary["bypass_method"] = result.get("bypass_method")
@@ -218,10 +259,15 @@ class Reporter:
         if check_name == "ssl_pinning":
             bypass = result.get("bypass_successful")
             pinned = bool(result.get("pinning_detected"))
+            bypass_details = result.get("bypass_details") or {}
             summary = {
                 "pinning_detected": pinned,
                 "pinning_type": result.get("pinning_type"),
                 "bypass_successful": bypass,
+                "intercepted_hosts": list(
+                    bypass_details.get("intercepted_hosts") or []
+                )[:8],
+                "evidence_strength": bypass_details.get("evidence_strength"),
             }
             blocked = bool((result.get("bypass_details") or {}).get("blocked"))
             if blocked:
@@ -242,44 +288,6 @@ class Reporter:
                 status = "N/A"  # sem pinning — bypass não aplicável
             else:
                 status = "OK"
-            return status, summary
-
-        if check_name == "revoked_ca":
-            # CA comprometida (eMudhra emSign G3): dois vetores decidem o
-            # veredito. "FALHOU" = o ambiente confia em CA comprometida
-            # (backend usando intermediário comprometido OU runtime
-            # aceitando a cadeia no probe) — MITM possível sem instalar
-            # CA. "OK" = o probe comprovou rejeição. "N/A" = probe não
-            # avaliado e nenhum host comprometido encontrado.
-            server_hit = bool(result.get("server_uses_compromised_ca"))
-            probe = result.get("probe_accepted")
-            summary = {
-                "server_uses_compromised_ca": server_hit,
-                "hosts_checked": len(result.get("hosts_checked") or []),
-                "probe_accepted": probe,
-            }
-            cas = result.get("compromised_cas") or []
-            if cas:
-                summary["compromised_ca"] = list(cas)
-            if server_hit:
-                status = "FALHOU"
-                summary["detail"] = (
-                    "backend do app usa intermediário eMudhra comprometido/revogado"
-                )
-            elif probe is True:
-                status = "FALHOU"
-                summary["detail"] = (
-                    "o runtime do app aceitou cadeia de CA comprometida "
-                    "(MITM sem instalar CA)"
-                )
-            elif probe is False:
-                status = "OK"  # trust path rejeitou a cadeia comprometida
-            else:
-                status = "N/A"
-                summary["skip_reason"] = (
-                    result.get("bypass_skipped_reason")
-                    or "teste de aceitação não avaliado"
-                )
             return status, summary
 
         # Check desconhecido não pode ser reportado como sucesso.
@@ -327,9 +335,21 @@ class Reporter:
         if self.run_context:
             metadata["run"] = self.run_context
 
+        # Trilha de execução: o que foi tentado, o que foi encontrado e o
+        # que foi reportado. A ordem acompanha o resumo, para que a
+        # leitura do JSON e do HTML seja a mesma do terminal.
+        execution_log: list = []
+        for check_name, resumo in summary.items():
+            status = resumo.get("status", "ERROR")
+            for step in build_execution_log(
+                check_name, self._results.get(check_name) or {}, status
+            ):
+                execution_log.append({"check": check_name, **step})
+
         return {
             "metadata": metadata,
             "summary": summary,
+            "execution_log": execution_log,
             "details": self._results,
         }
 
@@ -356,12 +376,17 @@ class Reporter:
             raise RuntimeError(f"Template report.html.j2 indisponível: {exc}") from exc
 
         doc = self.generate_json()
+        execution_by_check: Dict[str, list] = {}
+        for step in doc.get("execution_log", []):
+            execution_by_check.setdefault(step["check"], []).append(step)
         return template.render(
             tool_name=TOOL_NAME,
             tool_version=TOOL_VERSION,
             metadata=doc["metadata"],
             summary=doc["summary"],
             details=doc["details"],
+            execution_log=doc["execution_log"],
+            execution_by_check=execution_by_check,
             generated_at=self.timestamp.strftime("%Y-%m-%d %H:%M:%S UTC"),
             json_blob=json.dumps(doc, ensure_ascii=False, indent=2),
         )

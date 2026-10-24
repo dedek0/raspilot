@@ -483,7 +483,7 @@ class TestAttemptBypass:
         assert res["effective_logs"]
 
     def test_failure_without_evidence(self):
-        """Apenas logs de instalação (sem neutralização) => success=False."""
+        """Apenas logs de instalação (sem neutralização) => inconclusivo."""
         dm = mock.MagicMock()
         dm.spawn_app.return_value = FakeSession(bypass_messages=[
             _bypass("libc.strstr hookado"),
@@ -493,8 +493,9 @@ class TestAttemptBypass:
         dm.is_app_alive.return_value = True
         with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = AntiHookingCheck(dm).attempt_bypass("com.app")
-        assert res["success"] is False
+        assert res["success"] is None
         assert res["effective_logs"] == []
+        assert "não exercitado" in res["skipped_reason"]
 
     def test_app_death_beats_evidence(self):
         """Morte durante o bypass anula a evidência: RASP reagiu."""
@@ -738,8 +739,13 @@ class TestRunAll:
         assert res["hook_frameworks_present"] is True
         assert res["bypass_successful"] is None  # modo detect
 
-    def test_dynamic_protection_resists_bypass(self, tmp_path):
-        """Detecção só em runtime e bypass sem evidência => OK (False)."""
+    def test_dynamic_protection_without_exercised_bypass_is_skip(self, tmp_path):
+        """Detecção em runtime e bypass sem evidência => etapa não exercitada.
+
+        Antes o resultado era ``bypass_successful=False`` (OK), o que
+        afirmava que a proteção resistiu sem que nenhuma checagem
+        anti-hook tivesse sido exercitada durante o bypass.
+        """
         apk = _make_apk(str(tmp_path / "clean.apk"), {"classes.dex": b"plain"})
         dm = self._mock_dm(session=FakeSession(
             detection_messages=[_det("Class.forName", "org.lsposed.XposedBridge")],
@@ -748,7 +754,8 @@ class TestRunAll:
         with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = AntiHookingCheck(dm).run_all("com.app", apk_path=apk)
         assert res["protection_detected"] is True
-        assert res["bypass_successful"] is False
+        assert res["bypass_successful"] is None
+        assert "não exercitado" in res["bypass_skipped_reason"]
 
     def test_weak_signals_do_not_trigger_bypass(self, tmp_path):
         """Só sinais fracos => sem proteção e sem fase de bypass."""

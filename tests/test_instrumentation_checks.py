@@ -286,6 +286,25 @@ def test_bypass_emulador_modulo_sem_evidencia_e_inconclusivo(clean_dm):
     assert result["details"].startswith("nenhuma consulta anti-emulador")
 
 
+def test_bypass_emulador_modulo_so_spoof_e_inconclusivo(clean_dm):
+    """O self-report do spoof não é consulta do app.
+
+    Antes o spoof de Build no modo mask contava como "bypass exercitado"
+    e um app vivo sem nenhuma consulta era classificado como sucesso.
+    """
+    manager = FakeXposed(phases={
+        ("bypass", "mask"): _run(evidence=[
+            {"kind": "spoof", "channel": "emulator:spoof",
+             "method": "Build.MODEL", "detail": "sdk_gphone64_x86_64"},
+        ]),
+    })
+    check = AntiEmulatorCheck(clean_dm, method="module", xposed=manager)
+    result = check.attempt_module_bypass("com.example.app", window=1)
+    assert result["success"] is None
+    assert result["exercised"] is False
+    assert "não exercitado" in result["skipped_reason"]
+
+
 def test_bypass_emulador_modulo_morte_pos_janela(clean_dm):
     """Morte logo após a janela (kill assíncrono) invalida o sucesso."""
     dm = mock.MagicMock()

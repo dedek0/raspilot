@@ -941,7 +941,9 @@ def run_combined_bypass(
     kind = str(failure.get("kind", "unknown"))
     is_rasp = bool(failure.get("is_rasp"))
 
-    hook_success = bool(hook_effective) and alive
+    hook_exercised = bool(hook_effective)
+    hook_success: Optional[bool] = hook_exercised and alive
+    hook_skipped_reason: Optional[str] = None
     hook_error: Optional[str] = None
     if alive and hook_java_error:
         hook_success = False
@@ -961,6 +963,14 @@ def run_combined_bypass(
                 "app encerrou sem reação RASP identificável durante o bypass "
                 f"({kind})"
             )
+    elif not hook_exercised:
+        # App vivo, mas nenhuma checagem neutralizada: o bypass não foi
+        # exercitado. Inconclusivo, não derrota da proteção.
+        hook_success = None
+        hook_skipped_reason = (
+            "bypass não exercitado: nenhuma checagem anti-hook "
+            "neutralizada durante a janela"
+        )
     if hook_error is None and combined_error and not (not alive and is_rasp):
         hook_error = combined_error
 
@@ -989,6 +999,9 @@ def run_combined_bypass(
         "blocked": bool(not alive and is_rasp),
         "bypass_logs": hook_logs,
         "effective_logs": hook_effective,
+        "exercised": hook_exercised,
+        "evidence_strength": "neutralized" if hook_exercised else "none",
+        "skipped_reason": hook_skipped_reason,
         "app_alive_at_end": alive,
         "death_cause": death_cause,
         "logcat": logcat,

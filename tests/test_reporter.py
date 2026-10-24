@@ -79,46 +79,86 @@ class TestGenerateJson:
     """Schema do relatório JSON."""
 
     def test_schema_snapshot(self):
-        """O documento segue exatamente o schema esperado (snapshot)."""
+        """O documento segue o schema esperado (metadata, summary, log, details)."""
         doc = _reporter().generate_json()
-        expected = {
-            "metadata": {
-                "schema_version": SCHEMA_VERSION,
-                "tool_name": TOOL_NAME,
-                "tool_version": TOOL_VERSION,
-                "timestamp": "2026-10-14T12:00:00+00:00",
-                "device": DEVICE,
-                "package": "com.example.app",
-            },
-            "summary": {
-                "anti_root": {
-                    "status": "FALHOU", "is_rooted": True, "confidence": "high",
-                },
-                "anti_frida": {
-                    "status": "FALHOU", "vulnerable": True, "frida_present": True,
-                },
-                "anti_emulator": {
-                    "status": "OK", "protection_detected": True,
-                    "bypass_successful": False, "device_is_emulator": False,
-                },
-                "ssl_pinning": {
-                    "status": "FALHOU", "pinning_detected": True,
-                    "pinning_type": "okhttp", "bypass_successful": True,
-                },
-                "anti_hooking": {
-                    "status": "FALHOU", "protection_detected": True,
-                    "bypass_successful": True, "hook_frameworks_present": True,
-                },
-            },
-            "details": RESULTS,
+        assert set(doc) == {"metadata", "summary", "execution_log", "details"}
+        assert doc["metadata"] == {
+            "schema_version": SCHEMA_VERSION,
+            "tool_name": TOOL_NAME,
+            "tool_version": TOOL_VERSION,
+            "timestamp": "2026-10-14T12:00:00+00:00",
+            "device": DEVICE,
+            "package": "com.example.app",
         }
-        assert doc == expected
+        assert doc["summary"] == {
+            "anti_root": {
+                "status": "FALHOU", "is_rooted": True, "confidence": "high",
+                "positive_vectors": ["magisk"], "evaluated_vectors": 0,
+            },
+            "anti_frida": {
+                "status": "FALHOU", "vulnerable": True,
+                "frida_injected_by_tool": True,
+                "observation_status": None, "detection_signals": [],
+            },
+            "anti_emulator": {
+                "status": "OK", "protection_detected": True,
+                "bypass_successful": False, "device_is_emulator": False,
+                "protection_sources": [],
+            },
+            "ssl_pinning": {
+                "status": "FALHOU", "pinning_detected": True,
+                "pinning_type": "okhttp", "bypass_successful": True,
+                "intercepted_hosts": ["api.x.com"], "evidence_strength": None,
+            },
+            "anti_hooking": {
+                "status": "FALHOU", "protection_detected": True,
+                "bypass_successful": True, "hook_frameworks_present": True,
+                "protection_sources": ["static_apk", "dynamic"],
+            },
+        }
+        assert doc["details"] == RESULTS
+        # A trilha cobre todos os checks e sempre termina em um veredito
+        # com o status reportado.
+        assert {step["check"] for step in doc["execution_log"]} == set(RESULTS)
+        verdicts = [
+            step for step in doc["execution_log"] if step["phase"] == "verdict"
+        ]
+        assert len(verdicts) == len(RESULTS)
+        assert all(step.get("reported_status") for step in verdicts)
 
     def test_json_serializable(self):
         """O documento é 100% serializável em JSON."""
         doc = _reporter().generate_json()
         parsed = json.loads(json.dumps(doc))
         assert parsed["metadata"]["package"] == "com.example.app"
+
+    def test_execution_log_has_attempt_find_and_report(self):
+        """A trilha registra tentativa, achado e status reportado."""
+        doc = _reporter().generate_json()
+        hook = [s for s in doc["execution_log"] if s["check"] == "anti_hooking"]
+        assert any(s["phase"] == "static" for s in hook)
+        assert any(s["phase"] == "detection" for s in hook)
+        assert any(s["phase"] == "bypass" for s in hook)
+        verdict = [s for s in hook if s["phase"] == "verdict"][0]
+        assert verdict["reported_status"] == "FALHOU"
+        assert "bypass_successful=True" in verdict["details"]
+        # A evidência real do bypass está na etapa de bypass, não só no
+        # veredito.
+        bypass = [s for s in hook if s["phase"] == "bypass"][0]
+        assert bypass["outcome"] == "success"
+        assert bypass["evidence"]
+
+    def test_execution_log_marks_skip_and_error(self):
+        """Checks pulados/errados têm etapa explícita na trilha."""
+        rep = Reporter(device_info=DEVICE, package_name="pkg")
+        rep.collect("ssl_pinning", {"skipped": True})
+        rep.collect("anti_root", {"error": "adb offline"})
+        log = rep.generate_json()["execution_log"]
+        ssl = [s for s in log if s["check"] == "ssl_pinning"][0]
+        root = [s for s in log if s["check"] == "anti_root"][0]
+        assert ssl["outcome"] == "skipped" and ssl["reported_status"] == "SKIP"
+        assert root["outcome"] == "error" and root["reported_status"] == "ERROR"
+        assert "adb offline" in root["details"]
 
     def test_status_ok_when_protection_wins(self):
         """Anti-frida que bloqueou o Frida => status OK."""
@@ -269,6 +309,13 @@ class TestGenerateHtml:
         assert "anti_root" in html
         assert "bypass_successful" in html
 
+    def test_html_includes_execution_log(self):
+        """O HTML traz a seção de execução com a mesma trilha do JSON."""
+        html = _reporter().generate_html()
+        assert "Registro de execução" in html
+        assert "Tentar neutralizar as checagens anti-hook do app" in html
+        assert "evidências:" in html
+
 
 class TestSave:
     """Persistência dos relatórios."""
@@ -291,6 +338,8 @@ class TestSave:
         with open(json_path, encoding="utf-8") as fh:
             doc = json.load(fh)
         assert doc["summary"]["anti_root"]["status"] == "FALHOU"
+        assert doc["execution_log"]
+        assert doc["metadata"]["schema_version"] == SCHEMA_VERSION
 
     def test_slug_sanitizes_package(self):
         """Pacotes exóticos viram slug seguro (pontos preservados)."""

@@ -205,16 +205,18 @@ if (!RASPILOT_JAVA_ONLY) {
         Interceptor.attach(addr, {
             onEnter: function (args) {
                 try {
+                    var a = args[0].readCString();
+                    var b = args[1].readCString();
                     if (name === 'strstr') {
-                        var needle = args[1].readCString();
-                        if (looksLikeFrida(needle)) {
-                            reportDetection('native_' + name, 'needle=' + needle);
+                        // (haystack, needle): o termo procurado é o
+                        // segundo argumento.
+                        if (looksLikeFrida(b)) {
+                            reportDetection('native_' + name, 'needle=' + b);
                         }
-                    } else {
-                        if (looksLikeFrida(args[0].readCString()) ||
-                            looksLikeFrida(args[1].readCString())) {
-                            reportDetection('native_' + name, 'comparação com string frida');
-                        }
+                    } else if (looksLikeFrida(a) || looksLikeFrida(b)) {
+                        // O lado que contém o termo é o needle real.
+                        var hit = looksLikeFrida(a) ? a : b;
+                        reportDetection('native_' + name, 'needle=' + hit);
                     }
                 } catch (e) { /* best-effort */ }
             }

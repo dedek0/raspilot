@@ -64,6 +64,13 @@
   .badge.na { background: var(--na-bg); color: var(--na); }
   .badge.skip { background: var(--na-bg); color: var(--na); }
   .summary-card ul { margin: 8px 0 0; padding-left: 18px; font-size: 13px; color: var(--muted); }
+  .outcome { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 700; }
+  .outcome.ok, .outcome.success, .outcome.failed { color: var(--fail); }
+  .outcome.detected, .outcome.inconclusive { color: var(--warn); }
+  .outcome.blocked, .outcome.resisted, .outcome.not_detected { color: var(--ok); }
+  .outcome.error { color: var(--error); }
+  .outcome.skipped, .outcome.not_applicable { color: var(--na); }
+  .evidence { color: var(--muted); font-size: 12px; }
   details {
     background: #fff; border: 1px solid var(--line); border-radius: 10px;
     margin: 12px 0; padding: 12px 16px;
@@ -110,12 +117,55 @@
       <h3>{{ name }} <span class="badge {{ 'falhou' if s.status == 'FALHOU' else cls }}">{{ s.status }}</span></h3>
       <ul>
         {% for k, v in s.items() if k != 'status' %}
-        <li><strong>{{ k }}:</strong> {{ v }}</li>
+        <li><strong>{{ k }}:</strong>
+          {% if v is iterable and v is not string %}
+            {{ v | join('; ') if v else '—' }}
+          {% else %}
+            {{ v if v is not none else '—' }}
+          {% endif %}
+        </li>
         {% endfor %}
       </ul>
     </div>
     {% endfor %}
   </div>
+
+  <h2>Registro de execução</h2>
+  <p style="color:var(--muted);font-size:13px;margin-top:-4px;">
+    Para cada etapa: o que o RASPilot tentou executar, o que encontrou e o
+    status final reportado. A mesma trilha está no JSON em
+    <code>execution_log</code>.
+  </p>
+  {% for name, entries in execution_by_check.items() %}
+  <details open>
+    <summary>{{ name }} — {{ entries | length }} etapa(s)</summary>
+    <table>
+      <thead>
+        <tr><th>Fase</th><th>Tentativa</th><th>Encontrado</th><th>Reportado</th></tr>
+      </thead>
+      <tbody>
+        {% for e in entries %}
+        <tr>
+          <td><code>{{ e.phase }}</code></td>
+          <td>{{ e.action }}</td>
+          <td>
+            <span class="outcome {{ e.outcome }}">{{ e.outcome }}</span>
+            {% if e.details %}<br>{{ e.details }}{% endif %}
+            {% if e.evidence %}
+            <div class="evidence">evidências: {{ e.evidence | join('; ') }}</div>
+            {% endif %}
+          </td>
+          <td>
+            {% if e.reported_status %}
+            <strong>{{ e.reported_status }}</strong>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </details>
+  {% endfor %}
 
   <h2>Evidências detalhadas</h2>
   {% for name, result in details.items() %}

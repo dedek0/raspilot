@@ -179,11 +179,14 @@ public final class EmulatorShield {
         }
         hookSystemProperties(probe, mask, observe);
         hookEmulatorFiles(probe, mask, observe);
-        if (probe || observe) {
-            hookTelephony(probe);
+        // No modo mask os canais secundarios continuam expostos: e o
+        // cenario de um emulador com camada de stealth. Sem esse spoof
+        // o app veria o device fisico e o bypass nao seria exercitado.
+        if (probe || mask || observe) {
+            hookTelephony(probe || mask);
         }
-        if (probe || observe) {
-            hookAndroidId(probe);
+        if (probe || mask || observe) {
+            hookAndroidId(probe || mask);
         }
     }
 
@@ -191,7 +194,8 @@ public final class EmulatorShield {
      * Aplica valores de Build conforme o modo.
      *
      * @param probe True para valores de emulador.
-     * @param mask True para sanitizar apenas valores emulados.
+     * @param mask True para ocultar os artefatos decisivos e manter os
+     *             secundarios expostos.
      */
     private static void applyBuildValues(boolean probe, boolean mask) {
         for (String name : DECISIVE_BUILD) {
@@ -204,7 +208,7 @@ public final class EmulatorShield {
                 }
             }
         }
-        if (!probe) {
+        if (!probe && !mask) {
             return;
         }
         for (String name : SECONDARY_BUILD) {
@@ -300,6 +304,17 @@ public final class EmulatorShield {
                                     param.setResult(CLEAN_PROPS.get(key));
                                     Evidence.emit("neutralize", "emulator:decisive",
                                             "SystemProperties.get", key + " (mask)");
+                                }
+                                return;
+                            }
+                            if (mask) {
+                                // Canal secundario: continua exposto, como
+                                // em um emulador com camada de stealth.
+                                String spoofed = EMU_PROPS.get(key);
+                                if (spoofed != null) {
+                                    param.setResult(spoofed);
+                                    Evidence.emit("neutralize", "emulator:secondary",
+                                            "SystemProperties.get", key + "=" + spoofed);
                                 }
                                 return;
                             }

@@ -489,8 +489,8 @@ class DeviceManager:
     def reverse_port(self, device_port: int, host_port: int, timeout: int = DEFAULT_ADB_TIMEOUT) -> bool:
         """Mapeia uma porta do dispositivo para o host (``adb reverse``).
 
-        Usado pelo check ``revoked_ca`` para expor o TLS de teste ao
-        processo do app sem proxy global. Nunca levanta exceção.
+        Utilitário genérico para expor um serviço local do host ao
+        processo de um app durante a auditoria. Nunca levanta exceção.
 
         Args:
             device_port: Porta escutada no device (``tcp:<device_port>``).

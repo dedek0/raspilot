@@ -24,6 +24,7 @@ import time
 from typing import Callable, List, Optional
 
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from avd_manager import AvdConfig, AvdConfigError, AvdError, AvdManager
@@ -32,7 +33,6 @@ from checks.anti_frida import AntiFridaCheck
 from checks.anti_hooking import AntiHookingCheck
 from checks.anti_root import AntiRootCheck
 from checks.combined import run_combined_bypass, run_combined_observation
-from checks.revoked_ca import RevokedCACheck
 from checks.ssl_pinning import SSLPinningCheck
 from device_manager import (
     TOOL_NAME,
@@ -53,7 +53,7 @@ LOG_FORMAT = "[%(asctime)s] [%(levelname)s] %(message)s"
 # Checks conhecidos — usado para validar --skip e nomear o relatório.
 KNOWN_CHECKS = (
     "anti_root", "anti_frida", "anti_emulator", "anti_hooking",
-    "ssl_pinning", "revoked_ca",
+    "ssl_pinning",
 )
 
 
@@ -122,17 +122,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="CHECK",
         help=f"Checks a pular ({', '.join(KNOWN_CHECKS)})",
-    )
-    parser.add_argument(
-        "--audit-host",
-        action="append",
-        default=[],
-        metavar="HOST",
-        help=(
-            "Host da API do app para o check revoked_ca (aceita HOST, "
-            "HOST:PORTA ou URL). Pode ser repetido; hosts observados no "
-            "tráfego do app também são inspecionados automaticamente"
-        ),
     )
     parser.add_argument(
         "--window",
@@ -322,6 +311,26 @@ def _run_step(
     return result
 
 
+def _format_summary_value(value) -> str:
+    """Formata um valor do resumo para leitura no terminal.
+
+    Args:
+        value: Valor vindo do resumo do relatório.
+
+    Returns:
+        Texto compacto (listas separadas por vírgula, textos truncados).
+    """
+    if isinstance(value, (list, tuple, set)):
+        items = [str(item) for item in value if item is not None]
+        return ", ".join(items) if items else "—"
+    if isinstance(value, dict):
+        return ", ".join(f"{k}={v}" for k, v in value.items()) or "—"
+    text = str(value)
+    if len(text) > 180:
+        text = text[:179].rstrip() + "…"
+    return text
+
+
 def print_summary_table(reporter: Reporter) -> None:
     """Exibe a tabela final de resumo no terminal.
 
@@ -349,11 +358,83 @@ def print_summary_table(reporter: Reporter) -> None:
         status = summary.get("status", "?")
         color = color_by_status.get(status, "white")
         key_bits = [
-            f"{k}={v}"
+            f"{k}={escape(_format_summary_value(v))}"
             for k, v in summary.items()
-            if k not in ("status", "skipped") and v is not None
+            if k not in ("status", "skipped")
+            and v is not None
+            and v != []
+            and v != {}
+            and v != ""
         ]
-        table.add_row(name, f"[{color}]{status}[/{color}]", ", ".join(key_bits) or "—")
+        table.add_row(
+            escape(name),
+            f"[{color}]{status}[/{color}]",
+            ", ".join(key_bits) or "—",
+        )
+
+    console.print()
+    console.print(table)
+
+
+def print_execution_log(reporter: Reporter) -> None:
+    """Exibe a trilha detalhada de execução no terminal.
+
+    A tabela responde, para cada etapa: o check, a fase, o que foi
+    tentado, o que foi encontrado e o status final. É a mesma trilha
+    gravada no JSON (``execution_log``) e no HTML.
+
+    Args:
+        reporter: Relatório com os resultados coletados.
+    """
+    doc = reporter.generate_json()
+    steps = doc.get("execution_log") or []
+    if not steps:
+        return
+
+    table = Table(
+        title=f"{TOOL_NAME} — Log de execução",
+        title_style="bold cyan",
+        header_style="bold",
+        show_lines=False,
+    )
+    table.add_column("Check / fase", style="bold", no_wrap=False)
+    table.add_column("Tentativa", overflow="fold")
+    table.add_column("Encontrado", overflow="fold")
+    table.add_column("Reportado", justify="center", no_wrap=True)
+
+    outcome_color = {
+        "ok": "green",
+        "success": "red",
+        "failed": "red",
+        "detected": "yellow",
+        "blocked": "green",
+        "resisted": "green",
+        "not_detected": "green",
+        "inconclusive": "yellow",
+        "skipped": "dim",
+        "not_applicable": "dim",
+        "error": "magenta",
+    }
+    for step in steps:
+        outcome = step.get("outcome", "?")
+        color = outcome_color.get(outcome, "white")
+        found = f"[{color}]{escape(outcome)}[/{color}]"
+        details = step.get("details") or ""
+        if details:
+            found += "\n" + escape(details)
+        evidence = step.get("evidence") or []
+        if evidence:
+            found += "\n[dim]evidências: " + escape(
+                "; ".join(str(item) for item in evidence)
+            ) + "[/dim]"
+        reported = step.get("reported_status") or ""
+        table.add_row(
+            f"{escape(str(step.get('check', '?')))}\n"
+            f"[dim]{escape(str(step.get('phase', '?')))}[/dim]",
+            escape(str(step.get("action", "?"))),
+            found,
+            f"[{color}]{escape(reported)}[/{color}]" if reported else "—",
+        )
 
     console.print()
     console.print(table)
@@ -605,7 +686,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         dynamic = any(
             check not in args.skip
             for check in (
-                "anti_frida", "anti_hooking", "ssl_pinning", "anti_emulator", "revoked_ca",
+                "anti_frida", "anti_hooking", "ssl_pinning", "anti_emulator",
             )
         )
         if dynamic and not args.no_baseline:
@@ -739,7 +820,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         )
 
         # 11) SSL Pinning (usa bypass combinado quando houver).
-        ssl_report = _run_step(
+        _run_step(
             reporter,
             "ssl_pinning",
             lambda: SSLPinningCheck(dm, mode=args.mode, no_java=args.no_java).run_all(
@@ -747,25 +828,6 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 precomputed_bypass=ssl_bypass,
             ),
             skipped="ssl_pinning" in args.skip,
-        )
-
-        # 11b) CA comprometida (eMudhra emSign G3 — bug Mozilla 2083449).
-        #
-        # Roda com spawns próprios (probe de aceitação no processo do
-        # app). Usa os hosts observados no bypass de SSL Pinning como
-        # alvos do diagnóstico de chain, somados aos --audit-host.
-        observed_hosts = list(args.audit_host or [])
-        if ssl_report:
-            observed_hosts += list(
-                (ssl_report.get("bypass_details") or {}).get("intercepted_hosts") or []
-            )
-        _run_step(
-            reporter,
-            "revoked_ca",
-            lambda: RevokedCACheck(dm, mode=args.mode, no_java=args.no_java).run_all(
-                args.package, window=args.window, hosts=observed_hosts,
-            ),
-            skipped="revoked_ca" in args.skip,
         )
 
         # 12) Anti-Emulador (detecção + bypass).
@@ -825,6 +887,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     # 14) Relatórios.
     json_path, html_path = reporter.save()
     print_summary_table(reporter)
+    print_execution_log(reporter)
     console.print(f"\n[green]✓[/] Relatório JSON: [bold]{json_path}[/]")
     console.print(f"[green]✓[/] Relatório HTML: [bold]{html_path}[/]")
     return 0

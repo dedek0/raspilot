@@ -330,6 +330,13 @@ function observePath(api, path) {
 // Native — buscas por strings de frameworks (sem terminador garantido)
 // ----------------------------------------------------------------------
 if (!RASPILOT_JAVA_ONLY) {
+// Limita o texto reportado: caminhos e comandos do app podem ser
+// longos, e a trilha precisa continuar legível.
+function shortText(value) {
+    var text = '' + value;
+    return text.length > 120 ? text.substring(0, 119) + '…' : text;
+}
+
 ['strstr', 'strcmp', 'strcasestr'].forEach(function (name) {
     try {
         var addr = raspilotFindExport('libc.so', name);
@@ -339,8 +346,18 @@ if (!RASPILOT_JAVA_ONLY) {
                 try {
                     var a = args[0].readCString();
                     var b = args[1].readCString();
-                    if (matchesHookFramework(a) || matchesHookFramework(b)) {
-                        report('native_' + name, 'needle=' + (b || a));
+                    if (name === 'strstr' || name === 'strcasestr') {
+                        // (haystack, needle): o termo procurado é o
+                        // segundo argumento. Reportar o haystack como
+                        // "needle" tornava a evidência enganosa.
+                        if (matchesHookFramework(b)) {
+                            report('native_' + name, 'needle=' + shortText(b));
+                        }
+                    } else if (matchesHookFramework(a) || matchesHookFramework(b)) {
+                        // strcmp compara dois lados; o lado que casa é o
+                        // termo procurado pelo app.
+                        var hit = matchesHookFramework(a) ? a : b;
+                        report('native_' + name, 'needle=' + shortText(hit));
                     }
                 } catch (e) { /* best-effort */ }
             }
@@ -1541,17 +1558,18 @@ class AntiHookingCheck:
             and not log.endswith("carregado")
         ]
         alive = died_after is None
-        success = bool(effective) and alive
+        exercised = bool(effective)
+        success: Optional[bool] = exercised and alive
+        skipped_reason: Optional[str] = None
         logcat = analyze_since(
             self.dm, logcat_mark, package_name, locals().get("pid")
         )
         # O app bloqueou a auditoria: encerrou com a instrumentação e a
         # causa é atribuível ao RASP. Isso é uma conclusão sobre a
         # proteção (ela resistiu), não uma etapa que não rodou.
-        blocked = bool(
-            not alive
-            and classify_failure(logcat, self._baseline()).get("is_rasp")
-        )
+        failure = classify_failure(logcat, self._baseline())
+        blocked = bool(not alive and failure.get("is_rasp"))
+        death_kind = str(failure.get("kind", "unknown"))
         error: Optional[str] = None
         if alive and java_load_error:
             # Hooks Java são essenciais para o anti-hooking; neutralizar
@@ -1559,11 +1577,34 @@ class AntiHookingCheck:
             success = False
             error = f"hooks Java do bypass não carregaram: {java_load_error}"
         elif not alive:
-            # O app encerrou durante o bypass: o bypass não venceu — o
-            # app bloqueou a auditoria.
+            # O app encerrou durante o bypass. Só é "bloqueou a
+            # auditoria" quando a morte é atribuível ao RASP; uma morte
+            # sem causa atribuível deixa o bypass inconclusivo.
             success = False
-            error = (
-                "o app bloqueou o bypass: encerrou durante a execução do bypass"
+            if blocked:
+                error = (
+                    "o app bloqueou o bypass: encerrou durante a execução "
+                    "do bypass (reação do RASP)"
+                )
+            elif death_kind == "instrumentation_crash":
+                error = (
+                    "o app encerrou o agente de instrumentação durante o "
+                    "bypass; resultado inconclusivo"
+                )
+            else:
+                error = (
+                    "app encerrou durante o bypass sem reação RASP "
+                    f"atribuível ({death_kind}); resultado inconclusivo"
+                )
+        elif not exercised:
+            # O app sobreviveu, mas nenhuma checagem anti-hook foi
+            # neutralizada: o bypass não foi exercitado. Isso é
+            # inconclusivo, não derrota da proteção — o mesmo critério
+            # já aplicado ao bypass via módulo.
+            success = None
+            skipped_reason = (
+                "bypass não exercitado: nenhuma checagem anti-hook "
+                "neutralizada durante a janela"
             )
 
         result = {
@@ -1571,6 +1612,9 @@ class AntiHookingCheck:
             "blocked": blocked,
             "bypass_logs": bypass_logs,
             "effective_logs": effective,
+            "exercised": exercised,
+            "evidence_strength": "neutralized" if exercised else "none",
+            "skipped_reason": skipped_reason,
             "app_alive_at_end": alive,
             "death_cause": death_cause,
             "logcat": logcat,

@@ -147,6 +147,33 @@ class ModuleConfig:
 class XposedManager:
     """Prepara e executa o módulo de instrumentação no dispositivo."""
 
+    @staticmethod
+    def _source_digest() -> str:
+        """Hash dos fontes do módulo, para invalidar builds antigos.
+
+        O cache era indexado apenas pela configuração (hook/emu/target):
+        uma mudança no código Java reutilizava o APK anterior e o
+        dispositivo continuava executando a versão antiga do módulo.
+
+        Returns:
+            SHA-256 (primeiros 12 hex) de todos os arquivos-fonte, ou
+            ``"nosrc"`` quando o diretório não existe.
+        """
+        digest = hashlib.sha256()
+        try:
+            for root, _, files in os.walk(MODULE_SRC_DIR):
+                for name in sorted(files):
+                    path = os.path.join(root, name)
+                    digest.update(os.path.relpath(path, MODULE_SRC_DIR).encode())
+                    try:
+                        with open(path, "rb") as fh:
+                            digest.update(fh.read())
+                    except OSError:
+                        continue
+        except OSError:
+            return "nosrc"
+        return digest.hexdigest()[:12] or "nosrc"
+
     def __init__(
         self,
         dm: "DeviceManager",
@@ -479,7 +506,13 @@ class XposedManager:
             return {"ok": False, "apk": None,
                     "detail": f"fontes do módulo ausentes: {MODULE_SRC_DIR}"}
 
-        out_dir = os.path.join(BUILD_DIR, config.fingerprint())
+        # A configuração identifica o comportamento; o hash dos fontes
+        # garante que uma mudança no módulo gere um APK novo em vez de
+        # reutilizar silenciosamente o build anterior.
+        source_digest = self._source_digest()
+        out_dir = os.path.join(
+            BUILD_DIR, f"{config.fingerprint()}-{source_digest}"
+        )
         apk = os.path.join(out_dir, "raspilot-module.apk")
         if os.path.exists(apk):
             self.apk_built = apk
