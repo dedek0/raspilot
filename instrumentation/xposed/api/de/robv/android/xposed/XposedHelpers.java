@@ -34,6 +34,12 @@ public class XposedHelpers {
         return null;
     }
 
+    public static XC_MethodHook.Unhook findAndHookConstructor(
+            String className, ClassLoader classLoader,
+            Object... parameterTypesAndCallback) {
+        return null;
+    }
+
     public static Object callMethod(Object obj, String methodName, Object... args) {
         return null;
     }

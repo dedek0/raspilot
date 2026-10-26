@@ -33,7 +33,7 @@ class FakeXposed:
         }
 
     def run_phase(self, config: ModuleConfig, window: int = 12,
-                  keep_enabled: bool = False) -> dict:
+                  keep_enabled: bool = False, interact: bool = False) -> dict:
         """Devolve a resposta programada para a fase."""
         self.configs.append(config)
         key = (config.hook, config.emulator)

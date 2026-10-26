@@ -568,7 +568,7 @@ class TestAttemptModuleBypass:
         """Gerenciador falso: observe/bypass devolvem runs determinísticos."""
         mgr = mock.MagicMock()
 
-        def run_phase(config, window=12, keep_enabled=False):
+        def run_phase(config, window=12, keep_enabled=False, interact=False):
             if config.hook == "observe":
                 return {"ok": True, "run": {
                     "observed": list(observe or []),

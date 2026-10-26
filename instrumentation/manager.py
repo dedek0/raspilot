@@ -23,6 +23,7 @@ import os
 import re
 import shlex
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -696,21 +697,28 @@ class XposedManager:
 
         return {"ok": True, "steps": steps, "error": None}
 
-    def launch(self, window: int = 12) -> dict:
+    def launch(self, window: int = 12, interact: bool = False) -> dict:
         """Executa o app alvo sem instrumentação externa e coleta a
         evidência emitida pelo módulo.
 
         Args:
             window: Janela de observação em segundos.
+            interact: Quando True, dispara eventos de entrada ao app
+                durante a janela. Proteções costumam rodar checagens de
+                segurança em interação do usuário (lançamento de telas,
+                toques); sem interação, uma parte delas não é exercitada
+                na janela.
 
         Returns:
             Dict com ``pid``, ``app_alive_at_end``, ``died_after``,
-            ``evidence``, ``neutralized``, ``observed``, ``module_ready``,
-            ``effective_config`` e ``error``.
+            ``evidence``, ``neutralized``, ``observed``, ``contexts``,
+            ``module_ready``, ``effective_config`` e ``error``.
         """
         mark = self.dm.logcat_mark()
         self.dm.run_shell(f"am force-stop {self.package_name}", timeout=20)
         time.sleep(1)
+
+        launcher = self._start_interaction() if interact else None
 
         launch = self.dm.run_shell(
             f"monkey -p {self.package_name} -c android.intent.category.LAUNCHER 1",
@@ -734,6 +742,7 @@ class XposedManager:
         evidence = parse_evidence(lines)
         ready = [item for item in evidence if item["kind"] == "ready"]
         effective = _parse_ready(ready[-1]["detail"]) if ready else {}
+        neutralized, observed, contexts = partition_evidence(evidence)
 
         alive = died_after is None
         result = {
@@ -742,17 +751,13 @@ class XposedManager:
             "died_after": died_after,
             "evidence": evidence,
             "lines": lines,
-            "neutralized": [
-                item for item in evidence
-                if item["kind"] == "neutralize" and item["channel"] != "module"
-            ],
-            "observed": [
-                item for item in evidence
-                if item["kind"] == "observe" and item["channel"] != "module"
-            ],
+            "neutralized": neutralized,
+            "observed": observed,
+            "contexts": contexts,
             "module_ready": bool(ready),
             "effective_config": effective,
             "launch_output": (launch.get("stdout") or "")[:400],
+            "interact": bool(interact),
             "error": None,
         }
         if not ready:
@@ -760,7 +765,33 @@ class XposedManager:
                 "o módulo não foi carregado no processo alvo — o escopo do "
                 "framework não foi aplicado"
             )
+        if launcher is not None and not launcher.is_alive():
+            result["interaction_error"] = str(
+                getattr(launcher, "error", None) or ""
+            ) or None
         return result
+
+    def _start_interaction(self) -> threading.Thread:
+        """Dispara a simulação de interação em paralelo à janela.
+
+        A simulação roda em thread daemon: uma falha aqui é registrada
+        no retorno da fase e não derruba a observação — o resultado
+        inconclusivo persiste, mas a evidência continua sendo coletada.
+
+        Returns:
+            Thread criada (para diagnóstico no retorno).
+        """
+        def run() -> None:
+            try:
+                time.sleep(2.0)
+                self.dm.simulate_interaction(self.package_name)
+            except Exception as exc:  # pragma: no cover - proteção
+                run.error = exc  # type: ignore[attr-defined]
+
+        run.error = None  # type: ignore[attr-defined]
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread
 
     def _launch_activity(self) -> dict:
         """Inicia o app pela atividade principal resolvida.
@@ -829,7 +860,8 @@ class XposedManager:
         return actions
 
     def run_phase(
-        self, config: ModuleConfig, window: int = 12, keep_enabled: bool = False
+        self, config: ModuleConfig, window: int = 12, keep_enabled: bool = False,
+        interact: bool = False,
     ) -> dict:
         """Executa uma fase completa com o módulo.
 
@@ -842,6 +874,10 @@ class XposedManager:
             window: Janela de observação em segundos.
             keep_enabled: Se True, o módulo permanece habilitado e no
                 escopo ao final da fase.
+            interact: Quando True, dispara eventos de entrada ao app
+                durante a janela. Proteções costumam exercitar checagens
+                de segurança na interação do usuário; sem isso, parte
+                delas não aparece na janela.
 
         Returns:
             Dict com ``ok``, ``steps``, ``run`` (resultado da execução),
@@ -862,7 +898,7 @@ class XposedManager:
         run: Dict[str, object] = {}
         error: Optional[str] = None
         try:
-            run = self.launch(window)
+            run = self.launch(window, interact=interact)
             error = run.get("error")
         except Exception as exc:  # pragma: no cover - proteção de fase
             error = str(exc)
@@ -938,6 +974,40 @@ def parse_evidence(lines: List[str]) -> List[Dict[str, str]]:
             "detail": match.group("detail").strip(),
         })
     return events
+
+
+def partition_evidence(
+    events: List[Dict[str, str]],
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
+    """Separa os eventos de evidência por papel-veredito.
+
+    Eventos internos do módulo (canal ``module``) não são evidência de
+    aplicação. Entre os eventos de aplicação, a leitura de artefatos do
+    próprio processo (``/proc``) tem uso legítimo — SDK de relatório de
+    crash, por exemplo —, então ela vira **contexto**: é registrada para
+    a análise, mas não sustenta veredito sozinha.
+
+    Args:
+        events: Eventos de :func:`parse_evidence`.
+
+    Returns:
+        Tupla ``(aplicados, observados, contextos)`` com os eventos por
+        papel, na ordem original de emissão.
+    """
+    applied: List[Dict[str, str]] = []
+    observed: List[Dict[str, str]] = []
+    contexts: List[Dict[str, str]] = []
+    for item in events:
+        if item.get("channel") == "module":
+            continue
+        kind = item.get("kind")
+        if kind == "neutralize":
+            applied.append(item)
+        elif kind == "observe":
+            observed.append(item)
+        elif kind == "context":
+            contexts.append(item)
+    return applied, observed, contexts
 
 
 def _parse_ready(detail: str) -> Dict[str, str]:

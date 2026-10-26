@@ -1671,15 +1671,20 @@ class AntiHookingCheck:
             target=package_name,
             label="hook-observe",
         )
-        phase = manager.run_phase(config, window=window)
+        phase = manager.run_phase(config, window=window, interact=True)
         run = phase.get("run") or {}
         observed = [
             f"{item['method']}: {item['detail']}".strip(": ")
             for item in run.get("observed", [])
         ]
+        contexts = [
+            f"{item['method']}: {item['detail']}".strip(": ")
+            for item in run.get("contexts", [])
+        ]
         result = {
             "observed": True,
             "detection_methods_found": observed,
+            "contexts": contexts,
             "app_alive_at_end": run.get("app_alive_at_end"),
             "module_ready": bool(run.get("module_ready")),
             "effective_config": run.get("effective_config", {}),
@@ -1739,7 +1744,7 @@ class AntiHookingCheck:
             target=package_name,
             label="hook-bypass",
         )
-        phase = manager.run_phase(bypass_config, window=window)
+        phase = manager.run_phase(bypass_config, window=window, interact=True)
         phases.append({"phase": "bypass", "ok": phase.get("ok"),
                        "error": phase.get("error")})
 
@@ -1767,6 +1772,13 @@ class AntiHookingCheck:
         )
         logs.extend(f"[bypass] {item['method']} {item['detail']}".strip()
                     for item in neutralized)
+        # Contexto (ex: leitura de artefatos do próprio processo) é
+        # registrado para a análise, mas não conta como checagem
+        # neutralizada: uso legítimo existe e o veredito não depende dele.
+        for item in run.get("contexts", []) or []:
+            logs.append(
+                f"[contexto] {item['method']} {item['detail']}".strip()
+            )
 
         alive = bool(run.get("app_alive_at_end"))
         pid = run.get("pid")

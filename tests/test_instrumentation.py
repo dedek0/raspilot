@@ -13,6 +13,7 @@ from instrumentation.manager import (
     _parse_ready,
     _parse_status,
     parse_evidence,
+    partition_evidence,
 )
 
 ShellResponse = Union[str, Dict[str, object]]
@@ -351,3 +352,43 @@ def test_cleanup_restaura_escopo_e_desabilita():
     assert "scope_restore" in steps
     assert "disable" in steps
     assert any("com.other.app/0" in cmd for cmd in dm.commands)
+
+
+class TestPartitionEvidence:
+    """Separação de eventos por papel-veredito."""
+
+    def test_aplica_observado_e_neutralizado(self):
+        """Eventos aplicação/observação/contexto vão para listas distintas."""
+        events = [
+            {"kind": "observe", "channel": "hook", "method": "File.exists", "detail": "/x"},
+            {"kind": "neutralize", "channel": "hook", "method": "File.exists", "detail": "/x"},
+            {"kind": "ready", "channel": "module", "method": "state", "detail": "hook=observe"},
+            {"kind": "context", "channel": "hook", "method": "FileInputStream", "detail": "/proc/self/maps"},
+        ]
+        applied, observed, contexts = partition_evidence(events)
+        assert [i["method"] for i in applied] == ["File.exists"]
+        assert [i["method"] for i in observed] == ["File.exists"]
+        assert [i["detail"] for i in contexts] == ["/proc/self/maps"]
+
+    def test_evento_interno_nao_evidencia(self):
+        """Eventos do canal interno do módulo são ignorados em todos."""
+        events = [
+            {"kind": "observe", "channel": "module", "method": "m", "detail": "d"},
+            {"kind": "neutralize", "channel": "module", "method": "m", "detail": "d"},
+            {"kind": "context", "channel": "module", "method": "m", "detail": "d"},
+        ]
+        applied, observed, contexts = partition_evidence(events)
+        assert applied == []
+        assert observed == []
+        assert contexts == []
+
+    def test_tipos_desconhecidos_ficam_fora(self):
+        """Kinds não pertencentes à separação não viram evidência por engano."""
+        events = [
+            {"kind": "error", "channel": "hook", "method": "m", "detail": "d"},
+            {"kind": "other", "channel": "hook", "method": "m", "detail": "d"},
+        ]
+        applied, observed, contexts = partition_evidence(events)
+        assert applied == []
+        assert observed == []
+        assert contexts == []

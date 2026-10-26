@@ -5,6 +5,8 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.RandomAccessFile;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -20,7 +22,7 @@ public final class HookShield {
     private static final String[] TOKENS = {
             "xposed", "lsposed", "edxposed", "substrate", "sandhook", "yahfa",
             "lsplant", "dobby", "andhook", "shadowhook", "bytehook", "xhook",
-            "whale", "epic", "riru", "frida", "gadget",
+            "whale", "epic", "riru", "frida", "gadget", "zygisk",
     };
 
     /** Pacotes de gerenciadores e modulos de frameworks conhecidos. */
@@ -47,11 +49,16 @@ public final class HookShield {
         hookClassForName(bypass);
         hookLoadClass(bypass);
         hookFileExists(bypass);
+        hookFileAttributes(bypass);
+        hookProcStreams(bypass);
         hookRuntimeExec(bypass);
         hookProcessBuilder(bypass);
         hookSystemProperty(bypass);
         hookSystemEnv(bypass);
+        hookSystemProperties(bypass);
         hookPackageManager(bypass, classLoader);
+        hookPackageManagerListing(bypass, classLoader);
+        hookRunningProcesses(bypass);
     }
 
     private static void hookClassForName(final boolean bypass) {
@@ -135,6 +142,447 @@ public final class HookShield {
         } catch (Throwable error) {
             Evidence.error("File.exists", error);
         }
+    }
+
+    /**
+     * Instala hooks nas variantes de atributos de arquivo.
+     *
+     * Protecoes usam metodos diferentes de ``exists`` para constatar a
+     * presenca de artefatos: ``canRead``, ``length``, ``isDirectory`` e
+     * ``canWrite``. Sem esses hooks, a drede em ``File.exists`` deixa
+     * consultas comuns sem observacao nem neutralizacao.
+     *
+     * @param bypass True para neutralizar as consultas.
+     */
+    private static void hookFileAttributes(final boolean bypass) {
+        String[] booleanMethods = {"canRead", "canWrite", "isDirectory"};
+        for (String method : booleanMethods) {
+            try {
+                XposedHelpers.findAndHookMethod(
+                        "java.io.File", XposedBridge.BOOTCLASSLOADER, method,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param)
+                                    throws Throwable {
+                                String path = fileOf(param);
+                                if (path == null || !isFrameworkPath(path)) {
+                                    return;
+                                }
+                                Evidence.emit(bypass ? "neutralize" : "observe", "hook",
+                                        "File." + method, path);
+                                if (bypass) {
+                                    param.setResult(Boolean.FALSE);
+                                    param.returnEarly = true;
+                                }
+                            }
+                        });
+            } catch (Throwable error) {
+                Evidence.error("File." + method, error);
+            }
+        }
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "java.io.File", XposedBridge.BOOTCLASSLOADER, "length",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param)
+                                throws Throwable {
+                            String path = fileOf(param);
+                            if (path == null || !isFrameworkPath(path)) {
+                                return;
+                            }
+                            Evidence.emit(bypass ? "neutralize" : "observe", "hook",
+                                    "File.length", path);
+                            if (bypass) {
+                                param.setResult(0L);
+                                param.returnEarly = true;
+                            }
+                        }
+                    });
+        } catch (Throwable error) {
+            Evidence.error("File.length", error);
+        }
+    }
+
+    /**
+     * Observa leituras de artefatos do processo via streams Java.
+     *
+     * As checagens anti-hook e anti-debug leem arquivos do proprio
+     * processo: ``/proc/self/maps``, ``/proc/self/status``,
+     * ``/proc/self/cmdline`` — normalmente atraves de
+     * ``FileInputStream`` e ``RandomAccessFile``. Consultas a caminhos
+     * de framework (que ja passam nas drede de caminho) continuam nos
+     * canais habituais; este hook cobre o restante.
+     *
+     * A leitura de ``/proc`` tem uso legitimo (SDKs de relatorio de
+     * crash analisam o mapa de memoria); por isso o evento sai como
+     * contexto em observacao e precisa de outro canal para sustentar
+     * veredito. No bypass, a leitura volta vazia: sem conteudo, a
+     * checagem nao constata nada.
+     *
+     * @param bypass True para neutralizar as leituras.
+     */
+    private static void hookProcStreams(final boolean bypass) {
+        try {
+            XposedHelpers.findAndHookConstructor(
+                    "java.io.FileInputStream", XposedBridge.BOOTCLASSLOADER,
+                    String.class, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param)
+                                throws Throwable {
+                            Object raw = param.args == null ? null : param.args[0];
+                            String path = raw == null ? null : raw.toString();
+                            handleProcPath(param, bypass, "FileInputStream"
+                                    + (path == null ? "" : "(" + path + ")"), path);
+                        }
+                    });
+        } catch (Throwable error) {
+            Evidence.error("FileInputStream(String)", error);
+        }
+        try {
+            XposedHelpers.findAndHookConstructor(
+                    "java.io.FileInputStream", XposedBridge.BOOTCLASSLOADER,
+                    File.class, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param)
+                                throws Throwable {
+                            Object raw = param.args == null ? null : param.args[0];
+                            String path = raw instanceof File
+                                    ? ((File) raw).getAbsolutePath() : null;
+                            handleProcPath(param, bypass, "FileInputStream(File)", path);
+                        }
+                    });
+        } catch (Throwable error) {
+            Evidence.error("FileInputStream(File)", error);
+        }
+        try {
+            XposedHelpers.findAndHookConstructor(
+                    "java.io.RandomAccessFile", XposedBridge.BOOTCLASSLOADER,
+                    String.class, String.class, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param)
+                                throws Throwable {
+                            Object raw = param.args == null ? null : param.args[0];
+                            String path = raw == null ? null : raw.toString();
+                            handleProcPath(param, bypass, "RandomAccessFile"
+                                    + (path == null ? "" : "(" + path + ")"), path);
+                        }
+                    });
+        } catch (Throwable error) {
+            Evidence.error("RandomAccessFile(String,String)", error);
+        }
+        try {
+            XposedHelpers.findAndHookConstructor(
+                    "java.io.RandomAccessFile", XposedBridge.BOOTCLASSLOADER,
+                    File.class, String.class, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param)
+                                throws Throwable {
+                            Object raw = param.args == null ? null : param.args[0];
+                            String path = raw instanceof File
+                                    ? ((File) raw).getAbsolutePath() : null;
+                            handleProcPath(param, bypass, "RandomAccessFile(File)", path);
+                        }
+                    });
+        } catch (Throwable error) {
+            Evidence.error("RandomAccessFile(File,String)", error);
+        }
+    }
+
+    /**
+     * Trata uma consulta a caminho de processo pelo stream aberto.
+     *
+     * @param param .Parametros do hook.
+     * @param bypass True no modo bypass.
+     * @param method Nome legivel do metodo/constructor.
+     * @param path   Caminho consultado (pode ser null).
+     * @throws Throwable Ao abrir o stream de substituicao no bypass.
+     */
+    private static void handleProcPath(XC_MethodHook.MethodHookParam param,
+                                       boolean bypass, String method,
+                                       String path) throws Throwable {
+        if (path == null || !isProcessArtifactPath(path)) {
+            return;
+        }
+        Evidence.emit(bypass ? "neutralize" : "context", "hook",
+                method, path);
+        if (bypass) {
+            String empty = "/dev/null";
+            if (method.startsWith("FileInputStream")) {
+                param.setResult(new FileInputStream(empty));
+            } else {
+                param.setResult(new RandomAccessFile(empty, "r"));
+            }
+            param.returnEarly = true;
+        }
+    }
+
+    /**
+     * Observa consultas a propriedades do sistema Android.
+     *
+     * SDKs de protecao consultam propriedades de artefatos (servicos
+     * de framework em init.svc, chaves de ambientes instrumentados)
+     * pelas APIs escondidas de propriedades, que nao passam em
+     * ``System.getProperty``.
+     *
+     * @param bypass True para neutralizar as consultas.
+     */
+    private static void hookSystemProperties(final boolean bypass) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "android.os.SystemProperties", XposedBridge.BOOTCLASSLOADER,
+                    "get", String.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param)
+                                throws Throwable {
+                            Object raw = param.args == null ? null : param.args[0];
+                            String key = raw == null ? null : raw.toString();
+                            if (!isFrameworkName(key)) {
+                                return;
+                            }
+                            Evidence.emit(bypass ? "neutralize" : "observe", "hook",
+                                    "SystemProperties.get", String.valueOf(key));
+                            if (bypass) {
+                                param.setResult("");
+                                param.returnEarly = true;
+                            }
+                        }
+                    });
+        } catch (Throwable error) {
+            Evidence.error("SystemProperties.get", error);
+        }
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "android.os.SystemProperties", XposedBridge.BOOTCLASSLOADER,
+                    "get", String.class, String.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param)
+                                throws Throwable {
+                            Object raw = param.args == null ? null : param.args[0];
+                            String key = raw == null ? null : raw.toString();
+                            if (!isFrameworkName(key)) {
+                                return;
+                            }
+                            Evidence.emit(bypass ? "neutralize" : "observe", "hook",
+                                    "SystemProperties.get2", String.valueOf(key));
+                            if (bypass) {
+                                Object fallback = param.args.length > 1
+                                        ? param.args[1] : "";
+                                param.setResult(fallback);
+                                param.returnEarly = true;
+                            }
+                        }
+                    });
+        } catch (Throwable error) {
+            Evidence.error("SystemProperties.get(def)", error);
+        }
+    }
+
+    /**
+     * Observa consultas a listagens do PackageManager.
+     *
+     * Checagens de varredura procuram artefatos na lista de apps
+     * instalados e em intents de integracao de framework. Emissao
+     * somente com correspondencia: listagem legtima de apps (UI e
+     * compartilhamento) nao vira evidencia.
+     *
+     * @param bypass      True para neutralizar as consultas.
+     * @param classLoader Class loader do processo alvo.
+     */
+    private static void hookPackageManagerListing(final boolean bypass,
+                                                   ClassLoader classLoader) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "android.app.ApplicationPackageManager",
+                    XposedBridge.BOOTCLASSLOADER, "queryIntentActivities",
+                    android.content.Intent.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param)
+                                throws Throwable {
+                            Object raw = param.args == null ? null : param.args[0];
+                            if (!(raw instanceof android.content.Intent)) {
+                                return;
+                            }
+                            android.content.Intent intent =
+                                    (android.content.Intent) raw;
+                            String action = intent.getAction() == null
+                                    ? "" : intent.getAction();
+                            String pkg = intent.getPackage() == null
+                                    ? "" : intent.getPackage();
+                            if (!isFrameworkName(action)
+                                    && !isFrameworkPackage(pkg)
+                                    && !isFrameworkName(pkg)) {
+                                return;
+                            }
+                            Evidence.emit(bypass ? "neutralize" : "observe", "hook",
+                                    "PackageManager.queryIntentActivities",
+                                    "action=" + action + " pkg=" + pkg);
+                            if (bypass) {
+                                param.setResult(new ArrayList<Object>());
+                                param.returnEarly = true;
+                            }
+                        }
+                    });
+        } catch (Throwable error) {
+            Evidence.error("PackageManager.queryIntentActivities", error);
+        }
+        String[] listing = {"getInstalledPackages", "getInstalledApplications"};
+        for (String method : listing) {
+            try {
+                XposedHelpers.findAndHookMethod(
+                        "android.app.ApplicationPackageManager",
+                        XposedBridge.BOOTCLASSLOADER, method, int.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void afterHookedMethod(MethodHookParam param)
+                                    throws Throwable {
+                                String found = firstFrameworkEntry(param.getResult());
+                                if (found == null) {
+                                    return;
+                                }
+                                Evidence.emit(bypass ? "neutralize" : "observe", "hook",
+                                        "PackageManager." + method, "frameworkPackages:" + found);
+                                if (bypass) {
+                                    param.setResult(stripFrameworkEntries(param.getResult()));
+                                }
+                            }
+                        });
+            } catch (Throwable error) {
+                Evidence.error("PackageManager." + method, error);
+            }
+        }
+    }
+
+    /**
+     * Observa a lista de processos vivos consultada pelo app.
+     *
+     * Procura por nomes de processos de ferramentas de instrumentacao
+     * na lista devolvida ao app. Em observacao, emite somente com
+     * correspondencia; no bypass, as entradas correspondentes saem da
+     * lista antes de ser devolvidas.
+     *
+     * @param bypass True para neutralizar a consulta.
+     */
+    private static void hookRunningProcesses(final boolean bypass) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "android.app.ActivityManager",
+                    XposedBridge.BOOTCLASSLOADER, "getRunningAppProcesses",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param)
+                                throws Throwable {
+                            Object raw = param.getResult();
+                            if (!(raw instanceof List)) {
+                                return;
+                            }
+                            String found = firstFrameworkEntry(raw);
+                            if (found == null) {
+                                return;
+                            }
+                            Evidence.emit(bypass ? "neutralize" : "observe", "hook",
+                                    "ActivityManager.getRunningAppProcesses",
+                                    "frameworkProcess:" + found);
+                            if (bypass) {
+                                param.setResult(stripFrameworkEntries(raw));
+                            }
+                        }
+                    });
+        } catch (Throwable error) {
+            Evidence.error("ActivityManager.getRunningAppProcesses", error);
+        }
+    }
+
+    /**
+     * Extrai o caminho absoluto do arquivo consultado pelo hook.
+     *
+     * @param param Parametros do hook (thisObject e um File).
+     * @return Caminho ou null quando indisponivel.
+     */
+    private static String fileOf(XC_MethodHook.MethodHookParam param) {
+        Object target = param.thisObject;
+        if (!(target instanceof File)) {
+            return null;
+        }
+        try {
+            return ((File) target).getAbsolutePath();
+        } catch (Throwable error) {
+            return null;
+        }
+    }
+
+    /**
+     * Procura entradas de framework em uma colecao devolvida ao app.
+     *
+     * @param raw Resultado de metodo (List de PackageInfo,
+     *            ApplicationInfo ou RunningAppProcessInfo).
+     * @return Nome da primeira entrada corresponde ou null.
+     */
+    private static String firstFrameworkEntry(Object raw) {
+        if (!(raw instanceof List)) {
+            return null;
+        }
+        for (Object item : (List<?>) raw) {
+            String name = packageNameOf(item);
+            if (name != null && matchesFramework(name)) {
+                return name;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Remove entradas de framework de uma copia da colecao.
+     *
+     * @param raw Resultado original do metodo.
+     * @return Colecao sem as entradas correspondes.
+     */
+    private static List<Object> stripFrameworkEntries(Object raw) {
+        List<Object> kept = new ArrayList<>();
+        if (raw instanceof List) {
+            for (Object item : (List<?>) raw) {
+                String name = packageNameOf(item);
+                if (name == null || !matchesFramework(name)) {
+                    kept.add(item);
+                }
+            }
+        }
+        return kept;
+    }
+
+    /**
+     * Extrai o nome de pacote/processo de um item de listagem.
+     *
+     * @param item Item de PackageManager/ActivityManager.
+     * @return Nome ou null.
+     */
+    private static String packageNameOf(Object item) {
+        if (item == null) {
+            return null;
+        }
+        if (item instanceof android.content.pm.PackageInfo) {
+            return ((android.content.pm.PackageInfo) item).packageName;
+        }
+        if (item instanceof android.content.pm.ApplicationInfo) {
+            return ((android.content.pm.ApplicationInfo) item).packageName;
+        }
+        if (item instanceof android.app.ActivityManager.RunningAppProcessInfo) {
+            return ((android.app.ActivityManager.RunningAppProcessInfo) item).processName;
+        }
+        return null;
+    }
+
+    /**
+     * Informa se um nome corresponde a framework de hooking.
+     *
+     * @param name Nome de pacote ou processo.
+     * @return True quando ha correspondencia.
+     */
+    public static boolean matchesFramework(String name) {
+        return isFrameworkPackage(name) || isFrameworkName(name);
     }
 
     private static void hookRuntimeExec(final boolean bypass) {
@@ -347,6 +795,35 @@ public final class HookShield {
             return true;
         }
         return isFrameworkName(path);
+    }
+
+    /**
+     * Informa se um caminho e um artefato do proprio processo.
+     *
+     * Protecoes anti-debug leem o mapa de memoria e o estado do
+     * proprio processo antes de qualquer outro artefato; caminhos de
+     * outros processos ficam fora do escopo.
+     *
+     * @param path Caminho consultado.
+     * @return True quando o caminho referencia o processo atual.
+     */
+    public static boolean isProcessArtifactPath(String path) {
+        if (path == null || path.length() < 10) {
+            return false;
+        }
+        String lower = path.toLowerCase();
+        if (lower.contains("/proc/self/")) {
+            return true;
+        }
+        try {
+            int pid = android.os.Process.myPid();
+            if (lower.startsWith("/proc/" + Integer.toString(pid) + "/")) {
+                return true;
+            }
+        } catch (Throwable ignored) {
+            // O caminho por pid e dispensavel quando o pid falha.
+        }
+        return false;
     }
 
     /**

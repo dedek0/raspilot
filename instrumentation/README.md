@@ -95,20 +95,34 @@ RASPilotModule: EVT|<tipo>|<canal>|<método>|<detalhe>
 ```
 
 Tipos: `observe` (consulta do app), `neutralize` (consulta neutralizada),
-`spoof` (valor aplicado pelo módulo), `ready` (módulo carregado) e `error`.
+`spoof` (valor aplicado pelo módulo), `ready` (módulo carregado), `context`
+(registro sem sustentação de veredito — leitura de `/proc` tem uso legítimo)
+e `error`.
 
 ## Cobertura
 
 A camada anti-hook neutraliza `Class.forName`,
-`ClassLoader.loadClass`, `File.exists`, `Runtime.exec`,
-`ProcessBuilder.start`, `System.getProperty`, `System.getenv` e
-`PackageManager.getPackageInfo`.
+`ClassLoader.loadClass`, `File.exists` (e variantes `canRead`,
+`canWrite`, `length`, `isDirectory`), `Runtime.exec`,
+`ProcessBuilder.start`, `System.getProperty`, `System.getenv`,
+`SystemProperties.get`, `PackageManager.getPackageInfo` e
+`queryIntentActivities` de framework. As listagens
+`getInstalledPackages`, `getInstalledApplications` e
+`getRunningAppProcesses` são observadas quando contêm artefatos de
+framework (e, no bypass, as entradas correspondentes saem da lista).
+Leituras de artefatos do próprio processo — `/proc/self/*` — via
+`FileInputStream`/`RandomAccessFile` são registradas como `context` e,
+no bypass, devolvidas vazias (stream de `/dev/null`).
 
 A camada de emulador atua sobre `Build`, `SystemProperties.get`,
 `TelephonyManager`, `Settings.Secure` e `File.exists`.
 
-Verificações escritas em código nativo (leitura de
-`/proc/self/maps`, buscas de string) **não** são cobertas: o módulo não
-tem componente nativo. O relatório registra a limitação em
+Durante a janela de observação os checks de `anti_hooking` simulam
+interação do usuário (eventos `monkey` no app alvo): proteções que só
+exercitam checagens na navegação deixam de ficar fora da janela.
+
+Verificações escritas em código nativo (consultas diretas via
+`open()`/`read()` sem passar por Java) **não** são cobertas: o módulo
+não tem componente nativo. O relatório registra a limitação em
 `coverage.not_covered` e lista em `framework_artifacts` os artefatos do
 framework que continuam visíveis no processo alvo.

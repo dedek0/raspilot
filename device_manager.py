@@ -445,6 +445,32 @@ class DeviceManager:
         if thread is not None:
             thread.join(timeout=2)
 
+    def simulate_interaction(
+        self, package_name: str, events: int = 25, timeout: int = 120
+    ) -> dict:
+        """Simula interação do usuário com o app alvo (eventos de toque).
+
+        Proteções de segurança exercitam parte das checagens quando o
+        usuário navega no app; rodar a janela de observação sem entrada
+        deixa essas checagens fora da evidência. Os eventos são gerados
+        pelo ``monkey`` do próprio sistema: aleatórios por definição e
+        limitados ao app informado.
+
+        Args:
+            package_name: Package name do app alvo.
+            events: Quantidade de eventos de entrada.
+            timeout: Timeout do comando no dispositivo.
+
+        Returns:
+            Dict no formato de :meth:`run_shell`.
+        """
+        count = max(1, min(int(events), 500))
+        command = (
+            f"monkey -p {package_name} "
+            f"-c android.intent.category.LAUNCHER {count}"
+        )
+        return self.run_shell(command, timeout=timeout)
+
     def logcat_mark(self) -> int:
         """Retorna o índice atual (monotônico) do buffer de logcat.
 

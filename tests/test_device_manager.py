@@ -585,6 +585,42 @@ class TestSpawnIsolation:
         assert session is fake_device.attach.return_value
 
 
+class TestSimulateInteraction:
+    """Simulação de interação do usuário para exercitar checagens."""
+
+    def test_monkey_limitado_ao_app(self):
+        """O comando usa monkey com o pacote e a quantidade pedida."""
+        dm = DeviceManager()
+        calls = []
+
+        def fake_shell(command, timeout=20):
+            calls.append((command, timeout))
+            return {"ok": True, "rc": 0, "stdout": "", "stderr": ""}
+
+        with mock.patch.object(dm, "run_shell", side_effect=fake_shell):
+            dm.simulate_interaction("com.exemplo.app", events=30, timeout=60)
+
+        command, timeout = calls[0]
+        assert command == (
+            "monkey -p com.exemplo.app "
+            "-c android.intent.category.LAUNCHER 30"
+        )
+        assert timeout == 60
+
+    def test_quantidade_e_limitada(self):
+        """Quantidades absurdas são reduzidas ao limite; mínimo é 1."""
+        dm = DeviceManager()
+        commands = []
+        with mock.patch.object(
+            dm, "run_shell",
+            side_effect=lambda cmd, timeout=20: commands.append(cmd)
+        ):
+            dm.simulate_interaction("com.exemplo.app", events=10_000)
+            dm.simulate_interaction("com.exemplo.app", events=0)
+        assert "LAUNCHER 500" in commands[0]
+        assert "LAUNCHER 1" in commands[1]
+
+
 class TestAppReady:
     """Espera pelo app ficar em foco antes de carregar a camada Java."""
 
