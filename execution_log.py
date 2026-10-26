@@ -68,6 +68,8 @@ BYPASS_ACTIONS = {
 }
 
 STATIC_ACTIONS = {
+    "anti_root": "Analisar o APK por referências à detecção de root",
+    "anti_frida": "Analisar o APK por assinaturas anti-Frida",
     "anti_hooking": "Analisar o APK por assinaturas anti-hook",
     "anti_emulator": "Analisar o APK por assinaturas anti-emulador",
     "ssl_pinning": "Analisar o APK por assinaturas de SSL pinning",
@@ -234,9 +236,12 @@ def _static_entry(trace: List[dict], check_name: str, detection: Any) -> None:
         detection.get("static_detected") or detection.get("pinning_detected")
     )
     outcome = "detected" if detected else "not_detected"
+    details = detection.get("details") or ""
+    if detection.get("available") is False and not detected:
+        outcome = "skipped"
+        details = details or "análise estática não executada"
     if detection.get("error"):
         outcome = "error"
-    details = detection.get("details") or ""
     if detected:
         principal = detection.get("primary") or detection.get("type")
         if principal:
@@ -426,15 +431,18 @@ def _verdict_text(check_name: str, result: dict) -> str:
     """
     if check_name == "anti_root":
         positive = result.get("positive_vectors") or []
+        app_root = result.get("app_root_detection") or {}
         return (
             f"is_rooted={bool(result.get('is_rooted'))}; "
             f"confiança={result.get('confidence')}; "
-            f"vetores positivos={', '.join(map(str, positive)) or 'nenhum'}"
+            f"vetores positivos={', '.join(map(str, positive)) or 'nenhum'}; "
+            f"app_detecta_root={bool(app_root.get('present'))}"
         )
     if check_name == "anti_frida":
         app_detection = result.get("app_detection") or {}
         return (
             f"vulnerable={result.get('vulnerable')}; "
+            f"proteção={bool(result.get('protection_detected'))}; "
             f"observação={app_detection.get('observation_status') or 'n/a'}; "
             f"sinais={len(app_detection.get('detection_methods_found') or [])}"
         )
@@ -522,8 +530,10 @@ def build_execution_log(
 
     if check_name == "anti_root":
         _subcheck_entries(trace, check_name, result.get("checks"))
+        _static_entry(trace, check_name, result.get("app_root_detection"))
     elif check_name == "anti_frida":
         _subcheck_entries(trace, check_name, result.get("checks"))
+        _static_entry(trace, check_name, result.get("static_detection"))
         _dynamic_entry(trace, check_name, result.get("app_detection"))
         app_detection = result.get("app_detection") or {}
         if app_detection.get("detection_methods_found"):

@@ -34,6 +34,7 @@ from checks.anti_hooking import AntiHookingCheck
 from checks.anti_root import AntiRootCheck
 from checks.combined import run_combined_bypass, run_combined_observation
 from checks.ssl_pinning import SSLPinningCheck
+from checks.static import build_static_profile
 from device_manager import (
     TOOL_NAME,
     TOOL_VERSION,
@@ -181,6 +182,23 @@ def build_parser() -> argparse.ArgumentParser:
             "APK pré-construído do módulo de instrumentação (dispensa o "
             "build, que exige o SDK do Android)"
         ),
+    )
+    parser.add_argument(
+        "--static-engine",
+        choices=("auto", "asc", "builtin", "off"),
+        default="auto",
+        help=(
+            "Motor da análise estática do APK: auto=ASC se instalado "
+            "(fallback para varredura de bytes); asc=exige Droid ASC; "
+            "builtin=só varredura de bytes; off=não analisa"
+        ),
+    )
+    parser.add_argument(
+        "--static-timeout",
+        type=float,
+        default=60.0,
+        metavar="SEG",
+        help="Timeout por consulta ao Droid ASC (padrão: 60s)",
     )
     parser.add_argument(
         "--java-timeout",
@@ -503,6 +521,8 @@ def _build_run_context(args: argparse.Namespace, dm: "DeviceManager") -> dict:
             "hook_method": getattr(args, "hook_method", "auto"),
             "emulator_method": getattr(args, "emulator_method", "auto"),
             "module_apk": getattr(args, "module_apk", None),
+            "static_engine": getattr(args, "static_engine", "auto"),
+            "static_timeout": getattr(args, "static_timeout", 60.0),
             "avd": {
                 "enabled": bool(getattr(args, "avd", False)),
                 "config_path": getattr(args, "avd_config", None),
@@ -668,6 +688,51 @@ def run_pipeline(args: argparse.Namespace) -> int:
         run_context=_build_run_context(args, dm),
     )
 
+    # 3.1) Perfil estático do APK (uma única vez, compartilhado pelos
+    #      checks). Roda antes de qualquer spawn: não depende do app vivo.
+    static_profile = None
+    if getattr(args, "static_engine", "auto") != "off":
+        with console.status("[cyan]Analisando o APK (estático)...[/]"):
+            try:
+                static_profile = build_static_profile(
+                    dm,
+                    args.package,
+                    engine=getattr(args, "static_engine", "auto"),
+                    timeout=getattr(args, "static_timeout", 60.0),
+                )
+            except Exception as exc:  # o ASC não pode derrubar o pipeline
+                logger.warning("Análise estática falhou", exc_info=True)
+                static_profile = None
+                console.print(
+                    f"[yellow]![/] Estático indisponível: {escape(str(exc))}"
+                )
+        if static_profile and static_profile.get("available"):
+            summary = static_profile.get("summary") or {}
+            present = summary.get("vectors_present") or []
+            engine = summary.get("engine") or "?"
+            console.print(
+                f"[green]✓[/] Estático ({engine}): "
+                f"{len(present)} vetor(es) com indícios"
+                + (f" — {', '.join(present)}" if present else "")
+            )
+            reporter.run_context["static"] = {
+                "available": True,
+                "engine": summary.get("engine"),
+                "version": static_profile.get("version"),
+                "vectors_present": present,
+                "rasp_sdks": summary.get("rasp_sdks") or [],
+                "classes_count": static_profile.get("classes_count"),
+                "cached": bool(static_profile.get("cached")),
+            }
+        elif static_profile:
+            reason = (static_profile.get("summary") or {}).get("error") or "indisponível"
+            console.print(f"[yellow]![/] Estático: {escape(str(reason))}")
+            reporter.run_context["static"] = {
+                "available": False,
+                "engine": static_profile.get("engine"),
+                "error": reason,
+            }
+
     session = None
     pid = None
     xposed: Optional[XposedManager] = None
@@ -676,7 +741,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         _run_step(
             reporter,
             "anti_root",
-            lambda: AntiRootCheck(dm).run_all(),
+            lambda: AntiRootCheck(dm).run_all(static_profile=static_profile),
             skipped="anti_root" in args.skip,
         )
 
@@ -780,6 +845,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                         package_name=args.package,
                         logcat_mark=frida_logcat_mark,
                         app_detection=frida_detection,
+                        static_profile=static_profile,
                     ),
                 )
             else:
@@ -815,6 +881,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 window=args.window,
                 precomputed_detection=hook_detection,
                 precomputed_bypass=hooking_bypass,
+                static_profile=static_profile,
             ),
             skipped="anti_hooking" in args.skip,
         )
@@ -826,6 +893,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             lambda: SSLPinningCheck(dm, mode=args.mode, no_java=args.no_java).run_all(
                 args.package, window=args.window,
                 precomputed_bypass=ssl_bypass,
+                static_profile=static_profile,
             ),
             skipped="ssl_pinning" in args.skip,
         )
@@ -844,7 +912,11 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 dm, mode=args.mode, no_java=args.no_java,
                 java_timeout=args.java_timeout,
                 method=emulator_method, xposed=xposed,
-            ).run_all(args.package, window=args.window),
+            ).run_all(
+                args.package,
+                window=args.window,
+                static_profile=static_profile,
+            ),
             skipped="anti_emulator" in args.skip,
         )
     finally:

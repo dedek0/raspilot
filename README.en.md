@@ -30,6 +30,9 @@ the collected evidence.
   toolchain is installed without system privileges:
   `./instrumentation/setup_toolchain.sh` (requirements in
   `instrumentation/requirements.txt`).
+- **Optional:** Droid ASC (`pip install -r requirements-static.txt`,
+  Python 3.10+) for semantic APK analysis. Without it RASPilot uses the
+  built-in byte-signature scan.
 
 ### On the Android device
 
@@ -86,6 +89,8 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 # test dependencies (optional)
 pip install -r requirements-dev.txt
+# semantic static analysis (optional, requires Python 3.10+)
+pip install -r requirements-static.txt
 ```
 
 Quick check:
@@ -134,6 +139,8 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--hook-method METHOD` | no | Anti-hook bypass: `frida` (injected agent), `module` (hooking APK on the device, scoped to the target package) or `auto` (default: uses the module when a framework is available) |
 | `--emulator-method METHOD` | no | Anti-emulator probe/bypass: `frida`, `module` or `auto` (default) |
 | `--module-apk PATH` | no | Pre-built instrumentation module APK (skips the build, which requires the Android SDK) |
+| `--static-engine ENGINE` | no | APK static analysis: `auto` (default; ASC when installed, otherwise byte scan), `asc` (require Droid ASC), `builtin` (byte scan only) or `off` |
+| `--static-timeout SEC` | no | Timeout per Droid ASC query (default `60`) |
 | `--js-runtime RUNTIME` | no | Frida JavaScript runtime: `qjs` (default) or `v8` |
 | `--verbose` | no | DEBUG-level logging |
 | `--skip CHECK...` | no | Checks to skip (`anti_root`, `anti_frida`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
@@ -167,17 +174,32 @@ independent evidence source to correlate deaths (`SIGKILL`, `SIGSEGV`,
 Before any Frida spawn, an **uninstrumented baseline** checks whether the
 app already dies by itself, so instrumentation crashes or normal app
 lifecycle are not mistaken for a RASP reaction.
-Anti-Frida + anti-hooking observation runs in a **single session**, and anti-hooking/SSL bypasses share another spawn. The anti-emulator check runs **last**, with its own spawns: the probe makes the app see an emulator, and a shared spawn would contaminate the other checks. The APK cache lives in `~/.raspilot/cache/apk` (disable with `RASPILOT_APK_CACHE=0`).
+Before any spawn, an **APK static profile** is built once and shared by the
+checks: byte-signature scan (always) + decoded manifest, class list and
+method references via Droid ASC (when installed). The profile is cached
+by APK hash and separates "the app has no protection" from "the bypass
+beat the protection", while also flagging gaps in bypass-hook coverage.
+It does **not** replace dynamic observation: presence in the APK is not
+proof of execution.
+
+Anti-Frida + anti-hooking observation runs in a **single session**, and anti-hooking/SSL bypasses share another spawn. The anti-emulator check runs **last**, with its own spawns: the probe makes the app see an emulator, and a shared spawn would contaminate the other checks. The APK cache lives in `~/.raspilot/cache/apk` (disable with `RASPILOT_APK_CACHE=0`); the static profile cache lives in `~/.raspilot/cache/static` (disable with `RASPILOT_STATIC_CACHE=0`).
 
 Status semantics:
 
 | Status | Meaning |
 |---|---|
 | `OK` | Environment/protection OK (e.g. SSL pinning resisted the bypass, app detected and blocked Frida/hooking/emulator) |
-| `FALHOU` | Threat present or bypass won (e.g. root in the environment, pinning circumvented, app failed to detect Frida or anti-hook/anti-emulator checks) |
-| `N/A` | Not applicable: the protection being measured does not exist (e.g. no SSL pinning) |
+| `FALHOU` | Threat present or bypass won (e.g. root in the environment, pinning circumvented, anti-hook/anti-emulator protection exists but the bypass got through) |
+| `N/A` | Not applicable: the protection being measured does not exist (e.g. no SSL pinning, or no high-confidence anti-Frida reference in the APK and no runtime detection) |
 | `SKIP` | A step did not run: skipped via `--skip`, or the bypass was not evaluated even though the protection exists (reason in `skip_reason`) |
 | `ERROR` | Check could not conclude (pipeline continues) — includes inconclusive observation |
+
+> **Anti-Frida:** when the static profile is available and finds **no**
+> high-confidence Frida reference, and the app does not react at runtime,
+> the status becomes `N/A` (there was no protection to beat). If the APK
+> references the check but the app does not react, the status stays
+> `FALHOU`: the protection exists in code but was not observed in the
+> window. The reason is stored in `verdict_reason`.
 
 > **Golden rule:** RASPilot only claims a protection held when there is
 > high-confidence evidence. Generic logcat terms (`root`, `hook`,
@@ -212,6 +234,43 @@ Status semantics:
 
 ## Checks
 
+### 0. Static APK analysis (`checks/static/`)
+
+The static profile is built once per run and shared by all five checks.
+It has two layers:
+
+1. **Byte scan (always available)** — reads `AndroidManifest.xml`,
+   `*.dex`, `lib/**/*.so`, `assets/flutter_assets*` and `res/xml/*` and
+   looks for ASCII/UTF-16LE signatures. It is the same base already used
+   by the checks, now consolidated into one pass.
+2. **Droid ASC (optional)** — runs `getmanifest`, `listclass` and a
+   curated set of `findrefs` queries to find **which class/method**
+   references the API or string. This is what turns "the APK contains
+   the string" into "class `X` references `X509TrustManager`".
+
+For each vector (`frida`, `hooking`, `root`, `emulator`, `pinning`) the
+profile records `present`, `confidence`, `findings` (source, class,
+method, evidence) and `possible_gaps` — techniques the current bypass
+scripts do not cover, such as native BoringSSL pinning or native
+`/proc/self/maps` reads. Static presence is **not** treated as proof of
+execution.
+
+Confidence is calibrated to avoid false positives: bundled
+`okhttp`/Flutter/Conscrypt do not count as pinning; a custom
+`X509TrustManager` only counts with a pinning hint; a lone `getStackTrace`
+does not count as anti-hook; and a generic `frida` string does not count
+as anti-Frida.
+
+The ASC runs as a subprocess with a timeout and per-APK cache. Without
+it (or with `--static-engine builtin`) RASPilot keeps working with the
+byte scan and records the limitation in the report. Cache lives in
+`~/.raspilot/cache/static` and can be disabled with
+`RASPILOT_STATIC_CACHE=0`.
+
+Limitations: ASC reads the installed APK; native code, packed DEX and
+runtime-loaded DEX are not covered. A referenced string may live in dead
+code. The profile is surface evidence, not behaviour evidence.
+
 ### 1. Anti-Root (`checks/anti_root.py`)
 
 Multiple independent vectors consolidated into `is_rooted` + `confidence`:
@@ -227,6 +286,15 @@ Multiple independent vectors consolidated into `is_rooted` + `confidence`:
 - Busybox
 
 Confidence: `high` (≥2 vectors), `medium` (1), `low` (0).
+
+Besides the device verdict, the check stores `app_root_detection` with
+the root-detection references found in the APK (RootBeer, `su`, Magisk,
+`ro.debuggable`, `File.exists`, `Runtime.exec`, etc.). This field is
+**informational** and does not change `is_rooted`: a clean device stays
+`OK` even when the app can detect root. The coverage of
+`scripts/anti_root_bypass.js` appears in `coverage.possible_gaps`; the
+dynamic execution of that bypass in `anti_root` is not wired into the
+pipeline yet.
 
 ### 2. Anti-Frida (`checks/anti_frida.py`)
 
@@ -245,8 +313,19 @@ Confidence: `high` (≥2 vectors), `medium` (1), `low` (0).
   isolates the cause, the crash stays `ERROR`/inconclusive, not `OK`
 - If observation cannot run (script/attach failure), the result is
   `ERROR`, not `vulnerable=True`
+- **Static analysis**: APK signatures (`frida` as a whole word,
+  `gum-js-loop`, `libfrida`, `linjector`, `frida-gadget`) and, via ASC,
+  class/method references. Generic references (UI text, app name) stay at
+  low/medium confidence and do not enter the verdict; only high-confidence
+  evidence (detection context, `gum-js-loop`, `linjector`, `libfrida`)
+  counts as anti-Frida protection.
 
 `vulnerable=True` ⇒ the app did **not** detect Frida (RASP failure).
+When the static profile is available and finds no high-confidence
+anti-Frida protection, and the app does not react either, the check
+returns `N/A` instead of `FALHOU` — there was no protection to beat. If
+the APK references the check but the app does not react, the verdict
+stays `FALHOU` and the reason is stored in `verdict_reason`.
 The corresponding bypass lives in `scripts/anti_frida_bypass.js`.
 
 ### 3. Anti-Emulator (`checks/anti_emulator.py`)
@@ -264,9 +343,10 @@ Phases:
   detection for Genymotion/LDPlayer/BlueStacks/Nox/Waydroid. It is
   **informative**: it tells which kind of machine the audit ran on, not
   whether the app is protected.
-- **Static detection**: pulls the APK and scans for anti-emulator
-  signatures (detection methods/classes of RASP SDKs and fingerprint
-  strings such as `ro.kernel.qemu`, `goldfish`, `sdk_gphone`).
+- **Static detection**: anti-emulator signatures (detection
+  methods/classes of RASP SDKs and fingerprint strings such as
+  `ro.kernel.qemu`, `goldfish`, `sdk_gphone`), enriched by the ASC
+  profile (`SystemProperties.get` refs, SDK classes and so on).
 - **Dynamic detection (probe)**: suspended spawn with
   `scripts/emulator_spoof.js` in `probe` mode — the app starts to **see an
   emulator** (`Build.*`, `SystemProperties`, `/dev/qemu_pipe`, IMEI,
@@ -308,9 +388,11 @@ phases consolidated into `protection_detected` + `bypass_successful`:
   `/data/adb/lspd`) and hook libraries mapped into the process (Frida
   session with `/proc/<pid>/maps` fallback). Frida libraries are excluded —
   detecting them is the Anti-Frida check's job.
-- **Static detection**: pulls the APK and scans for the signatures RASP
-  SDKs use to probe hooks (Xposed classes, LSPosed/lspd/LSPlant, EdXposed,
-  Substrate, SandHook/YAHFA/Whale/Dobby and Frida strings).
+- **Static detection**: scans for the signatures RASP SDKs use to probe
+  hooks (Xposed classes, LSPosed/lspd/LSPlant, EdXposed, Substrate,
+  SandHook/YAHFA/Whale/Dobby and Frida strings), enriched by the ASC
+  profile (`findrefs` of `XposedBridge`, `org.lsposed`, `getStackTrace`
+  and framework classes).
 - **Dynamic observation**: suspended spawn with a script that records
   (without blocking) `Class.forName`/`ClassLoader.loadClass` of framework
   classes, `File.exists` and `open`/`fopen`/`access`/`stat` on framework
@@ -343,9 +425,11 @@ vector the protection actually inspects.
 
 ### 5. SSL Pinning (`checks/ssl_pinning.py`)
 
-- **Static detection**: pulls the APK (`pm path` + `adb pull`) and scans
-  for OkHttp `CertificatePinner`, TrustKit, NetworkSecurityConfig, Flutter
-  and Conscrypt/native signatures (binary Manifest, DEX, native libs).
+- **Static detection**: scans the APK (`pm path` + `adb pull`) for OkHttp
+  `CertificatePinner`, TrustKit, NetworkSecurityConfig, Flutter and
+  Conscrypt/native signatures (binary Manifest, DEX, native libs). With
+  ASC the manifest is decoded (`networkSecurityConfig`, `debuggable`) and
+  `findrefs impl X509TrustManager` locates custom TrustManagers.
 - **Dynamic bypass**: injects `scripts/ssl_bypass.js` (universal) covering
   TrustManager, HostnameVerifier, OkHttp 3/4, NSC, Conscrypt, Apache
   HttpClient, WebView, BoringSSL/OpenSSL and Flutter. Bypass is only
@@ -535,6 +619,7 @@ for `sys.boot_completed`, hands the serial (`emulator-5554`) to the
 ```
 raspilot/
 ├── main.py                     # CLI + auditing pipeline
+├── requirements-static.txt     # Optional dependency: Droid ASC (Python 3.10+)
 ├── avd_manager.py              # Optional emulated environment (AVD)
 ├── device_manager.py           # ADB (USB/Wi-Fi) + frida-server + logcat/baseline
 ├── logcat_analyzer.py          # Death/security/TLS logcat correlation
@@ -554,6 +639,10 @@ raspilot/
 │   ├── combined.py             # Single-session observation/bypass
 │   ├── stealth.py              # Native bootstrap before resume
 │   ├── apk_utils.py            # Shared APK helpers + APK cache
+│   ├── static/                 # Static profile (signatures + Droid ASC)
+│   │   ├── engine.py           # ASC subprocess, timeout and cache
+│   │   ├── queries.py          # Signatures and high-signal queries
+│   │   └── profile.py          # Profile, confidence and bypass coverage
 │   └── ssl_pinning.py          # SSL pinning detection + bypass
 ├── scripts/
 │   ├── ssl_bypass.js           # Universal SSL pinning bypass (Frida)
@@ -641,11 +730,21 @@ baseline result) so the run can be reproduced.
 | App spawned but checks empty | App protected against debuggers | Use `--verbose` and inspect `details` in the JSON |
 | Window too short for slow apps | Long splash or late RASP checks | Increase with `--window 20` (or more) |
 | `hooking framework unavailable` | No framework with a configuration cli on the device | Use `--hook-method frida --emulator-method frida` |
+| `Estático: droidasc não instalado` | Optional semantic analysis unavailable | `pip install -r requirements-static.txt` (Python 3.10+) or use `--static-engine builtin` |
+| `Estático: timeout após Ns` | Large APK or slow host | Increase `--static-timeout`; the check continues with partial results |
 | `module build failed` | Android SDK or JDK missing on the host | Install `build-tools` + `platform` in `$ANDROID_HOME` and a JDK, or use `--module-apk` |
 
 ---
 
 ## Known limitations
+
+**Static analysis is surface, not behaviour.** The APK profile finds
+references to checks and points out coverage gaps, but it does not prove
+that the method ran. Native code, packed/encrypted DEX and DEX loaded at
+runtime are not seen by ASC; when that happens the report records the
+limitation and the dynamic verdict remains the source of proof.
+`anti_root` uses the profile for information only: dynamic execution of
+`anti_root_bypass.js` is not integrated into the check yet.
 
 **The Java layer depends on the agent attaching to the app's virtual
 machine.** The Java bridge obtains the `JNIEnv` of the instrumentation

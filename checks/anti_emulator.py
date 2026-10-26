@@ -48,6 +48,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from checks.apk_utils import pull_apk, scan_apk
+from checks.static import merge_signature_detection, vector_view
 from checks.stealth import load_stealth, unload_stealth
 from logcat_analyzer import (
     HIGH_CONFIDENCE_CATEGORIES,
@@ -1731,6 +1732,7 @@ class AntiEmulatorCheck:
         apk_path: Optional[str] = None,
         precomputed_detection: Optional[dict] = None,
         precomputed_bypass: Optional[dict] = None,
+        static_profile: Optional[dict] = None,
     ) -> dict:
         """Combina contexto do dispositivo, detecção (estática + dinâmica)
         e bypass.
@@ -1751,6 +1753,8 @@ class AntiEmulatorCheck:
             apk_path: Caminho opcional de APK local para a análise estática.
             precomputed_detection: Detecção pré-calculada (opcional).
             precomputed_bypass: Bypass pré-calculado (opcional).
+            static_profile: Perfil estático do APK (opcional); enriquece
+                a detecção por assinaturas com classes/xrefs do ASC.
 
         Returns:
             Dict com ``protection_detected``, ``bypass_successful``,
@@ -1758,7 +1762,12 @@ class AntiEmulatorCheck:
             ``app_detection``, ``bypass_details`` e ``timestamp``.
         """
         device = self.classify_device()
-        static = self.detect_static(package_name, apk_path=apk_path)
+        static_view = vector_view(static_profile, "emulator")
+        if static_view is not None:
+            static = merge_signature_detection({}, static_view)
+            static["details"] = static.get("details") or "análise estática do perfil do APK"
+        else:
+            static = self.detect_static(package_name, apk_path=apk_path)
 
         # Fase dinâmica: usa a detecção pré-calculada quando fornecida;
         # caso contrário, cria um spawn próprio (uso standalone).
@@ -1881,6 +1890,18 @@ class AntiEmulatorCheck:
             "checks": device.get("checks", {}),
             "device_environment": device,
             "static_detection": static,
+            "static_analysis": (
+                {
+                    "engine": static_view.get("engine"),
+                    "version": static_view.get("version"),
+                    "vector": "emulator",
+                    "present": bool(static_view.get("effective", static_view.get("present"))),
+                    "confidence": static_view.get("confidence"),
+                    "coverage": static_view.get("coverage"),
+                }
+                if static_view is not None
+                else None
+            ),
             "app_detection": app_detection,
             "bypass_details": bypass_details,
             "bypass_skipped_reason": bypass_skipped_reason,

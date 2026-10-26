@@ -1,0 +1,11 @@
+# RASPilot — análise estática opcional (Droid ASC)
+#
+# Requer Python 3.10+. Sem este arquivo o RASPilot continua funcionando
+# com a varredura de assinaturas embutida (engine "builtin").
+#
+# Instale com:
+#     python -m pip install -r requirements-static.txt
+#
+# O ASC é usado apenas como subprocesso pelo RASPilot; a versão é
+# pinada porque o CLI ainda está na série 0.1.x.
+droidasc==0.1.2.post3

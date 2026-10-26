@@ -27,6 +27,9 @@ coletadas.
 - Android SDK (`build-tools` + `platform`) e um JDK — **apenas** para compilar
   o módulo de instrumentação descrito abaixo. Sem eles, o RASPilot continua
   funcionando com o método `frida` (veja *Módulo de instrumentação*).
+- **Opcional:** Droid ASC (`pip install -r requirements-static.txt`,
+  Python 3.10+) para a análise estática semântica do APK. Sem ele, o
+  RASPilot usa a varredura de assinaturas embutida.
 
 ### No dispositivo Android
 
@@ -82,6 +85,8 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 # dependências de teste (opcional)
 pip install -r requirements-dev.txt
+# análise estática semântica (opcional, requer Python 3.10+)
+pip install -r requirements-static.txt
 ```
 
 Verificação rápida:
@@ -130,6 +135,8 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--hook-method MÉTODO` | não | Bypass anti-hook: `frida` (agente injetado), `module` (APK de hooking no dispositivo, limitado ao pacote alvo) ou `auto` (default: usa o módulo quando há framework disponível) |
 | `--emulator-method MÉTODO` | não | Probe/bypass anti-emulador: `frida`, `module` ou `auto` (default) |
 | `--module-apk PATH` | não | APK pré-construído do módulo de instrumentação (dispensa o build, que exige o SDK do Android) |
+| `--static-engine MOTOR` | não | Análise estática do APK: `auto` (default; ASC se instalado, senão varredura de bytes), `asc` (exige Droid ASC), `builtin` (só varredura de bytes) ou `off` |
+| `--static-timeout SEG` | não | Timeout por consulta ao Droid ASC (default `60`) |
 | `--js-runtime RUNTIME` | não | Runtime JavaScript do Frida: `qjs` (default) ou `v8` |
 | `--verbose` | não | Logging em nível DEBUG |
 | `--skip CHECK...` | não | Checks a pular (`anti_root`, `anti_frida`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
@@ -164,17 +171,26 @@ mensagens de SDKs de segurança e erros de TLS/pinning. Antes de qualquer
 spawn com Frida, um **baseline sem instrumentação** verifica se o app já
 morre sozinho; assim um crash da instrumentação ou o ciclo de vida normal
 do app não é confundido com uma reação do RASP.
-A observação anti-Frida + anti-hooking roda em uma **sessão única**, e os bypasses de anti-hooking/SSL compartilham outro spawn. O anti-emulador roda **por último**, com spawns próprios: o probe faz o app enxergar um emulador, e um spawn compartilhado contaminaria os demais checks. O cache de APK fica em `~/.raspilot/cache/apk` (desative com `RASPILOT_APK_CACHE=0`).
+Antes de qualquer spawn, um **perfil estático** do APK é construído uma única vez e compartilhado pelos checks: varredura de assinaturas (sempre) + manifesto, classes e referências de método via Droid ASC (quando instalado). O perfil fica em cache por hash dos APKs e serve para separar "o app não tem proteção" de "o bypass venceu a proteção" e para apontar lacunas de cobertura dos hooks. Ele **não** substitui a observação dinâmica: presença no APK não prova execução.
+
+A observação anti-Frida + anti-hooking roda em uma **sessão única**, e os bypasses de anti-hooking/SSL compartilham outro spawn. O anti-emulador roda **por último**, com spawns próprios: o probe faz o app enxergar um emulador, e um spawn compartilhado contaminaria os demais checks. O cache de APK fica em `~/.raspilot/cache/apk` (desative com `RASPILOT_APK_CACHE=0`); o cache do perfil estático fica em `~/.raspilot/cache/static` (desative com `RASPILOT_STATIC_CACHE=0`).
 
 Semântica de status:
 
 | Status | Significado |
 |---|---|
 | `OK` | Ambiente/proteção OK (ex: SSL pinning resistiu ao bypass, app detectou e bloqueou o Frida/hooking/emulador) |
-| `FALHOU` | Ameaça presente ou bypass venceu (ex: root no ambiente, pinning contornado, app não detectou o Frida nem checagens anti-hook/anti-emulador) |
-| `N/A` | Não aplicável: não existe a proteção que se mediria (ex: sem SSL pinning) |
+| `FALHOU` | Ameaça presente ou bypass venceu (ex: root no ambiente, pinning contornado, proteção anti-hook/anti-emulador existe mas o bypass passou) |
+| `N/A` | Não aplicável: não existe a proteção que se mediria (ex: sem SSL pinning, ou anti-Frida sem referência de alta confiança no APK e sem detecção em runtime) |
 | `SKIP` | Etapa que não rodou: pulada via `--skip`, ou bypass não avaliado apesar de a proteção existir (o motivo vai em `skip_reason`) |
 | `ERROR` | A verificação não pôde concluir (o pipeline continua) — inclui observação inconclusiva |
+
+> **Anti-Frida:** quando o perfil estático está disponível e **não** encontra
+> nenhuma referência de alta confiança a Frida, e o app também não reage em
+> runtime, o status passa a ser `N/A` (não havia proteção a ser vencida).
+> Se o APK referencia a checagem mas o app não reage, o status continua
+> `FALHOU`: a proteção existe no código, mas não foi observada na janela.
+> O motivo fica em `verdict_reason`.
 
 > **Regra de ouro:** o RASPilot só afirma que uma proteção resistiu quando
 > houve evidência de confiança alta. Termos genéricos de logcat (`root`,
@@ -209,6 +225,45 @@ Semântica de status:
 
 ## Verificações
 
+### 0. Análise estática do APK (`checks/static/`)
+
+O perfil estático é construído uma vez por execução e compartilhado pelos
+cinco checks. Ele tem duas camadas:
+
+1. **Varredura de bytes (sempre disponível)** — lê `AndroidManifest.xml`,
+   `*.dex`, `lib/**/*.so`, `assets/flutter_assets*` e `res/xml/*` e procura
+   assinaturas ASCII/UTF-16LE. É a mesma base já usada pelos checks, agora
+   consolidada em uma passada.
+2. **Droid ASC (opcional)** — executa `getmanifest`, `listclass` e um
+   conjunto curado de `findrefs` para descobrir **em qual classe/método**
+   a API ou string aparece. É isso que permite dizer "o app referencia
+   `X509TrustManager` na classe `X`" em vez de apenas "o APK contém a
+   string".
+
+Para cada vetor (`frida`, `hooking`, `root`, `emulator`, `pinning`) o
+perfil registra `present`, `confidence`, `findings` (fonte, classe, método,
+evidência) e `possible_gaps` — técnicas que os scripts de bypass atuais
+não cobrem, como pinning nativo em BoringSSL ou leitura nativa de
+`/proc/self/maps`. A presença estática **não** é tratada como prova de
+execução.
+
+A confiança é calibrada para evitar falso positivo: `okhttp`/Flutter/
+Conscrypt empacotados não contam como pinning; um `X509TrustManager`
+customizado só conta com indício de pinning; `getStackTrace` isolado não
+conta como anti-hook; e uma string `frida` genérica não conta como
+anti-Frida.
+
+O ASC é executado como subprocesso, com timeout e cache por hash do APK.
+Sem ele (ou com `--static-engine builtin`), o RASPilot continua
+funcionando com a varredura de bytes e registra a limitação no relatório.
+O cache fica em `~/.raspilot/cache/static` e pode ser desligado com
+`RASPILOT_STATIC_CACHE=0`.
+
+Limitações: o ASC lê o APK instalado; código nativo, DEX empacotado ou
+carregado em runtime não são cobertos. Uma string referenciada pode estar
+em código morto. Por isso o perfil é evidência de superfície, não de
+comportamento.
+
 ### 1. Anti-Root (`checks/anti_root.py`)
 
 Múltiplos vetores independentes consolidados em `is_rooted` + `confidence`:
@@ -224,6 +279,15 @@ Múltiplos vetores independentes consolidados em `is_rooted` + `confidence`:
 - Busybox
 
 Confiança: `high` (≥2 vetores), `medium` (1), `low` (0).
+
+Além do veredito do dispositivo, o check grava `app_root_detection` com as
+referências de detecção de root encontradas no APK (RootBeer, `su`,
+Magisk, `ro.debuggable`, `File.exists`, `Runtime.exec` etc.). Esse campo é
+**informativo** e não altera `is_rooted`: um device limpo continua `OK`
+mesmo que o app saiba detectar root. A cobertura do
+`scripts/anti_root_bypass.js` aparece em `coverage.possible_gaps`; a
+execução dinâmica desse bypass no `anti_root` ainda não está ligada no
+pipeline.
 
 ### 2. Anti-Frida (`checks/anti_frida.py`)
 
@@ -242,8 +306,19 @@ Confiança: `high` (≥2 vetores), `medium` (1), `low` (0).
   causa, o crash fica `ERROR`/inconclusivo, não `OK`
 - Se a observação não puder executar (script/attach), o resultado é
   `ERROR`, não `vulnerable=True`
+- **Análise estática**: assinaturas no APK (`frida` como palavra
+  isolada, `gum-js-loop`, `libfrida`, `linjector`, `frida-gadget`) e, via
+  ASC, referências com classe/método. Referências genéricas (texto de UI,
+  nome do app) ficam em baixa/média confiança e não entram no veredito;
+  só evidência de alta confiança (contexto de detecção, `gum-js-loop`,
+  `linjector`, `libfrida`) conta como proteção anti-Frida.
 
 `vulnerable=True` ⇒ o app **não** detectou o Frida (falha de RASP).
+Quando o perfil estático está disponível e não encontra nenhuma proteção
+anti-Frida de alta confiança, e o app também não reage, o check retorna
+`N/A` em vez de `FALHOU` — não havia proteção a ser vencida. Se o APK
+referencia a checagem mas o app não reage, o veredito continua `FALHOU` e
+o motivo fica em `verdict_reason`.
 O bypass correspondente vive em `scripts/anti_frida_bypass.js`.
 
 ### 3. Anti-Emulador (`checks/anti_emulator.py`)
@@ -261,9 +336,10 @@ Fases:
   Bluetooth placeholder e detecção de Genymotion/LDPlayer/BlueStacks/Nox/
   Waydroid. É **informativo**: diz em que tipo de máquina a auditoria
   rodou, e não se o app é protegido.
-- **Detecção estática**: baixa o APK e procura assinaturas anti-emulador
-  (métodos/classes de detecção de SDKs de RASP e strings de fingerprint
-  como `ro.kernel.qemu`, `goldfish`, `sdk_gphone`).
+- **Detecção estática**: assinaturas anti-emulador (métodos/classes de
+  detecção de SDKs de RASP e strings de fingerprint como
+  `ro.kernel.qemu`, `goldfish`, `sdk_gphone`), enriquecidas pelo perfil
+  ASC (referências a `SystemProperties.get`, classes de SDK etc.).
 - **Detecção dinâmica (probe)**: spawn suspenso com
   `scripts/emulator_spoof.js` no modo `probe` — o app passa a **enxergar
   um emulador** (`Build.*`, `SystemProperties`, `/dev/qemu_pipe`, IMEI,
@@ -305,9 +381,11 @@ independentes consolidadas em `protection_detected` + `bypass_successful`:
   `/data/adb/lspd`) e libs de hook mapeadas no processo (sessão Frida com
   fallback para `/proc/<pid>/maps`). Libs do Frida ficam de fora — a
   detecção delas é papel do Anti-Frida.
-- **Detecção estática**: baixa o APK e procura assinaturas que SDKs
-  anti-RASP usam para checar hooks (classes Xposed, LSPosed/lspd/LSPlant,
-  EdXposed, Substrate, SandHook/YAHFA/Whale/Dobby e strings Frida).
+- **Detecção estática**: procura assinaturas que SDKs anti-RASP usam
+  para checar hooks (classes Xposed, LSPosed/lspd/LSPlant, EdXposed,
+  Substrate, SandHook/YAHFA/Whale/Dobby e strings Frida), enriquecidas
+  pelo perfil ASC (`findrefs` de `XposedBridge`, `org.lsposed`,
+  `getStackTrace` e classes de frameworks).
 - **Observação dinâmica**: spawn suspenso com script que registra (sem
   bloquear) `Class.forName`/`ClassLoader.loadClass` de classes de
   frameworks, `File.exists` e `open`/`fopen`/`access`/`stat` em paths de
@@ -338,10 +416,12 @@ proteção de fato fiscaliza.
 
 ### 5. SSL Pinning (`checks/ssl_pinning.py`)
 
-- **Detecção estática**: baixa o APK (`pm path` + `adb pull`) e procura
+- **Detecção estática**: varre o APK (`pm path` + `adb pull`) por
   assinaturas de OkHttp `CertificatePinner`, TrustKit,
   NetworkSecurityConfig, Flutter e Conscrypt/nativo (Manifest binário,
-  DEX, libs nativas).
+  DEX, libs nativas). Com ASC, o manifesto é decodificado
+  (`networkSecurityConfig`, `debuggable`) e `findrefs impl
+  X509TrustManager` localiza TrustManagers customizados.
 - **Bypass dinâmico**: injeta `scripts/ssl_bypass.js` (universal) cobrindo
   TrustManager, HostnameVerifier, OkHttp 3/4, NSC, Conscrypt, Apache
   HttpClient, WebView, BoringSSL/OpenSSL e Flutter. Bypass só é considerado
@@ -570,6 +650,7 @@ espera `sys.boot_completed`, entrega o serial (`emulator-5554`) ao
 ```
 raspilot/
 ├── main.py                     # CLI + pipeline de auditoria
+├── requirements-static.txt     # Dependência opcional: Droid ASC (Python 3.10+)
 ├── avd_manager.py              # Ambiente emulado (AVD) opcional
 ├── device_manager.py           # ADB (USB/Wi-Fi) + frida-server + logcat/baseline
 ├── logcat_analyzer.py          # Correlação de mortes/segurança/TLS no logcat
@@ -589,6 +670,10 @@ raspilot/
 │   ├── combined.py             # Observação/bypass em sessão única
 │   ├── stealth.py              # Bootstrap nativo antes do resume
 │   ├── apk_utils.py            # Helpers compartilhados + cache de APK
+│   ├── static/                 # Perfil estático (assinaturas + Droid ASC)
+│   │   ├── engine.py           # Subprocesso, timeout e cache do ASC
+│   │   ├── queries.py          # Assinaturas e consultas de alto sinal
+│   │   └── profile.py          # Perfil, confiança e cobertura do bypass
 │   └── ssl_pinning.py          # Detecção + bypass de SSL pinning
 ├── scripts/
 │   ├── ssl_bypass.js           # Bypass universal de SSL pinning (Frida)
@@ -680,11 +765,22 @@ alvo e resultado do baseline) para que a execução possa ser reproduzida.
 | `SKIP` com `skip_reason` no bypass | A camada Java não ficou ativa a tempo | Aumente `--java-timeout`; veja *Limitações conhecidas* |
 | App morre logo após o resume | Auto-destruição do app ao detectar a instrumentação | A camada nativa neutraliza `abort`/sinais; as ações neutralizadas aparecem em `neutralized_actions` |
 | `framework de hooking indisponível` | Nenhum framework com cli de configuração no aparelho | Use `--hook-method frida --emulator-method frida` |
+| `Estático: droidasc não instalado` | Análise semântica opcional indisponível | `pip install -r requirements-static.txt` (Python 3.10+) ou use `--static-engine builtin` |
+| `Estático: timeout após Ns` | APK grande ou máquina lenta | Aumente `--static-timeout`; o check continua com o resultado parcial |
 | `build do módulo falhou` | SDK do Android ou JDK ausentes no host | Instale `build-tools` + `platform` em `$ANDROID_HOME` e um JDK, ou use `--module-apk` |
 
 ---
 
 ## Limitações conhecidas
+
+**A análise estática é superfície, não comportamento.** O perfil do APK
+encontra referências a checagens e aponta lacunas de cobertura, mas não
+prova que o método foi executado. Código nativo, DEX empacotado/criptografado
+e DEX carregado em runtime não são vistos pelo ASC; quando isso acontece,
+o relatório registra a limitação e o veredito dinâmico continua sendo a
+fonte de prova. O `anti_root` usa o perfil apenas como informação: a
+execução dinâmica do `anti_root_bypass.js` ainda não está integrada ao
+check.
 
 **A camada Java depende da anexação do agente à máquina virtual do app.**
 A bridge Java obtém o `JNIEnv` da thread do agente de instrumentação.

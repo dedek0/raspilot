@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 from rich.console import Console
 
 from checks.apk_utils import pull_apk, scan_apk
+from checks.static import merge_pinning_detection, vector_view
 from checks.stealth import PROC_FILTER_SCRIPT, load_stealth, unload_stealth
 from logcat_analyzer import (
     analyze_since,
@@ -540,6 +541,7 @@ class SSLPinningCheck:
         apk_path: Optional[str] = None,
         window: int = 12,
         precomputed_bypass: Optional[dict] = None,
+        static_profile: Optional[dict] = None,
     ) -> dict:
         """Combina detecção estática e tentativa de bypass.
 
@@ -550,13 +552,35 @@ class SSLPinningCheck:
             package_name: Package name do app alvo.
             apk_path: Caminho opcional de APK local para análise.
             window: Janela de observação do bypass em segundos.
+            precomputed_bypass: Bypass combinado pré-calculado.
+            static_profile: Perfil estático do APK (opcional); acrescenta
+                manifesto decodificado, TrustManagers e xrefs do ASC.
 
         Returns:
             Dict com ``pinning_detected``, ``pinning_type``,
             ``bypass_successful`` (bool|None), ``evidence`` (lista) e
             ``bypass_details`` (dict|None) e ``timestamp``.
         """
-        detection = self.detect_pinning(package_name, apk_path=apk_path)
+        static_view = vector_view(static_profile, "pinning")
+        if static_view is not None:
+            # O perfil já inclui a varredura de bytes (com confiança
+            # calibrada) + ASC; evita a varredura duplicada e não trata
+            # Flutter/Conscrypt como pinning.
+            detection = merge_pinning_detection({}, static_view)
+        else:
+            detection = self.detect_pinning(package_name, apk_path=apk_path)
+        static_analysis = (
+            {
+                "engine": static_view.get("engine"),
+                "version": static_view.get("version"),
+                "vector": "pinning",
+                "present": bool(static_view.get("effective", static_view.get("present"))),
+                "confidence": static_view.get("confidence"),
+                "coverage": static_view.get("coverage"),
+            }
+            if static_view is not None
+            else None
+        )
 
         # Falha ao obter/analisar o APK é inconclusiva, não "sem pinning".
         if detection.get("error"):
@@ -567,6 +591,7 @@ class SSLPinningCheck:
                 "evidence": [],
                 "bypass_details": None,
                 "detection": detection,
+                "static_analysis": static_analysis,
                 "error": str(detection["error"]),
                 "timestamp": _now_iso(),
             }
@@ -579,6 +604,7 @@ class SSLPinningCheck:
                 "evidence": [],
                 "bypass_details": None,
                 "detection": detection,
+                "static_analysis": static_analysis,
                 "timestamp": _now_iso(),
             }
 
@@ -597,6 +623,7 @@ class SSLPinningCheck:
                 "bypass_details": None,
                 "bypass_skipped_reason": bypass_skipped_reason,
                 "detection": detection,
+                "static_analysis": static_analysis,
                 "timestamp": _now_iso(),
             }
 
@@ -629,6 +656,7 @@ class SSLPinningCheck:
             "evidence": detection.get("evidence", []),
             "bypass_details": bypass,
             "detection": detection,
+            "static_analysis": static_analysis,
             "timestamp": _now_iso(),
         }
         if bypass.get("blocked"):

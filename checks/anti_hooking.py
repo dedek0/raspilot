@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from checks.apk_utils import pull_apk, scan_apk
+from checks.static import merge_signature_detection, vector_view
 from checks.stealth import PROC_FILTER_SCRIPT, load_stealth, unload_stealth
 from rasp_vendors import VENDORS
 from logcat_analyzer import (
@@ -1904,6 +1905,7 @@ class AntiHookingCheck:
         apk_path: Optional[str] = None,
         precomputed_detection: Optional[dict] = None,
         precomputed_bypass: Optional[dict] = None,
+        static_profile: Optional[dict] = None,
     ) -> dict:
         """Combina vetores, detecção (estática + dinâmica) e bypass.
 
@@ -1924,6 +1926,10 @@ class AntiHookingCheck:
             package_name: Package name do app alvo.
             window: Janela de observação (segundos) da observação e do bypass.
             apk_path: Caminho opcional de APK local para a análise estática.
+            precomputed_detection: Observação combinada pré-calculada.
+            precomputed_bypass: Bypass combinado pré-calculado.
+            static_profile: Perfil estático do APK (opcional); enriquece
+                a detecção por assinaturas com classes/xrefs do ASC.
 
         Returns:
             Dict com ``protection_detected``, ``bypass_successful``,
@@ -1963,7 +1969,14 @@ class AntiHookingCheck:
                     "details": f"falha ao identificar o framework: {exc}",
                 }
 
-        static = self.detect_static(package_name, apk_path=apk_path)
+        static_view = vector_view(static_profile, "hooking")
+        if static_view is not None:
+            # O perfil já inclui a varredura de assinaturas + ASC; evita
+            # baixar/varrear o APK uma segunda vez.
+            static = merge_signature_detection({}, static_view)
+            static["details"] = static.get("details") or "análise estática do perfil do APK"
+        else:
+            static = self.detect_static(package_name, apk_path=apk_path)
 
         # Fase dinâmica: usa a observação combinada quando fornecida;
         # caso contrário, cria um spawn próprio (uso standalone).
@@ -2100,6 +2113,18 @@ class AntiHookingCheck:
             ),
             "checks": checks,
             "static_detection": static,
+            "static_analysis": (
+                {
+                    "engine": static_view.get("engine"),
+                    "version": static_view.get("version"),
+                    "vector": "hooking",
+                    "present": bool(static_view.get("effective", static_view.get("present"))),
+                    "confidence": static_view.get("confidence"),
+                    "coverage": static_view.get("coverage"),
+                }
+                if static_view is not None
+                else None
+            ),
             "app_detection": app_detection,
             "bypass_details": bypass_details,
             "bypass_skipped_reason": bypass_skipped_reason,

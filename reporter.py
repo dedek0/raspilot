@@ -114,6 +114,8 @@ class Reporter:
         static = result.get("static_detection") or {}
         if static.get("static_detected"):
             sources.append("static_apk")
+        if (static.get("asc") or {}).get("effective"):
+            sources.append("static_asc")
         app_detection = result.get("app_detection") or {}
         if app_detection.get("detected"):
             sources.append("dynamic")
@@ -147,6 +149,7 @@ class Reporter:
             is_rooted = bool(result.get("is_rooted"))
             positive = list(result.get("positive_vectors") or [])
             evaluated = list(result.get("evaluated_vectors") or [])
+            app_root = result.get("app_root_detection") or {}
             return (
                 "FALHOU" if is_rooted else "OK",
                 {
@@ -154,12 +157,22 @@ class Reporter:
                     "confidence": result.get("confidence"),
                     "positive_vectors": positive,
                     "evaluated_vectors": len(evaluated),
+                    "app_root_detection": {
+                        "present": bool(app_root.get("present")),
+                        "confidence": app_root.get("confidence"),
+                        "engine": (result.get("static_analysis") or {}).get("engine"),
+                    },
+                    "coverage_gaps": (
+                        ((result.get("static_analysis") or {}).get("coverage") or {})
+                        .get("possible_gaps", [])
+                    ),
                 },
             )
 
         if check_name == "anti_frida":
             raw_vulnerable = result.get("vulnerable")
             app_detection = result.get("app_detection") or {}
+            static_analysis = result.get("static_analysis") or {}
             # O conjunto de chaves do resumo é o mesmo em todos os status:
             # um consumidor não pode falhar com KeyError justamente nos
             # casos inconclusivos.
@@ -173,7 +186,21 @@ class Reporter:
                 "detection_signals": list(
                     app_detection.get("detection_methods_found") or []
                 )[:6],
+                "protection_detected": bool(result.get("protection_detected")),
+                "static_present": bool(static_analysis.get("present")),
+                "static_engine": static_analysis.get("engine"),
+                "protection_sources": list(result.get("protection_sources") or []),
+                "coverage_gaps": (
+                    (static_analysis.get("coverage") or {}).get("possible_gaps", [])
+                ),
             }
+            if result.get("verdict_reason"):
+                summary["verdict_reason"] = result.get("verdict_reason")
+            # N/A explícito: não havia proteção no APK nem detecção em
+            # runtime, então não existe "bypass vencedor" a reportar.
+            if str(result.get("status_hint") or "").upper() == "N/A":
+                summary["reason"] = result.get("verdict_reason") or "sem proteção"
+                return "N/A", summary
             if raw_vulnerable is None:
                 # Observação inconclusiva (crash da instrumentação, morte no
                 # baseline, script que não carregou) não é OK nem FALHOU.
@@ -193,6 +220,11 @@ class Reporter:
                 "bypass_successful": bypass,
                 "device_is_emulator": bool(result.get("device_is_emulator")),
                 "protection_sources": Reporter._protection_sources(result),
+                "static_engine": (result.get("static_analysis") or {}).get("engine"),
+                "coverage_gaps": (
+                    ((result.get("static_analysis") or {}).get("coverage") or {})
+                    .get("possible_gaps", [])
+                ),
             }
             if result.get("probe_method"):
                 summary["probe_method"] = result.get("probe_method")
@@ -227,6 +259,11 @@ class Reporter:
                 "bypass_successful": bypass,
                 "hook_frameworks_present": bool(result.get("hook_frameworks_present")),
                 "protection_sources": Reporter._protection_sources(result),
+                "static_engine": (result.get("static_analysis") or {}).get("engine"),
+                "coverage_gaps": (
+                    ((result.get("static_analysis") or {}).get("coverage") or {})
+                    .get("possible_gaps", [])
+                ),
             }
             if result.get("bypass_method"):
                 summary["bypass_method"] = result.get("bypass_method")
@@ -268,6 +305,11 @@ class Reporter:
                     bypass_details.get("intercepted_hosts") or []
                 )[:8],
                 "evidence_strength": bypass_details.get("evidence_strength"),
+                "static_engine": (result.get("static_analysis") or {}).get("engine"),
+                "coverage_gaps": (
+                    ((result.get("static_analysis") or {}).get("coverage") or {})
+                    .get("possible_gaps", [])
+                ),
             }
             blocked = bool((result.get("bypass_details") or {}).get("blocked"))
             if blocked:

@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, Optional
 
+from checks.static import vector_view
 from checks.stealth import load_stealth, unload_stealth
 from logcat_analyzer import (
     HIGH_CONFIDENCE_CATEGORIES,
@@ -1070,6 +1071,7 @@ class AntiFridaCheck:
         package_name: Optional[str] = None,
         logcat_mark: Optional[int] = None,
         app_detection: Optional[dict] = None,
+        static_profile: Optional[dict] = None,
     ) -> dict:
         """Consolida presença de Frida e capacidade de detecção do app.
 
@@ -1087,11 +1089,16 @@ class AntiFridaCheck:
             window: Janela de observação em segundos.
             package_name: Package name do alvo (para logcat).
             logcat_mark: Marcador de logcat tirado antes do spawn.
+            app_detection: Observação pré-calculada (opcional).
+            static_profile: Perfil estático do APK (opcional). Quando
+                disponível, distingue "app sem proteção anti-Frida" de
+                "proteção existe, mas não foi observada".
 
         Returns:
             Dict com ``vulnerable`` (bool|None), ``frida_present``,
             ``checks`` (por vetor), ``app_detection`` (dict),
-            ``baseline`` e ``timestamp`` (ISO8601).
+            ``static_detection``, ``protection_detected``,
+            ``status_hint``, ``baseline`` e ``timestamp`` (ISO8601).
         """
         # Observação primeiro: o app está suspenso desde o spawn. Instalar
         # os hooks nativos e retomar o quanto antes evita o start timeout
@@ -1123,6 +1130,87 @@ class AntiFridaCheck:
         frida_present = any(res.get("detected") for res in checks.values())
         vulnerable = app_detection.get("vulnerable")
 
+        # A análise estática responde "o APK contém checagem anti-Frida?".
+        # Sem ela, o veredito antigo dizia "bypass venceu" para qualquer
+        # app que não reagisse ao Frida — inclusive apps sem proteção.
+        static_view = vector_view(static_profile, "frida")
+        static_confidence = (static_view or {}).get("confidence")
+        # Achados genéricos (ex: string "frida" em um nome de classe ou em
+        # texto de UI) não bastam para afirmar que existe proteção anti-Frida.
+        # Só evidência de alta confiança entra no veredito; medium/low fica
+        # como contexto no relatório.
+        static_present = bool(
+            static_view
+            and static_view.get("present")
+            and static_confidence == "high"
+        )
+        detected_by_app = bool(app_detection.get("detected")) or (
+            app_detection.get("vulnerable") is False
+        )
+        protection_detected = static_present or detected_by_app
+        protection_sources = []
+        if static_present:
+            protection_sources.append("static_apk")
+        if detected_by_app:
+            protection_sources.append("dynamic")
+
+        status_hint = None
+        verdict_reason = None
+        # Consistência: se o app executou uma checagem, a proteção
+        # funcionou mesmo que um resultado pré-calculado diga o contrário.
+        if detected_by_app and vulnerable is not None:
+            vulnerable = False
+        if vulnerable is True and not detected_by_app:
+            if static_view is not None:
+                if static_present:
+                    verdict_reason = (
+                        "proteção anti-Frida identificada no APK, mas o app "
+                        "não reagiu na janela de observação"
+                    )
+                else:
+                    # Nenhuma proteção no APK e nenhuma reação em runtime:
+                    # não houve bypass a vencer. N/A é mais honesto que
+                    # FALHOU (que significa "a proteção resistiu mal").
+                    vulnerable = None
+                    status_hint = "N/A"
+                    verdict_reason = (
+                        "nenhuma proteção anti-Frida identificada no APK e "
+                        "nenhuma detecção observada em runtime"
+                    )
+
+        static_detection = {
+            "static_detected": static_present,
+            "available": static_view is not None,
+            "confidence": (static_view or {}).get("confidence"),
+            "types": sorted(
+                {
+                    item.get("kind")
+                    for item in (static_view or {}).get("findings", [])
+                    if item.get("kind")
+                }
+            ),
+            "evidence": [
+                item.get("evidence")
+                for item in (static_view or {}).get("findings", [])
+                if item.get("evidence")
+            ],
+            "details": (
+                "assinaturas/classes anti-Frida no APK"
+                if static_present
+                else (
+                    "apenas indícios de baixa/média confiança (não usados no veredito)"
+                    if (static_view or {}).get("present")
+                    else (
+                        "nenhuma assinatura anti-Frida no APK"
+                        if static_view is not None
+                        else "análise estática não executada"
+                    )
+                )
+            ),
+        }
+        if static_view is not None:
+            static_detection["asc"] = static_view
+
         result = {
             "vulnerable": vulnerable,
             "frida_present": frida_present,
@@ -1133,10 +1221,24 @@ class AntiFridaCheck:
             "frida_pid": pid,
             "checks": checks,
             "app_detection": app_detection,
+            "static_detection": static_detection,
+            "protection_detected": protection_detected,
+            "protection_sources": protection_sources,
+            "status_hint": status_hint,
+            "verdict_reason": verdict_reason,
             "baseline": app_detection.get("baseline"),
             "timestamp": _now_iso(),
         }
-        if app_detection.get("error"):
+        if static_view is not None:
+            result["static_analysis"] = {
+                "engine": static_view.get("engine"),
+                "version": static_view.get("version"),
+                "vector": "frida",
+                "present": static_present,
+                "confidence": static_view.get("confidence"),
+                "coverage": static_view.get("coverage"),
+            }
+        if app_detection.get("error") and status_hint is None:
             result["error"] = str(app_detection["error"])
         logger.info(
             "Anti-Frida: vulnerable=%s frida_present=%s status=%s",

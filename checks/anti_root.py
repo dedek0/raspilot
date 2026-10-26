@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
+
+from checks.static import vector_view
 
 if TYPE_CHECKING:  # evita import circular em tempo de importação
     from device_manager import DeviceManager
@@ -394,17 +396,25 @@ class AntiRootCheck:
     # ------------------------------------------------------------------
     # Consolidação
     # ------------------------------------------------------------------
-    def run_all(self) -> dict:
+    def run_all(self, static_profile: Optional[dict] = None) -> dict:
         """Executa todos os vetores anti-root e consolida o veredito.
 
         Consolidação: ``is_rooted=True`` se **qualquer** vetor positivo
         (exceto evidências "informativas" como bootloader). Confiança:
         ``high`` (>= 2 vetores), ``medium`` (1), ``low`` (0).
 
+        O perfil estático é **informativo**: ele responde se o app tem
+        código de detecção de root, mas o veredito ``is_rooted`` continua
+        medindo o dispositivo. Misturar os dois faria um device limpo
+        parecer rooteado só porque o app sabe detectar root.
+
+        Args:
+            static_profile: Perfil estático do APK (opcional).
+
         Returns:
             Dict com ``is_rooted`` (bool), ``confidence``
-            ('high'|'medium'|'low'), ``checks`` (dict por vetor) e
-            ``timestamp`` (ISO8601).
+            ('high'|'medium'|'low'), ``checks`` (dict por vetor),
+            ``app_root_detection`` e ``timestamp`` (ISO8601).
         """
         checks = {
             "su_binaries": self.check_su_binaries(),
@@ -447,6 +457,27 @@ class AntiRootCheck:
             "checks": checks,
             "timestamp": _now_iso(),
         }
+        static_view = vector_view(static_profile, "root")
+        if static_view is not None:
+            app_root_detection = dict(static_view)
+            app_root_detection["detected"] = bool(static_view.get("present"))
+            app_root_detection["static_detected"] = bool(static_view.get("present"))
+            app_root_detection["details"] = (
+                "o APK referencia APIs/paths de detecção de root; "
+                "isto não altera o veredito do dispositivo"
+            )
+            result["app_root_detection"] = app_root_detection
+            result["static_analysis"] = {
+                "engine": static_view.get("engine"),
+                "version": static_view.get("version"),
+                "vector": "root",
+                "present": bool(static_view.get("present")),
+                "confidence": static_view.get("confidence"),
+                "coverage": static_view.get("coverage"),
+            }
+        else:
+            result["app_root_detection"] = None
+            result["static_analysis"] = None
         if not evaluated:
             result["error"] = (
                 "nenhum vetor anti-root pôde ser avaliado: "
