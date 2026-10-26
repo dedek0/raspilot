@@ -313,6 +313,7 @@ class TestRunAll:
         })
         dm = mock.MagicMock()
         dm.spawn_app.return_value = TestAttemptBypass._FakeSession([])
+        dm.last_spawn_pid = 42
         dm.is_app_alive.return_value = False
         dm.capture_death_cause.return_value = {
             "evidence": [], "signal": "SIGKILL", "summary": "SIGKILL",

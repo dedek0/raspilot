@@ -74,6 +74,76 @@ class TestAnalyzeLogcat:
         assert res["target_lines"] == ["10-16 10:00:00.000 1234 1234 I com.app : starting"]
 
 
+class TestPidScopedAttribution:
+    """Atribuição de linha por pid: instância residual não contamina a fase.
+
+    Uma instância anterior do mesmo app pode continuar rodando em
+    segundo plano (spawn anterior sem force-stop) e logar com o mesmo
+    package name. A linha dela tem pid de emissor diferente do alvo — e
+    não deve sustentar veredito da fase observada.
+    """
+
+    def test_stale_instance_line_is_not_attributed(self):
+        """Linha de outro processo do mesmo pacote não entra como evidência."""
+        lines = [
+            # instância residual (fase anterior) detectando frida
+            "10-16 10:00:01.000 4242 4242 I RASP: frida-server detected",
+            # instância observada na fase atual
+            "10-16 10:00:02.000 5678 5678 I RASP: frida-server detected",
+        ]
+        res = analyze_logcat(lines, package="com.app", pid=5678)
+        frida = [s for s in res["security_signals"] if s["category"] == "frida"]
+        assert frida, "a linha do processo observado deve ser mantida"
+        assert all(s["line"].split()[3] == "5678" for s in frida), frida
+
+    def test_stale_instance_death_is_not_attributed(self):
+        """Morte da instância residual não vira morte da fase atual."""
+        lines = [
+            "10-16 10:00:03.000 1520 1570 I ActivityManager: "
+            "Process com.app (pid 4242) has died",
+        ]
+        res = analyze_logcat(lines, package="com.app", pid=5678)
+        assert res["death"]["detected"] is False
+
+    def test_system_kill_of_target_pid_is_kept(self):
+        """am_kill do sistema citando o pid alvo continua sendo evidência."""
+        lines = [
+            "10-16 10:00:03.000 1520 1570 W ActivityManager: "
+            "Killing 5678:com.app/10008 (adj 0): root detected",
+        ]
+        res = analyze_logcat(lines, package="com.app", pid=5678)
+        assert res["death"]["detected"] is True
+
+    def test_message_of_target_pid_is_kept(self):
+        """Tombstone/exit do Zygote citando o pid alvo no corpo conta."""
+        lines = [
+            # emissor é o Zygote (1520), mas o corpo cita o pid alvo
+            "10-16 10:00:01.000 1520 1570 I Zygote  : Process 5678 exited "
+            "due to signal 9",
+        ]
+        res = analyze_logcat(lines, package="com.app", pid=5678)
+        assert res["death"]["detected"] is True
+        assert res["death"]["signal"] == "SIGKILL"
+
+    def test_app_own_line_without_pid_in_body_is_kept(self):
+        """Linha emitida pelo próprio processo alvo conta mesmo sem corpo."""
+        lines = [
+            "10-16 10:00:02.000 5678 5678 I SomeTag: running checks",
+        ]
+        res = analyze_logcat(lines, package="com.app", pid=5678)
+        assert res["target_lines"]
+
+    def test_without_pid_the_package_still_matches(self):
+        """Sem pid conhecido, o critério por pacote é mantido."""
+        lines = [
+            "10-16 10:00:01.000 4242 4242 I SecurityService: "
+            "com.app reports frida-server detected",
+        ]
+        res = analyze_logcat(lines, package="com.app")
+        assert any(s["category"] == "frida" for s in res["security_signals"])
+        assert res["target_lines"]
+
+
 class TestHelpers:
     """Helpers tolerantes a DeviceManager fake."""
 

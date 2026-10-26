@@ -270,8 +270,67 @@ def _clip(line: str) -> str:
     return clean[:MAX_LINE_LEN]
 
 
+# Pid do emissor na linha de logcat. O formato ``-v threadtime`` é
+# ``MM-DD HH:MM:SS.mmm PID TID LEVEL TAG: mensagem``.
+_LOGCAT_HEADER_PATTERN = re.compile(
+    r"^\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3}\s+(\d+)\s+\d+\s+[VDIWEF]"
+)
+
+
+def _line_log_pid(line: str) -> Optional[int]:
+    """Extrai o pid do processo **emissor** da linha de logcat.
+
+    O primeiro número da linha é o pid do processo que emitiu a linha,
+    e não um pid citado no corpo da mensagem.
+
+    Args:
+        line: Linha de logcat (normalizada por :func:`_clip`).
+
+    Returns:
+        Pid emissor, ou ``None`` quando o formato não permite extrair.
+    """
+    match = _LOGCAT_HEADER_PATTERN.match(line)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _pid_value(pid: object) -> Optional[int]:
+    """Normaliza o pid do alvo para inteiro quando possível.
+
+    Tolerante a valores inesperados (ex: mocks de teste): um pid não
+    parseável devolve ``None`` e a atribuição volta a usar o pacote.
+
+    Args:
+        pid: Valor recebido pela análise (int, str etc.).
+
+    Returns:
+        Inteiro correspondente, ou ``None`` se não for convertível.
+    """
+    if isinstance(pid, int) and not isinstance(pid, bool):
+        return pid
+    try:
+        return int(pid)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        try:
+            return int(str(pid))
+        except (TypeError, ValueError):
+            return None
+
+
 def _line_matches_target(line: str, package: Optional[str], pid: Optional[int]) -> bool:
-    """Verifica se a linha cita o pacote ou o pid alvo.
+    """Verifica se a linha atribuível ao alvo da análise.
+
+    Com ``pid`` conhecido, a menção ao pacote deixa de ser suficiente:
+    uma instância **residual** de execução anterior do mesmo app pode
+    estar rodando em segundo plano e logando com o mesmo package name —
+    e a linha dela não deve virar evidência da fase observada. Quando o
+    pid é conhecido:
+
+    - a linha emitida pelo próprio processo alvo conta;
+    - a linha emitida por outro processo só conta quando o **corpo**
+      cita explicitamente o pid alvo (``am_kill``, tombstone,
+      ``Process <pkg> (pid 1234) has died``).
 
     Args:
         line: Linha do logcat.
@@ -279,11 +338,23 @@ def _line_matches_target(line: str, package: Optional[str], pid: Optional[int]) 
         pid: PID do processo (opcional).
 
     Returns:
-        True se houver menção ao alvo.
+        True se a linha é atribuível ao alvo.
     """
     if package and package in line:
-        return True
-    if pid is not None and re.search(rf"\b{int(pid)}\b", line):
+        target = _pid_value(pid)
+        if pid is None or target is None:
+            # Sem pid parseável: volta ao critério por pacote.
+            return True
+        emitter = _line_log_pid(line)
+        if emitter is None or emitter == target:
+            # Emitida pelo próprio processo alvo (ou formato sem pid de
+            # emissor): a menção ao pacote basta.
+            return True
+        # Emitida por OUTRO processo: só é do alvo se o corpo citar o
+        # pid (kill/crash/tombstone do processo observado).
+        return re.search(rf"\b{target}\b", line) is not None
+    target = _pid_value(pid)
+    if target is not None and re.search(rf"\b{target}\b", line):
         return True
     return False
 

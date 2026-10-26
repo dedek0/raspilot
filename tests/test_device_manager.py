@@ -527,6 +527,64 @@ class TestBaseline:
         assert res["death_cause"]["signal"] == "SIGSEGV"
 
 
+class TestSpawnIsolation:
+    """Isolamento explícito entre fases: spawn começa em processo fresco."""
+
+    def test_spawn_app_force_stops_residual_instance(self):
+        """O spawn encerra instâncias residuais ANTES de spawnar.
+
+        O frida-server evicta o processo anterior no spawn, mas isso é
+        comportamento implícito: o force-stop explícito garante que a
+        fase nova comece em um processo fresco e que o app residual não
+        fique logando no segundo plano durante a fase seguinte.
+        """
+        dm = DeviceManager()
+        events = []
+
+        fake_device = mock.MagicMock()
+
+        def fake_spawn(args):
+            events.append(("spawn", args))
+            return 4321
+
+        fake_device.spawn.side_effect = fake_spawn
+
+        def fake_shell(command, timeout=20):
+            events.append(("shell", command))
+            return {"ok": True, "rc": 0, "stdout": "", "stderr": ""}
+
+        with mock.patch.object(dm, "_require_frida"), \
+             mock.patch.object(dm, "_frida_device", return_value=fake_device), \
+             mock.patch.object(dm, "run_shell", side_effect=fake_shell), \
+             mock.patch.object(
+                 dm, "resume_app", side_effect=lambda: events.append(("resume",))
+             ), \
+             mock.patch("device_manager.time.sleep"):
+            dm.spawn_app("com.app", resume=True)
+
+        fake_device.spawn.assert_called_once_with(["com.app"])
+        fake_device.resume.assert_called_once_with(4321)
+        assert ("shell", "am force-stop com.app") in events
+        # O force-stop acontece antes do spawn e da retomada do processo novo.
+        force_stop_index = events.index(("shell", "am force-stop com.app"))
+        spawn_index = events.index(("spawn", ["com.app"]))
+        assert force_stop_index < spawn_index
+
+    def test_spawn_force_stop_failure_does_not_propagate(self):
+        """Falha no force-stop (app inexistente) não interrompe o spawn."""
+        dm = DeviceManager()
+        fake_device = mock.MagicMock()
+        fake_device.spawn.return_value = 77
+        with mock.patch.object(dm, "_require_frida"), \
+             mock.patch.object(dm, "_frida_device", return_value=fake_device), \
+             mock.patch.object(dm, "run_shell", return_value={
+                 "ok": False, "rc": 1, "stdout": "", "stderr": "not found"
+             }), \
+             mock.patch("device_manager.time.sleep"):
+            session = dm.spawn_app("com.app")
+        assert session is fake_device.attach.return_value
+
+
 class TestAppReady:
     """Espera pelo app ficar em foco antes de carregar a camada Java."""
 

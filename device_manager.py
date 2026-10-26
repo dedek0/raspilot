@@ -1138,6 +1138,17 @@ class DeviceManager:
         # Nunca deixar um spawn anterior suspenso ao iniciar outro.
         self.resume_app()
 
+        # Isolamento explícito entre fases: encerra qualquer instância
+        # residual do app antes de espawnar, para que a fase comece sempre
+        # em um processo fresco. Sem isso, o isolamento dependia de o
+        # frida-server evictar o processo anterior no spawn — um
+        # comportamento implícito da ferramenta, não garantido por
+        # contrato; o processo residual ainda rodava em segundo plano
+        # entre a fase anterior e o spawn novo, logando com o mesmo
+        # package name e podendo contaminar a fase seguinte.
+        self.run_shell(f"am force-stop {package_name}", timeout=10)
+        time.sleep(0.5)
+
         pid = None
         try:
             pid = device.spawn([package_name])
