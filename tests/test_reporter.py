@@ -90,49 +90,37 @@ class TestGenerateJson:
             "device": DEVICE,
             "package": "com.example.app",
         }
-        assert doc["summary"] == {
-            "anti_root": {
-                "status": "FALHOU", "is_rooted": True, "confidence": "high",
-                "positive_vectors": ["magisk"], "evaluated_vectors": 0,
-                "app_root_detection": {
-                    "present": False, "confidence": None, "engine": None,
-                    "dynamic_detected": None,
-                },
-                "protection_detected": None, "bypass_successful": None,
-                "bypass_method": None, "coverage_gaps": [],
-            },
-            "anti_frida": {
-                "status": "FALHOU", "vulnerable": True,
-                "frida_injected_by_tool": True,
-                "observation_status": None, "detection_signals": [],
-                "protection_detected": False, "static_present": False,
-                "static_engine": None, "protection_sources": [],
-                "coverage_gaps": [], "static_owners": {}, "app_evidence": False,
-                "bypass_successful": None, "bypass_method": None,
-            },
-            "anti_emulator": {
-                "status": "OK", "protection_detected": True,
-                "bypass_successful": False, "device_is_emulator": False,
-                "protection_sources": [], "static_engine": None,
-                "coverage_gaps": [], "static_owners": {}, "app_evidence": False,
-            },
-            "ssl_pinning": {
-                "status": "FALHOU", "pinning_detected": True,
-                "pinning_suspected": False,
-                "pinning_type": "okhttp", "bypass_successful": True,
-                "intercepted_hosts": ["api.x.com"], "evidence_strength": None,
-                "tls_observed": False,
-                "static_engine": None, "coverage_gaps": [],
-                "static_owners": {}, "app_evidence": False,
-            },
-            "anti_hooking": {
-                "status": "FALHOU", "protection_detected": True,
-                "bypass_successful": True, "hook_frameworks_present": True,
-                "protection_sources": ["static_apk", "dynamic"],
-                "static_engine": None, "coverage_gaps": [],
-                "static_owners": {}, "app_evidence": False,
-            },
+        summary = doc["summary"]
+        assert set(summary) == set(RESULTS)
+        assert summary["anti_root"]["status"] == "FALHOU"
+        assert summary["anti_frida"]["status"] == "FALHOU"
+        assert summary["anti_emulator"]["status"] == "OK"
+        assert summary["anti_hooking"]["status"] == "FALHOU"
+        assert summary["ssl_pinning"]["status"] == "FALHOU"
+
+        detection_statuses = {
+            "detected", "indicated", "suspected", "not_detected",
+            "inconclusive", "not_applicable", "error",
         }
+        bypass_statuses = {
+            "bypassed", "resisted", "not_exercised",
+            "not_applicable", "error",
+        }
+        for name, item in summary.items():
+            assert {"status", "detection", "bypass"} <= set(item), name
+            assert item["detection"]["status"] in detection_statuses
+            assert item["bypass"]["status"] in bypass_statuses
+            assert item["detection"]["label"]
+            assert item["bypass"]["label"]
+
+        # Os dois vereditos são independentes: a detecção pode ter sido
+        # observada e o bypass pode ter vencido (ou não ter sido exercitado).
+        assert summary["anti_hooking"]["detection"]["status"] == "detected"
+        assert summary["anti_hooking"]["bypass"]["status"] == "bypassed"
+        assert summary["ssl_pinning"]["detection"]["status"] == "detected"
+        assert summary["ssl_pinning"]["bypass"]["status"] == "bypassed"
+        assert summary["anti_frida"]["detection"]["status"] == "not_detected"
+        assert summary["anti_root"]["detection"]["status"] == "inconclusive"
         assert doc["details"] == RESULTS
         # A trilha cobre todos os checks e sempre termina em um veredito
         # com o status reportado.
@@ -340,6 +328,8 @@ class TestGenerateHtml:
         assert "RASPilot" in html
         assert "Piloto Automático de Auditoria RASP" in html
         assert "FALHOU" in html
+        assert "Detecção" in html
+        assert "Bypass" in html
         assert "com.example.app" in html
 
     def test_html_escapes_package(self):

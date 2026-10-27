@@ -25,7 +25,7 @@ from execution_log import build_execution_log
 # Versão do schema do documento JSON. Incrementada quando a forma do
 # relatório muda de modo incompatível, para que um consumidor possa
 # detectar a mudança em vez de interpretar campos ausentes.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 logger = logging.getLogger("raspilot.reporter")
 
@@ -95,6 +95,211 @@ class Reporter:
     # ------------------------------------------------------------------
     # Semântica de status
     # ------------------------------------------------------------------
+    @staticmethod
+    def _verdict(status: str, label: str, detail: str = "", **extra: Any) -> dict:
+        """Monta um veredito de detecção ou bypass."""
+        verdict = {"status": status, "label": label, "detail": detail or None}
+        verdict.update(extra)
+        return verdict
+
+    @classmethod
+    def _dual_verdicts(
+        cls, check_name: str, result: dict, status: str
+    ) -> Tuple[dict, dict]:
+        """Deriva os dois vereditos de um check.
+
+        ``detection`` responde se a proteção foi observada/identificada.
+        ``bypass`` responde se a evasão venceu, resistiu ou não foi
+        exercitada. O ``status`` geral continua sendo a consolidação para
+        compatibilidade com consumidores antigos.
+        """
+        if result.get("skipped"):
+            return (
+                cls._verdict("not_applicable", "Não aplicável", "check pulado"),
+                cls._verdict("not_applicable", "Não aplicável", "check pulado"),
+            )
+
+        detection = cls._verdict("inconclusive", "Inconclusivo")
+        bypass = cls._verdict("not_exercised", "Não exercitado")
+
+        if check_name == "anti_frida":
+            app = result.get("app_detection") or {}
+            static = result.get("static_analysis") or {}
+            signals = list(app.get("detection_methods_found") or [])
+            vulnerable = result.get("vulnerable")
+            static_present = bool(static.get("present"))
+            if signals or app.get("detected") or vulnerable is False:
+                detection = cls._verdict(
+                    "detected", "Detectado",
+                    app.get("details") or "o app executou detecção de Frida",
+                    sources=list(result.get("protection_sources") or []),
+                )
+            elif static_present:
+                detection = cls._verdict(
+                    "indicated", "Indicado (estático)",
+                    "há referências anti-Frida no APK, mas sem detecção dinâmica",
+                    sources=["static"],
+                )
+            elif vulnerable is True:
+                detection = cls._verdict(
+                    "not_detected", "Não detectado",
+                    "o app não reagiu ao Frida na janela",
+                )
+            else:
+                detection = cls._verdict(
+                    "inconclusive", "Inconclusivo",
+                    app.get("error") or "observação sem conclusão",
+                )
+            protection = bool(result.get("protection_detected"))
+            bypass = cls._bypass_verdict(
+                result, protection, result.get("bypass_skipped_reason")
+            )
+            return detection, bypass
+
+        if check_name == "anti_root":
+            app = result.get("app_detection") or {}
+            module = result.get("module_detection") or {}
+            static = result.get("static_analysis") or {}
+            dynamic = bool(
+                app.get("detected")
+                or module.get("detected")
+                or (result.get("app_root_detection") or {}).get("dynamic_detected")
+            )
+            sources = []
+            if static.get("present"):
+                sources.append("static")
+            if module.get("detected"):
+                sources.append("module")
+            if app.get("detected"):
+                sources.append("dynamic")
+            if dynamic:
+                detection = cls._verdict(
+                    "detected", "Detectado",
+                    app.get("details") or module.get("details")
+                    or "o app executou checagens de root",
+                    sources=sources,
+                )
+            elif static.get("present"):
+                detection = cls._verdict(
+                    "indicated", "Indicado (estático)",
+                    "há referências de root no APK, sem checagem dinâmica",
+                    sources=sources,
+                )
+            elif result.get("protection_detected") is False:
+                detection = cls._verdict(
+                    "not_detected", "Não detectado",
+                    "nenhuma referência ou checagem de root observada",
+                )
+            else:
+                detection = cls._verdict(
+                    "inconclusive", "Inconclusivo",
+                    app.get("error") or "análise de root sem conclusão",
+                )
+            bypass = cls._bypass_verdict(
+                result, bool(result.get("protection_detected")),
+                result.get("bypass_skipped_reason"),
+            )
+            return detection, bypass
+
+        if check_name in ("anti_hooking", "anti_emulator"):
+            app = result.get("app_detection") or {}
+            static = result.get("static_detection") or {}
+            static_present = bool(static.get("static_detected"))
+            dynamic = bool(app.get("detected"))
+            observation = str(app.get("observation_status") or "")
+            if dynamic:
+                detection = cls._verdict(
+                    "detected", "Detectado",
+                    app.get("details") or "checagem observada em runtime",
+                    sources=list(Reporter._protection_sources(result)),
+                )
+            elif static_present:
+                detection = cls._verdict(
+                    "indicated", "Indicado (estático)",
+                    static.get("details") or "assinaturas no APK",
+                    sources=["static"],
+                )
+            elif result.get("protection_detected"):
+                detection = cls._verdict(
+                    "indicated", "Indicado",
+                    "proteção identificada por uma fonte sem detalhe dinâmico",
+                    sources=list(Reporter._protection_sources(result)),
+                )
+            elif app.get("error") or observation in (
+                "error", "crashed", "start_timeout", "native_only",
+                "inconclusive", "baseline_death", "unattributed_death",
+            ):
+                detection = cls._verdict(
+                    "inconclusive", "Inconclusivo",
+                    app.get("error") or observation or "observação sem conclusão",
+                )
+            else:
+                detection = cls._verdict(
+                    "not_detected", "Não detectado",
+                    "nenhuma checagem observada",
+                )
+            bypass = cls._bypass_verdict(
+                result, bool(result.get("protection_detected")),
+                result.get("bypass_skipped_reason"),
+            )
+            return detection, bypass
+
+        if check_name == "ssl_pinning":
+            static = result.get("static_analysis") or {}
+            pinned = bool(result.get("pinning_detected"))
+            suspected = bool(result.get("pinning_suspected"))
+            if pinned:
+                detection = cls._verdict(
+                    "detected", "Detectado",
+                    f"pinning do tipo {result.get('pinning_type') or 'n/a'}",
+                    sources=["static"],
+                )
+            elif suspected:
+                detection = cls._verdict(
+                    "suspected", "Suspeito / não confirmado",
+                    "há indícios fracos, mas o pinning não foi confirmado",
+                    sources=["static"],
+                )
+            elif static.get("present") is False:
+                detection = cls._verdict(
+                    "not_detected", "Não detectado",
+                    "nenhuma assinatura de pinning no APK",
+                )
+            else:
+                detection = cls._verdict(
+                    "inconclusive", "Inconclusivo",
+                    result.get("error") or "análise de pinning sem conclusão",
+                )
+            bypass = cls._bypass_verdict(
+                result, bool(pinned or suspected),
+                result.get("bypass_skipped_reason"),
+            )
+            return detection, bypass
+
+        return detection, bypass
+
+    @classmethod
+    def _bypass_verdict(cls, result: dict, protection: bool, reason: Any) -> dict:
+        success = result.get("bypass_successful")
+        method = result.get("bypass_method")
+        detail = str(reason or result.get("verdict_reason") or "")
+        if success is True:
+            return cls._verdict(
+                "bypassed", "Bypass venceu", detail, method=method
+            )
+        if success is False:
+            return cls._verdict(
+                "resisted", "Proteção resistiu", detail, method=method
+            )
+        if protection:
+            return cls._verdict(
+                "not_exercised", "Não exercitado", detail or "bypass não avaliado",
+                method=method,
+            )
+        return cls._verdict(
+            "not_applicable", "Não aplicável", "sem proteção a ser contornada"
+        )
+
     @staticmethod
     def _protection_sources(result: dict) -> list:
         """Lista de onde veio a evidência de proteção do app.
@@ -387,7 +592,13 @@ class Reporter:
         for check_name, result in self._results.items():
             status, resumo = self._status_for(check_name, result)
             resumo["status"] = status
-            summary[check_name] = resumo
+            detection, bypass = self._dual_verdicts(check_name, result, status)
+            summary[check_name] = {
+                "status": status,
+                "detection": detection,
+                "bypass": bypass,
+                **{key: value for key, value in resumo.items() if key != "status"},
+            }
 
         # Ordem estável: os checks dinâmicos podem ser executados fora
         # da ordem canônica (o anti-emulador faz spawns próprios), mas o

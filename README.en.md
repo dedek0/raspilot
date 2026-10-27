@@ -149,6 +149,23 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--avd-name NAME` | no | AVD name, overriding the configuration |
 | `--avd-check` | no | Validate the emulated environment and show what is missing (no audit) |
 
+### Default mode
+
+Without explicit flags RASPilot runs with:
+
+- `--mode bypass` — observe and attempt evasion;
+- `--static-engine auto` — ASC when installed, otherwise byte scan;
+- `--hook-method auto` / `--emulator-method auto` — module when a
+  framework is available, otherwise Frida; anti-root follows the same
+  preference (module first, Frida fallback);
+- `--window 15` — observation window;
+- `--static-timeout 60` — per-ASC-query timeout.
+
+Anti-Frida bypass runs by default in `bypass` mode: it first measures
+detection, then opens a separate spawn with native evasion. The weak SSL
+probe uses a minimum 20s window and `uiautomator`/`monkey` navigation.
+To disable, use `--static-engine off` and/or `--skip`.
+
 ### Output
 
 - Terminal: colored **"RASPilot — Relatório de Auditoria RASP"** summary
@@ -156,9 +173,10 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
   what it found and the reported status)
 - `reports/<package>_<timestamp>.json` — structured document
   (`metadata`, `summary`, `execution_log`, `details`) for LLM/MCP
-  consumption
+  consumption. Each `summary` item has `status`, `detection` and `bypass`;
+  current schema is **5**.
 - `reports/<package>_<timestamp>.html` — visual report with status badges,
-  evidence and the same execution trace
+  the **Detection × Bypass** table, evidence and the same execution trace
 
 `execution_log` is a list of steps shaped as
 `{check, phase, action, outcome, details, evidence, reported_status}`.
@@ -208,6 +226,30 @@ Status semantics:
 > `bypass_successful` determine the app protection status; if the Java
 > bridge cannot load, the bypass is `SKIP` with the reason, without
 > claiming the app does not detect root.
+
+### Two verdicts per check
+
+Besides the consolidated `status`, every check publishes `detection` and
+`bypass`:
+
+| Field | Values | Meaning |
+|---|---|---|
+| `detection.status` | `detected` | protection observed at runtime |
+| | `indicated` | static indication, not dynamically confirmed |
+| | `suspected` | weak indication (e.g. weak SSL), unconfirmed |
+| | `not_detected` | no protection observed |
+| | `inconclusive` | observation did not conclude |
+| | `not_applicable` | check skipped/no target |
+| | `error` | analysis error |
+| `bypass.status` | `bypassed` | evasion won (RASP bypassed) |
+| | `resisted` | protection resisted evasion |
+| | `not_exercised` | protection existed, bypass was not exercised |
+| | `not_applicable` | no protection to bypass |
+| | `error` | bypass error |
+
+The Portuguese labels (`Detectado`, `Bypass venceu`, `Proteção
+resistiu`, `Não exercitado`, etc.) are for terminal/HTML display. JSON
+consumers should use the `status` values.
 
 > **Golden rule:** RASPilot only claims a protection held when there is
 > high-confidence evidence. Generic logcat terms (`root`, `hook`,
@@ -500,9 +542,14 @@ A **hooking module (APK)** swaps the instrument: instead of an injected
 agent, the device itself loads the hooking framework into the app process —
 exactly the environment the protection looks for. The module neutralises the
 app's queries and the auditor observes the result **without** leaving a
-trace of external injection. It is also what allows the anti-emulator check
-to run without instrumentation: the app sees an emulator while running
-normally.
+trace of external injection. It is also what allows the anti-emulator and
+anti-root checks to run without instrumentation: the app sees an
+emulator/root environment while running normally.
+
+The module has three configurable layers: `hook` (anti-hook), `root`
+(anti-root) and `emu` (anti-emulator). Anti-root uses `RootShield` to
+observe/neutralise RootBeer, `File`, `Runtime.exec`, `SystemProperties`
+and `PackageManager`.
 
 ### How it works
 
@@ -548,14 +595,25 @@ python main.py --package com.example.app --hook-method module
 
 # use an already compiled APK
 python main.py --package com.example.app --module-apk ./module.apk
+
+# the repository pre-built APK already includes RootShield
+ls instrumentation/build/raspilot-module.apk
 ```
+
+> `instrumentation/build/raspilot-module.apk` is generated locally (the
+> `build/` directory is gitignored) and already contains all three layers.
+> Older APKs without `RootShield` cannot be used for the root phase; use
+> the automatic build or regenerate with
+> `instrumentation/build.sh --root off` (the runtime enables
+> `root=observe`/`root=bypass` per phase).
 
 ### Coverage and limitations
 
 The module acts on the app's **Java layer**: `Build`, `SystemProperties`,
-`TelephonyManager`, `Settings.Secure` and `File.exists`. Checks written in
-native code (reading `/proc/self/maps`, string searches) are **not**
-covered — the module has no native component. The report records that
+`TelephonyManager`, `Settings.Secure`, `File.exists`, RootBeer and
+`PackageManager`. Checks written in native code (reading
+`/proc/self/maps`, string searches) are **not** covered by the module —
+the report records that
 limitation in `coverage` and lists the framework artifacts that stay visible
 in the target process.
 

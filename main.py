@@ -362,6 +362,8 @@ def print_summary_table(reporter: Reporter) -> None:
         header_style="bold",
     )
     table.add_column("Verificação", style="bold")
+    table.add_column("Detecção", justify="center")
+    table.add_column("Bypass", justify="center")
     table.add_column("Status", justify="center")
     table.add_column("Resumo")
 
@@ -372,13 +374,33 @@ def print_summary_table(reporter: Reporter) -> None:
         "N/A": "dim",
         "SKIP": "dim",
     }
+    color_by_detection = {
+        "detected": "yellow",
+        "indicated": "yellow",
+        "suspected": "yellow",
+        "not_detected": "dim",
+        "inconclusive": "dim",
+        "not_applicable": "dim",
+        "error": "magenta",
+    }
+    color_by_bypass = {
+        "bypassed": "red",
+        "resisted": "green",
+        "not_exercised": "dim",
+        "not_applicable": "dim",
+        "error": "magenta",
+    }
     for name, summary in doc["summary"].items():
         status = summary.get("status", "?")
         color = color_by_status.get(status, "white")
+        detection = summary.get("detection") or {}
+        bypass = summary.get("bypass") or {}
+        detection_status = detection.get("status", "?")
+        bypass_status = bypass.get("status", "?")
         key_bits = [
             f"{k}={escape(_format_summary_value(v))}"
             for k, v in summary.items()
-            if k not in ("status", "skipped")
+            if k not in ("status", "skipped", "detection", "bypass")
             and v is not None
             and v != []
             and v != {}
@@ -386,6 +408,10 @@ def print_summary_table(reporter: Reporter) -> None:
         ]
         table.add_row(
             escape(name),
+            f"[{color_by_detection.get(detection_status, 'white')}]"
+            f"{escape(str(detection.get('label') or detection_status))}[/]",
+            f"[{color_by_bypass.get(bypass_status, 'white')}]"
+            f"{escape(str(bypass.get('label') or bypass_status))}[/]",
             f"[{color}]{status}[/{color}]",
             ", ".join(key_bits) or "—",
         )

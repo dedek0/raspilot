@@ -63,6 +63,22 @@
   .badge.error { background: var(--error-bg); color: var(--error); }
   .badge.na { background: var(--na-bg); color: var(--na); }
   .badge.skip { background: var(--na-bg); color: var(--na); }
+  .verdict-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 700; margin: 2px 4px 2px 0;
+  }
+  .verdict-detected, .verdict-indicated, .verdict-suspected {
+    background: var(--warn-bg); color: var(--warn);
+  }
+  .verdict-not_detected, .verdict-inconclusive, .verdict-not_exercised,
+  .verdict-not_applicable {
+    background: var(--na-bg); color: var(--na);
+  }
+  .verdict-bypassed { background: var(--fail-bg); color: var(--fail); }
+  .verdict-resisted { background: var(--ok-bg); color: var(--ok); }
+  .verdict-error { background: var(--error-bg); color: var(--error); }
+  .verdict-table td, .verdict-table th { font-size: 12px; }
+  .verdict-table .label { font-weight: 600; }
   .summary-card ul { margin: 8px 0 0; padding-left: 18px; font-size: 13px; color: var(--muted); }
   .outcome { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 700; }
   .outcome.ok, .outcome.success, .outcome.failed { color: var(--fail); }
@@ -108,15 +124,42 @@
     <strong>FALHOU</strong> = o bypass venceu ·
     <strong>N/A</strong> = não aplicável ·
     <strong>SKIP</strong> = pulado via --skip ·
-    <strong>ERROR</strong> = verificação não executou
+    <strong>ERROR</strong> = verificação não executou.
+    Cada check tem dois vereditos: <strong>detecção</strong> (a proteção
+    foi vista?) e <strong>bypass</strong> (a evasão venceu?).
   </p>
+  <table class="verdict-table">
+    <thead>
+      <tr><th>Check</th><th>Detecção</th><th>Bypass</th><th>Status geral</th></tr>
+    </thead>
+    <tbody>
+      {% for name, s in summary.items() %}
+      <tr>
+        <td><strong>{{ name }}</strong></td>
+        <td>
+          <span class="verdict-badge verdict-{{ s.detection.status }}">{{ s.detection.label }}</span>
+          {% if s.detection.detail %}<div class="evidence">{{ s.detection.detail }}</div>{% endif %}
+        </td>
+        <td>
+          <span class="verdict-badge verdict-{{ s.bypass.status }}">{{ s.bypass.label }}</span>
+          {% if s.bypass.detail %}<div class="evidence">{{ s.bypass.detail }}</div>{% endif %}
+        </td>
+        <td><span class="badge {{ 'falhou' if s.status == 'FALHOU' else s.status | lower }}">{{ s.status }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
   <div class="summary-grid">
     {% for name, s in summary.items() %}
     {% set cls = s.status | lower %}
     <div class="summary-card {{ 'falhou' if s.status == 'FALHOU' else cls }}">
       <h3>{{ name }} <span class="badge {{ 'falhou' if s.status == 'FALHOU' else cls }}">{{ s.status }}</span></h3>
+      <div>
+        <span class="verdict-badge verdict-{{ s.detection.status }}">Detecção: {{ s.detection.label }}</span>
+        <span class="verdict-badge verdict-{{ s.bypass.status }}">Bypass: {{ s.bypass.label }}</span>
+      </div>
       <ul>
-        {% for k, v in s.items() if k != 'status' %}
+        {% for k, v in s.items() if k not in ('status', 'detection', 'bypass') %}
         <li><strong>{{ k }}:</strong>
           {% if v is iterable and v is not string %}
             {{ v | join('; ') if v else '—' }}
