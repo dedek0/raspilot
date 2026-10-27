@@ -130,6 +130,10 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--device-id` | no | ADB serial (e.g. `emulator-5554`) |
 | `--wifi HOST:PORT` | no | Address for `adb connect` |
 | `--output-dir` | no | Reports directory (default `reports/`) |
+| `--stage STAGE` | no | `full` (default), `static` (APK only, no Frida), `detect` (detection only, no bypass) or `bypass` (detection + bypass) |
+| `--only CHECK` | no | Run only the given check; repeatable. E.g. `--only anti_frida --only anti_root` |
+| `--apk PATH` | no | Local target APK (skips `adb pull`); required for `--stage static` without a device |
+| `--json-only` | no | Write only JSON, no HTML (automation/MCP) |
 | `--window SECS` | no | Observation window in seconds for dynamic checks (default `15`) |
 | `--baseline-window SECS` | no | Uninstrumented baseline window (default `5`) |
 | `--no-baseline` | no | Skip the uninstrumented baseline |
@@ -165,6 +169,33 @@ Anti-Frida bypass runs by default in `bypass` mode: it first measures
 detection, then opens a separate spawn with native evasion. The weak SSL
 probe uses a minimum 20s window and `uiautomator`/`monkey` navigation.
 To disable, use `--static-engine off` and/or `--skip`.
+
+### Staged analysis
+
+To split the audit into phases:
+
+```bash
+# 1) static profile only; no Frida, no device needed
+python main.py --package com.example.app \
+    --apk ./app.apk --stage static --output-dir reports/stages
+
+# 2) dynamic detection only, no bypass
+python main.py --package com.example.app --stage detect
+
+# 3) detection + bypass (full behavior)
+python main.py --package com.example.app --stage bypass
+
+# 4) a single check
+python main.py --package com.example.app --stage detect --only anti_frida
+
+# 5) automation/MCP: JSON only, no HTML
+python main.py --package com.example.app --json-only
+```
+
+`--stage static` writes its own JSON (`..._static.json`) with `metadata`
+and `static_profile`. `--stage detect` forces `--mode detect`. `--only`
+is an allow-list; the other checks appear as `SKIP`. Persistent
+session/state across stages belongs to the next roadmap phase.
 
 ### Output
 

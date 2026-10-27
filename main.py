@@ -16,11 +16,13 @@ Uso básico::
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import signal
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
 from rich.console import Console
@@ -42,7 +44,7 @@ from device_manager import (
     DeviceManager,
     FridaSetupError,
 )
-from reporter import Reporter
+from reporter import Reporter, SCHEMA_VERSION
 from script_loader import safe_detach, set_js_runtime
 from instrumentation import XposedManager
 
@@ -111,6 +113,40 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         default="reports/",
         help="Diretório onde salvar os relatórios",
+    )
+    parser.add_argument(
+        "--stage",
+        choices=("full", "static", "detect", "bypass"),
+        default="full",
+        help=(
+            "Etapa da análise: full=completo (default); static=só perfil "
+            "do APK, sem Frida/spawn; detect=só detecção, sem bypass; "
+            "bypass=detecção+bypass"
+        ),
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        choices=KNOWN_CHECKS,
+        metavar="CHECK",
+        help=(
+            "Roda apenas o(s) check(s) informado(s); pode repetir. "
+            "Alternativa explícita ao --skip."
+        ),
+    )
+    parser.add_argument(
+        "--apk",
+        default=None,
+        metavar="PATH",
+        help=(
+            "APK local do alvo (pula o adb pull). Útil para --stage static "
+            "e para análises sem app instalado."
+        ),
+    )
+    parser.add_argument(
+        "--json-only",
+        action="store_true",
+        help="Gera apenas o JSON (sem HTML), útil para automação/MCP",
     )
     parser.add_argument(
         "--verbose",
@@ -549,6 +585,10 @@ def _build_run_context(args: argparse.Namespace, dm: "DeviceManager") -> dict:
             "module_apk": getattr(args, "module_apk", None),
             "static_engine": getattr(args, "static_engine", "auto"),
             "static_timeout": getattr(args, "static_timeout", 60.0),
+            "stage": getattr(args, "stage", "full"),
+            "only": list(getattr(args, "only", None) or []),
+            "apk": getattr(args, "apk", None),
+            "json_only": bool(getattr(args, "json_only", False)),
             "avd": {
                 "enabled": bool(getattr(args, "avd", False)),
                 "config_path": getattr(args, "avd_config", None),
@@ -639,6 +679,90 @@ def _activate_avd(args: argparse.Namespace) -> Optional[AvdManager]:
     return manager
 
 
+def run_static_stage(args: argparse.Namespace) -> int:
+    """Executa somente o perfil estático do APK.
+
+    Não sobe frida-server nem inicia o app. Se ``--apk`` for informado,
+    também não precisa de dispositivo conectado.
+
+    Args:
+        args: Argumentos da CLI.
+
+    Returns:
+        0 quando o perfil foi gerado; 1 quando o APK não pôde ser obtido.
+    """
+    logger = logging.getLogger("raspilot")
+    dm = None
+    info = {}
+    if not args.apk:
+        dm = DeviceManager(
+            device_id=args.device_id,
+            wifi_target=args.wifi,
+            verbose=args.verbose,
+        )
+        dm.connect_adb()
+        info = dm.get_device_info()
+        console.print("[green]✓[/] Dispositivo conectado para obter o APK")
+
+    with console.status("[cyan]Analisando o APK (estático)...[/]"):
+        profile = build_static_profile(
+            dm,
+            args.package,
+            apk_path=args.apk,
+            engine=getattr(args, "static_engine", "auto"),
+            timeout=getattr(args, "static_timeout", 60.0),
+        )
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    os.makedirs(args.output_dir, exist_ok=True)
+    base = f"{Reporter._slug(args.package)}_{stamp}_static"
+    path = os.path.abspath(os.path.join(args.output_dir, base + ".json"))
+    document = {
+        "metadata": {
+            "schema_version": SCHEMA_VERSION,
+            "tool_name": TOOL_NAME,
+            "tool_version": TOOL_VERSION,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "device": info,
+            "package": args.package,
+            "run": {
+                "stage": "static",
+                "static_engine": getattr(args, "static_engine", "auto"),
+                "static_timeout": getattr(args, "static_timeout", 60.0),
+                "apk": args.apk,
+            },
+        },
+        "static_profile": profile,
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(document, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+
+    summary = profile.get("summary") or {}
+    vectors = summary.get("vectors") or {}
+    table = Table(title="RASPilot — Análise estática", header_style="bold")
+    table.add_column("Vetor", style="bold")
+    table.add_column("Presente", justify="center")
+    table.add_column("Confiança", justify="center")
+    table.add_column("Achados", justify="right")
+    for name, item in vectors.items():
+        table.add_row(
+            name,
+            "sim" if item.get("present") else "não",
+            str(item.get("confidence") or "none"),
+            str(item.get("total") or 0),
+        )
+    console.print(table)
+    console.print(
+        f"[green]✓[/] Estático: engine={profile.get('engine')} "
+        f"classes={profile.get('classes_count') or 0} "
+        f"cached={bool(profile.get('cached'))}"
+    )
+    console.print(f"[green]✓[/] Perfil JSON: [bold]{path}[/]")
+    logger.info("Perfil estático salvo em %s", path)
+    return 0 if profile.get("available") else 1
+
+
 def run_pipeline(args: argparse.Namespace) -> int:
     """Executa o pipeline completo de auditoria RASP.
 
@@ -662,6 +786,16 @@ def run_pipeline(args: argparse.Namespace) -> int:
         pipeline sempre tenta terminar).
     """
     logger = logging.getLogger("raspilot")
+
+    if getattr(args, "stage", "full") == "static":
+        return run_static_stage(args)
+
+    if getattr(args, "stage", "full") == "detect":
+        args.mode = "detect"
+
+    only = [item for item in (getattr(args, "only", None) or []) if item in KNOWN_CHECKS]
+    if only:
+        args.skip = sorted(set(args.skip or []) | (set(KNOWN_CHECKS) - set(only)))
 
     # 0) Ambiente emulado (opcional): o alvo passa a ser o AVD.
     avd_manager = None
@@ -723,6 +857,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 static_profile = build_static_profile(
                     dm,
                     args.package,
+                    apk_path=getattr(args, "apk", None),
                     engine=getattr(args, "static_engine", "auto"),
                     timeout=getattr(args, "static_timeout", 60.0),
                 )
@@ -919,6 +1054,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             ).run_all(
                 args.package,
                 window=args.window,
+                apk_path=getattr(args, "apk", None),
                 precomputed_detection=hook_detection,
                 precomputed_bypass=hooking_bypass,
                 static_profile=static_profile,
@@ -932,6 +1068,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             "ssl_pinning",
             lambda: SSLPinningCheck(dm, mode=args.mode, no_java=args.no_java).run_all(
                 args.package, window=args.window,
+                apk_path=getattr(args, "apk", None),
                 precomputed_bypass=ssl_bypass,
                 static_profile=static_profile,
             ),
@@ -955,6 +1092,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             ).run_all(
                 args.package,
                 window=args.window,
+                apk_path=getattr(args, "apk", None),
                 static_profile=static_profile,
             ),
             skipped="anti_emulator" in args.skip,
@@ -997,11 +1135,14 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 logger.warning("Falha ao encerrar o AVD", exc_info=True)
 
     # 14) Relatórios.
-    json_path, html_path = reporter.save()
+    json_path, html_path = reporter.save(
+        write_html=not getattr(args, "json_only", False)
+    )
     print_summary_table(reporter)
     print_execution_log(reporter)
     console.print(f"\n[green]✓[/] Relatório JSON: [bold]{json_path}[/]")
-    console.print(f"[green]✓[/] Relatório HTML: [bold]{html_path}[/]")
+    if html_path:
+        console.print(f"[green]✓[/] Relatório HTML: [bold]{html_path}[/]")
     return 0
 
 

@@ -696,11 +696,16 @@ class Reporter:
         """
         return re.sub(r"[^a-zA-Z0-9._-]+", "_", value).strip("_") or "app"
 
-    def save(self) -> Tuple[str, str]:
+    def save(self, write_html: bool = True) -> Tuple[str, str]:
         """Salva os relatórios JSON e HTML no diretório de saída.
+
+        Args:
+            write_html: Se False, grava apenas o JSON (útil para
+                automação/MCP e para execuções por etapas).
 
         Returns:
             Tupla ``(caminho_json, caminho_html)`` com paths absolutos.
+            ``caminho_html`` é vazio quando ``write_html=False``.
 
         Raises:
             OSError: em falha de escrita.
@@ -717,9 +722,12 @@ class Reporter:
             json.dump(doc, fh, ensure_ascii=False, indent=2)
             fh.write("\n")
 
-        html = self.generate_html()
-        with open(html_path, "w", encoding="utf-8") as fh:
-            fh.write(html)
+        if write_html:
+            html = self.generate_html()
+            with open(html_path, "w", encoding="utf-8") as fh:
+                fh.write(html)
+        else:
+            html_path = ""
 
-        logger.info("Relatórios salvos: %s | %s", json_path, html_path)
+        logger.info("Relatórios salvos: %s | %s", json_path, html_path or "(sem HTML)")
         return json_path, html_path

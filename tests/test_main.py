@@ -143,3 +143,63 @@ class TestAvdCheck:
         ])
         assert rc == 1
         assert "emulator" in capsys.readouterr().out
+
+
+class TestStagedFlags:
+    """Flags de análise por etapas e automação."""
+
+    def test_defaults(self):
+        args = mainmod.parse_args(["--package", "com.example.app"])
+        assert args.stage == "full"
+        assert args.only is None
+        assert args.apk is None
+        assert args.json_only is False
+
+    def test_stage_only_apk_json(self, tmp_path):
+        apk = tmp_path / "app.apk"
+        apk.write_bytes(b"apk")
+        args = mainmod.parse_args([
+            "--package", "com.example.app",
+            "--stage", "detect",
+            "--only", "anti_frida",
+            "--only", "anti_root",
+            "--apk", str(apk),
+            "--json-only",
+        ])
+        assert args.stage == "detect"
+        assert args.only == ["anti_frida", "anti_root"]
+        assert args.apk == str(apk)
+        assert args.json_only is True
+
+    def test_static_stage_runs_without_device(self, tmp_path, monkeypatch):
+        profile = {
+            "available": True,
+            "engine": "builtin",
+            "classes_count": 0,
+            "cached": False,
+            "summary": {
+                "vectors": {
+                    "frida": {
+                        "present": True,
+                        "confidence": "medium",
+                        "total": 1,
+                    }
+                }
+            },
+        }
+        monkeypatch.setattr(
+            mainmod, "build_static_profile", lambda *a, **k: profile
+        )
+        args = mainmod.parse_args([
+            "--package", "com.example.app",
+            "--stage", "static",
+            "--apk", str(tmp_path / "app.apk"),
+            "--output-dir", str(tmp_path),
+        ])
+        rc = mainmod.run_static_stage(args)
+        assert rc == 0
+        files = list(tmp_path.glob("*_static.json"))
+        assert len(files) == 1
+        doc = json.loads(files[0].read_text(encoding="utf-8"))
+        assert doc["metadata"]["run"]["stage"] == "static"
+        assert doc["static_profile"]["engine"] == "builtin"

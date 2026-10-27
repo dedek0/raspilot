@@ -126,6 +126,10 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--device-id` | não | Serial ADB (ex: `emulator-5554`) |
 | `--wifi IP:PORTA` | não | Endereço para `adb connect` |
 | `--output-dir` | não | Diretório dos relatórios (default `reports/`) |
+| `--stage ETAPA` | não | `full` (default), `static` (só APK, sem Frida), `detect` (só detecção, sem bypass) ou `bypass` (detecção + bypass) |
+| `--only CHECK` | não | Roda apenas o check informado; pode repetir. Ex: `--only anti_frida --only anti_root` |
+| `--apk PATH` | não | APK local do alvo (pula `adb pull`); obrigatório para `--stage static` sem device |
+| `--json-only` | não | Gera só o JSON, sem HTML (automação/MCP) |
 | `--window SEG` | não | Janela de observação em segundos nos checks dinâmicos (default `15`) |
 | `--baseline-window SEG` | não | Janela do baseline sem instrumentação (default `5`) |
 | `--no-baseline` | não | Não executa o baseline antes dos checks dinâmicos |
@@ -161,6 +165,34 @@ O bypass anti-Frida roda por padrão no modo `bypass`: primeiro mede a
 detecção, depois abre um spawn separado com a evasão nativa. O probe SSL
 fraco usa janela mínima de 20s e navegação por `uiautomator`/`monkey`.
 Para desligar tudo, use `--static-engine off` e/ou `--skip`.
+
+### Análise por etapas
+
+Para separar a auditoria em fases:
+
+```bash
+# 1) só o perfil estático; não sobe Frida nem precisa de device
+python main.py --package com.exemplo.app \
+    --apk ./app.apk --stage static --output-dir reports/etapas
+
+# 2) só detecção dinâmica (anti-root/Frida/hook/emulador/SSL), sem bypass
+python main.py --package com.exemplo.app --stage detect
+
+# 3) detecção + bypass (comportamento completo)
+python main.py --package com.exemplo.app --stage bypass
+
+# 4) um check específico
+python main.py --package com.exemplo.app --stage detect --only anti_frida
+
+# 5) automação/MCP: somente JSON, sem HTML
+python main.py --package com.exemplo.app --json-only
+```
+
+`--stage static` grava um JSON próprio (`..._static.json`) com
+`metadata` e `static_profile`. `--stage detect` força `--mode detect`.
+`--only` é uma lista branca: os demais checks entram como `SKIP`.
+Sandbox/sessão persistente entre etapas entra na fase de estado/sessão
+(próxima etapa do roadmap).
 
 ### Saída
 
