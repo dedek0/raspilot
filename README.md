@@ -886,10 +886,17 @@ serem envolvidos como ferramentas MCP com `FastMCP`:
 
 O JSON emitido pelo RASPilot já segue um schema estável
 (`metadata` / `summary` / `execution_log` / `details`) pensado para leitura
-direta por LLMs. `metadata.schema_version` permite detectar mudanças
-incompatíveis e `metadata.run` registra o contexto da execução (argumentos
-da CLI, versão do Frida, porta, hashes sha256 dos scripts de injeção, pid
-alvo e resultado do baseline) para que a execução possa ser reproduzida.
+direta por LLMs. `metadata.schema_version` (atual **5**) permite detectar
+mudanças incompatíveis e `metadata.run` registra o contexto da execução
+(argumentos da CLI, versão do Frida, porta, hashes sha256 dos scripts de
+injeção, pid alvo e resultado do baseline) para que a execução possa ser
+reproduzida.
+
+Para MCP, o pipeline já foi preparado com análise por etapas e saída
+limpa: `--stage static|detect|bypass`, `--only`, `--apk` e `--json-only`.
+Cada ferramenta MCP pode mapear para uma etapa/check e retornar um `dict`
+com `summary` + caminho do relatório, deixando o JSON/HTML completo como
+*resource*. O estado/sessão entre chamadas entra na fase seguinte.
 
 ---
 

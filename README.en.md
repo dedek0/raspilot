@@ -851,10 +851,17 @@ be wrapped as MCP tools with `FastMCP`:
 
 The JSON emitted by RASPilot already follows a stable schema
 (`metadata` / `summary` / `execution_log` / `details`) designed for direct
-LLM reading. `metadata.schema_version` detects incompatible changes and
-`metadata.run` records the execution context (CLI arguments, Frida
-version, port, sha256 hashes of the injection scripts, target pid and
+LLM reading. `metadata.schema_version` (currently **5**) detects
+incompatible changes and `metadata.run` records the execution context
+(CLI arguments, Frida version, port, sha256 hashes of the injection
+scripts, target pid and
 baseline result) so the run can be reproduced.
+
+For MCP, the pipeline is already prepared with staged analysis and clean
+output: `--stage static|detect|bypass`, `--only`, `--apk` and
+`--json-only`. Each MCP tool can map to a stage/check and return a
+`dict` with `summary` + report path, leaving the full JSON/HTML as a
+*resource*. Cross-call state/session belongs to the next phase.
 
 ---
 

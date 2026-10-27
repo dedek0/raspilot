@@ -394,3 +394,15 @@ def test_anti_frida_inconclusive_is_error():
     summary = rep.generate_json()["summary"]["anti_frida"]
     assert summary["status"] == "ERROR"
     assert summary["error"]
+
+
+def test_save_json_only(tmp_path):
+    """--json-only grava somente o JSON."""
+    rep = Reporter(device_info=DEVICE, package_name="com.example.app",
+                   output_dir=str(tmp_path))
+    rep.collect("anti_frida", {"vulnerable": False, "frida_present": True})
+    json_path, html_path = rep.save(write_html=False)
+    assert json_path.endswith(".json")
+    assert html_path == ""
+    assert list(tmp_path.glob("*.json"))
+    assert not list(tmp_path.glob("*.html"))
