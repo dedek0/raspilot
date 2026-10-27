@@ -27,7 +27,7 @@ public class RaspilotModule implements IXposedHookLoadPackage, IXposedHookZygote
                 return;
             }
             if (!config.hookEnabled() && !config.rootEnabled()
-                    && !config.emulatorEnabled()) {
+                    && !config.tamperEnabled() && !config.emulatorEnabled()) {
                 Evidence.emit("ready", "module", "handleLoadPackage",
                         "nenhuma camada ativa para " + pkg);
                 return;
@@ -42,12 +42,16 @@ public class RaspilotModule implements IXposedHookLoadPackage, IXposedHookZygote
             if (config.rootEnabled()) {
                 RootShield.install(config, classLoader);
             }
+            if (config.tamperEnabled()) {
+                TamperShield.install(config, classLoader);
+            }
             if (config.emulatorEnabled()) {
                 EmulatorShield.install(config);
             }
             Evidence.emit("ready", "module", "handleLoadPackage",
                     "pkg=" + pkg + " hook=" + config.hookMode
                             + " root=" + config.rootMode
+                            + " tamper=" + config.tamperMode
                             + " emu=" + config.emulatorMode
                             + " label=" + config.label);
         } catch (Throwable error) {

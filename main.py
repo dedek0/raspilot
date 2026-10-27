@@ -34,6 +34,7 @@ from checks.anti_emulator import AntiEmulatorCheck
 from checks.anti_frida import AntiFridaCheck
 from checks.anti_hooking import AntiHookingCheck
 from checks.anti_root import AntiRootCheck
+from checks.anti_tampering import AntiTamperingCheck
 from checks.combined import run_combined_bypass, run_combined_observation
 from checks.ssl_pinning import SSLPinningCheck
 from checks.static import build_static_profile
@@ -55,8 +56,8 @@ LOG_FORMAT = "[%(asctime)s] [%(levelname)s] %(message)s"
 
 # Checks conhecidos — usado para validar --skip e nomear o relatório.
 KNOWN_CHECKS = (
-    "anti_root", "anti_frida", "anti_emulator", "anti_hooking",
-    "ssl_pinning",
+    "anti_root", "anti_frida", "anti_tampering", "anti_emulator",
+    "anti_hooking", "ssl_pinning",
 )
 
 
@@ -147,6 +148,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--json-only",
         action="store_true",
         help="Gera apenas o JSON (sem HTML), útil para automação/MCP",
+    )
+    parser.add_argument(
+        "--tamper-method",
+        choices=("auto", "static", "frida"),
+        default="auto",
+        help=(
+            "Método do anti-tampering: auto=estático + módulo/Frida; "
+            "static=só análise do APK; frida=só sonda em memória"
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -585,6 +595,7 @@ def _build_run_context(args: argparse.Namespace, dm: "DeviceManager") -> dict:
             "module_apk": getattr(args, "module_apk", None),
             "static_engine": getattr(args, "static_engine", "auto"),
             "static_timeout": getattr(args, "static_timeout", 60.0),
+            "tamper_method": getattr(args, "tamper_method", "auto"),
             "stage": getattr(args, "stage", "full"),
             "only": list(getattr(args, "only", None) or []),
             "apk": getattr(args, "apk", None),
@@ -768,8 +779,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
     Fluxo: conexão ADB → info do dispositivo → frida-server →
     anti_root → baseline → spawn do app → anti_frida → bypass combinado
-    → anti_hooking → ssl_pinning → anti_emulador (probe + bypass) →
-    relatórios → tabela final → cleanup.
+    → anti_hooking → ssl_pinning → anti_tampering → anti_emulador
+    (probe + bypass) → relatórios → tabela final → cleanup.
 
     O anti-emulador roda por último e com spawns próprios: o probe faz o
     app enxergar um emulador, o que contaminaria a observação dos demais
@@ -1073,6 +1084,25 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 static_profile=static_profile,
             ),
             skipped="ssl_pinning" in args.skip,
+        )
+
+        # 11.5) Anti-Tampering (estático + sonda em memória).
+        _run_step(
+            reporter,
+            "anti_tampering",
+            lambda: AntiTamperingCheck(
+                dm,
+                mode=args.mode,
+                no_java=args.no_java,
+                method=getattr(args, "tamper_method", "auto"),
+                xposed=xposed,
+            ).run_all(
+                static_profile=static_profile,
+                package_name=args.package,
+                window=args.window,
+                apk_path=getattr(args, "apk", None),
+            ),
+            skipped="anti_tampering" in args.skip,
         )
 
         # 12) Anti-Emulador (detecção + bypass).

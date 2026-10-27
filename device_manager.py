@@ -239,7 +239,8 @@ class DeviceManager:
         full_cmd += ["shell", command]
         try:
             proc = subprocess.run(
-                full_cmd, capture_output=True, text=True, timeout=timeout, check=False
+                full_cmd, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=timeout, check=False,
             )
             return {
                 "ok": proc.returncode == 0,
@@ -596,7 +597,7 @@ class DeviceManager:
         if self._logcat_proc is not None:
             return []
 
-        res = self.run_shell("logcat -d -v threadtime -t 500 2>/dev/null", timeout=10)
+        res = self.run_shell("logcat -d -v threadtime -t 5000 2>/dev/null", timeout=10)
         if res.get("ok") and res.get("stdout"):
             return res["stdout"].splitlines()
         return []

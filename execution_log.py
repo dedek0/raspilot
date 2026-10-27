@@ -63,6 +63,7 @@ SUBCHECK_ACTIONS: Dict[str, Dict[str, str]] = {
 
 BYPASS_ACTIONS = {
     "anti_root": "Tentar neutralizar a detecção de root do app",
+    "anti_tampering": "Tentar sobreviver à alteração de assinatura em memória",
     "anti_frida": "Tentar sobreviver à instrumentação com evasão anti-Frida",
     "anti_hooking": "Tentar neutralizar as checagens anti-hook do app",
     "anti_emulator": "Tentar ocultar os artefatos decisivos de emulador",
@@ -71,6 +72,7 @@ BYPASS_ACTIONS = {
 
 STATIC_ACTIONS = {
     "anti_root": "Analisar o APK por referências à detecção de root",
+    "anti_tampering": "Analisar o APK por referências de integridade/assinatura",
     "anti_frida": "Analisar o APK por assinaturas anti-Frida",
     "anti_hooking": "Analisar o APK por assinaturas anti-hook",
     "anti_emulator": "Analisar o APK por assinaturas anti-emulador",
@@ -79,6 +81,7 @@ STATIC_ACTIONS = {
 
 DYNAMIC_ACTIONS = {
     "anti_root": "Observar as checagens de root do app durante a janela",
+    "anti_tampering": "Comparar controle e assinatura alterada em memória",
     "anti_frida": "Observar a detecção de Frida pelo app durante a janela",
     "anti_hooking": "Observar as checagens anti-hook do app durante a janela",
     "anti_emulator": "Fazer o app enxergar um emulador e observar a reação",
@@ -442,6 +445,13 @@ def _verdict_text(check_name: str, result: dict) -> str:
             f"app_detecta_root={bool(app_root.get('present'))}; "
             f"bypass_root={result.get('bypass_successful')}"
         )
+    if check_name == "anti_tampering":
+        return (
+            f"tamper_detected={result.get('tamper_detected')}; "
+            f"static_detected={bool(result.get('static_detected'))}; "
+            f"bypass_successful={result.get('bypass_successful')}; "
+            f"método={result.get('bypass_method') or 'n/a'}"
+        )
     if check_name == "anti_frida":
         app_detection = result.get("app_detection") or {}
         return (
@@ -536,6 +546,10 @@ def build_execution_log(
     if check_name == "anti_root":
         _subcheck_entries(trace, check_name, result.get("checks"))
         _static_entry(trace, check_name, result.get("app_root_detection"))
+        _dynamic_entry(trace, check_name, result.get("app_detection"))
+        _bypass_entry(trace, check_name, result)
+    elif check_name == "anti_tampering":
+        _static_entry(trace, check_name, result.get("static_detection"))
         _dynamic_entry(trace, check_name, result.get("app_detection"))
         _bypass_entry(trace, check_name, result)
     elif check_name == "anti_frida":

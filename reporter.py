@@ -34,6 +34,7 @@ logger = logging.getLogger("raspilot.reporter")
 # próprios e roda por último), mas o relatório mantém a ordem estável.
 REPORT_ORDER = (
     "anti_root",
+    "anti_tampering",
     "anti_emulator",
     "anti_frida",
     "anti_hooking",
@@ -121,6 +122,60 @@ class Reporter:
 
         detection = cls._verdict("inconclusive", "Inconclusivo")
         bypass = cls._verdict("not_exercised", "Não exercitado")
+
+        if check_name == "anti_tampering":
+            detected = result.get("tamper_detected")
+            bypass = result.get("bypass_successful")
+            static_present = bool(result.get("static_detected"))
+            if detected is True:
+                detection = cls._verdict(
+                    "detected", "Detectado",
+                    "app reagiu à assinatura alterada em memória",
+                    sources=["dynamic"],
+                )
+            elif bypass is True:
+                detection = cls._verdict(
+                    "not_detected", "Não detectado",
+                    "app sobreviveu à assinatura alterada",
+                    sources=["dynamic"],
+                )
+            elif static_present:
+                detection = cls._verdict(
+                    "indicated", "Indicado (estático)",
+                    "há APIs de integridade no APK, sem sonda dinâmica",
+                    sources=["static"],
+                )
+            else:
+                detection = cls._verdict(
+                    "inconclusive", "Inconclusivo",
+                    result.get("bypass_skipped_reason")
+                    or "sonda de tamper não concluiu",
+                )
+            if bypass is True:
+                bypass_verdict = cls._verdict(
+                    "bypassed", "Bypass venceu",
+                    "app sobreviveu e continuou utilizável",
+                    method=result.get("bypass_method"),
+                )
+            elif bypass is False:
+                bypass_verdict = cls._verdict(
+                    "resisted", "Proteção resistiu",
+                    "app detectou/bloqueou a assinatura alterada",
+                    method=result.get("bypass_method"),
+                )
+            elif static_present:
+                bypass_verdict = cls._verdict(
+                    "not_exercised", "Não exercitado",
+                    result.get("bypass_skipped_reason")
+                    or "sonda de tamper não executada",
+                    method=result.get("bypass_method"),
+                )
+            else:
+                bypass_verdict = cls._verdict(
+                    "not_applicable", "Não aplicável",
+                    "sem proteção ou sonda de tamper",
+                )
+            return detection, bypass_verdict
 
         if check_name == "anti_frida":
             app = result.get("app_detection") or {}
@@ -383,6 +438,38 @@ class Reporter:
             if hint in ("OK", "FALHOU", "SKIP", "N/A"):
                 return hint, summary
             return ("FALHOU" if is_rooted else "OK"), summary
+
+        if check_name == "anti_tampering":
+            detected = result.get("tamper_detected")
+            bypass = result.get("bypass_successful")
+            static_analysis = result.get("static_analysis") or {}
+            summary = {
+                "tamper_detected": detected,
+                "static_detected": bool(result.get("static_detected")),
+                "bypass_successful": bypass,
+                "probe_method": result.get("bypass_method"),
+                "static_engine": static_analysis.get("engine"),
+                "static_owners": static_analysis.get("owners") or {},
+                "app_evidence": bool(static_analysis.get("app_evidence")),
+                "coverage_gaps": (
+                    (static_analysis.get("coverage") or {})
+                    .get("possible_gaps", [])
+                ),
+            }
+            if result.get("verdict_reason"):
+                summary["verdict_reason"] = result.get("verdict_reason")
+            if result.get("bypass_skipped_reason"):
+                summary["skip_reason"] = result.get("bypass_skipped_reason")
+            hint = str(result.get("status_hint") or "").upper()
+            if hint in ("OK", "FALHOU", "SKIP", "N/A", "ERROR"):
+                return hint, summary
+            if bypass is True:
+                return "FALHOU", summary
+            if bypass is False or detected is True:
+                return "OK", summary
+            if detected is False:
+                return "FALHOU", summary
+            return "SKIP", summary
 
         if check_name == "anti_frida":
             raw_vulnerable = result.get("vulnerable")

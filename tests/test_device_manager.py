@@ -194,7 +194,8 @@ class TestRunShell:
         dm = DeviceManager(device_id="SER1")
         seen = {}
 
-        def fake_run(cmd, capture_output=True, text=True, timeout=20, check=False):
+        def fake_run(cmd, capture_output=True, text=True, timeout=20,
+                     check=False, **kwargs):
             seen["cmd"] = cmd
             return _proc(stdout="ok")
 

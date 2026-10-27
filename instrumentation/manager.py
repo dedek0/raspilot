@@ -99,6 +99,8 @@ class ModuleConfig:
     Attributes:
         hook: Modo da camada anti-hook (``off``, ``observe``, ``bypass``).
         root: Modo da camada de root (``off``, ``observe``, ``bypass``).
+        tamper: Modo da camada de integridade (``off``, ``observe``,
+            ``bypass``).
         emulator: Modo da camada de emulador (``off``, ``observe``,
             ``probe``, ``mask``).
         target: Pacote alvo (vazio = qualquer pacote no escopo).
@@ -107,6 +109,7 @@ class ModuleConfig:
 
     hook: str = "off"
     root: str = "off"
+    tamper: str = "off"
     emulator: str = "off"
     target: str = ""
     label: str = ""
@@ -120,6 +123,7 @@ class ModuleConfig:
         parts = [
             f"hook={self.hook}",
             f"root={self.root}",
+            f"tamper={self.tamper}",
             f"emu={self.emulator}",
             f"target={self.target}",
             f"label={self.label}",
@@ -135,6 +139,7 @@ class ModuleConfig:
         return [
             "--hook", self.hook,
             "--root", self.root,
+            "--tamper", self.tamper,
             "--emu", self.emulator,
             "--target", self.target,
             "--label", self.label,
@@ -686,7 +691,8 @@ class XposedManager:
             # Sem override em execução, o comportamento do módulo é o
             # compilado no APK: só é equivalente se coincidir.
             fallback = self.build(ModuleConfig(
-                hook=config.hook, root=config.root, emulator=config.emulator,
+                hook=config.hook, root=config.root, tamper=config.tamper,
+                emulator=config.emulator,
                 target=config.target, label=config.label,
             ))
             steps.append({"step": "config_fallback", "ok": fallback["ok"],

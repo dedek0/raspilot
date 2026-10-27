@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-PROFILE_VERSION = 3
+PROFILE_VERSION = 4
 
 VECTORS: Tuple[str, ...] = (
     "frida",
@@ -19,6 +19,7 @@ VECTORS: Tuple[str, ...] = (
     "root",
     "emulator",
     "pinning",
+    "tamper",
 )
 
 VECTOR_LABELS: Dict[str, str] = {
@@ -27,6 +28,7 @@ VECTOR_LABELS: Dict[str, str] = {
     "root": "Anti-Root (detecção do app)",
     "emulator": "Anti-Emulador",
     "pinning": "SSL Pinning",
+    "tamper": "Anti-Tampering",
 }
 
 # Assinaturas de bytes adicionais para vetores que ainda não tinham
@@ -54,6 +56,25 @@ ROOT_SIGNATURES: List[Tuple[bytes, str]] = [
     (b"SafetyNet", "SafetyNet"),
     (b"Play Integrity", "Play Integrity"),
     (b"test-keys", "build test-keys"),
+]
+
+# Assinaturas de integridade/tampering: APIs de assinatura, hash de
+# pacote, Play Integrity/SafetyNet e verificações de código.
+TAMPER_SIGNATURES: List[Tuple[bytes, str]] = [
+    (b"GET_SIGNATURES", "PackageManager.GET_SIGNATURES"),
+    (b"GET_SIGNING_CERTIFICATES", "PackageManager.GET_SIGNING_CERTIFICATES"),
+    (b"PackageInfo;->signatures", "campo PackageInfo.signatures"),
+    (b"checkSignatures", "PackageManager.checkSignatures"),
+    (b"SigningInfo", "classe SigningInfo"),
+    (b"MessageDigest", "java.security.MessageDigest"),
+    (b"getPackageCodePath", "getPackageCodePath"),
+    (b"getPackageResourcePath", "getPackageResourcePath"),
+    (b"CRC32", "CRC32"),
+    (b"Play Integrity", "Play Integrity"),
+    (b"SafetyNet", "SafetyNet"),
+    (b"IntegrityToken", "IntegrityToken"),
+    (b"tamper", "string tamper"),
+    (b"checksum", "string checksum"),
 ]
 
 # Consultas de alto sinal executadas no ASC. Cada item é um comando
@@ -149,6 +170,54 @@ ASC_QUERIES: List[dict] = [
         "confidence": "low",
     },
     {
+        "vector": "tamper",
+        "kind": "method",
+        "value": "checkSignatures",
+        "class_name": "android.content.pm.PackageManager",
+        "label": "checagem de assinatura de pacote",
+    },
+    {
+        "vector": "tamper",
+        "kind": "method",
+        "value": "getPackageInfo",
+        "class_name": "android.content.pm.PackageManager",
+        "label": "leitura de PackageInfo/assinaturas",
+    },
+    {
+        "vector": "tamper",
+        "kind": "type",
+        "value": "android.content.pm.SigningInfo",
+        "label": "uso de SigningInfo",
+    },
+    {
+        "vector": "tamper",
+        "kind": "type",
+        "value": "java.security.MessageDigest",
+        "label": "hash de integridade",
+    },
+    {
+        "vector": "tamper",
+        "kind": "string",
+        "value": r"(?i)play\s+integrity",
+        "display": "Play Integrity",
+        "label": "Play Integrity",
+    },
+    {
+        "vector": "tamper",
+        "kind": "string",
+        "value": r"(?i)\bsafetynet\b",
+        "display": "SafetyNet",
+        "label": "SafetyNet",
+    },
+    {
+        "vector": "tamper",
+        "kind": "string",
+        "value": r"(?i)\btamper\b",
+        "display": "tamper",
+        "label": "string tamper",
+        "confidence": "low",
+    },
+    {
         "vector": "pinning",
         "kind": "impl",
         "value": "javax.net.ssl.X509TrustManager",
@@ -201,6 +270,13 @@ BYPASS_HOOKS: Dict[str, List[str]] = {
         "Settings.Secure",
         "propriedades/arquivos/strstr nativos",
     ],
+    "tamper": [
+        "PackageManager.getPackageInfo/signatures",
+        "PackageManager.checkSignatures",
+        "MessageDigest/SHA-256",
+        "Play Integrity/SafetyNet",
+        "Zip/CRC/checksum",
+    ],
     "pinning": [
         "X509TrustManager",
         "Conscrypt TrustManagerImpl",
@@ -218,6 +294,7 @@ NATIVE_HINTS: Dict[str, Tuple[str, ...]] = {
     "emulator": ("strstr", "native", "ro.kernel.qemu"),
     "pinning": ("ssl_ctx", "boringssl", "libconscrypt_jni", "publickeypinner"),
     "hooking": ("strstr", "native", "ptrace"),
+    "tamper": ("signature", "integrity", "tamper", "checksum"),
 }
 
 __all__ = [
@@ -227,6 +304,7 @@ __all__ = [
     "NATIVE_HINTS",
     "PROFILE_VERSION",
     "ROOT_SIGNATURES",
+    "TAMPER_SIGNATURES",
     "VECTOR_LABELS",
     "VECTORS",
 ]

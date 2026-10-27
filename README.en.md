@@ -4,8 +4,8 @@
 
 **RASPilot — Automatic RASP Auditing Pilot for Android.**
 
-Orchestrates Anti-Root, Anti-Frida, Anti-Emulator, Anti-Hooking and SSL
-Pinning checks against Android apps, producing structured reports ready for
+Orchestrates Anti-Root, Anti-Frida, Anti-Tampering, Anti-Emulator,
+Anti-Hooking and SSL Pinning checks against Android apps, producing structured reports ready for
 LLM consumption via MCP.
 
 RASPilot connects to an Android device (USB or Wi-Fi ADB), automatically
@@ -147,7 +147,8 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--static-timeout SEC` | no | Timeout per Droid ASC query (default `60`) |
 | `--js-runtime RUNTIME` | no | Frida JavaScript runtime: `qjs` (default) or `v8` |
 | `--verbose` | no | DEBUG-level logging |
-| `--skip CHECK...` | no | Checks to skip (`anti_root`, `anti_frida`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
+| `--skip CHECK...` | no | Checks to skip (`anti_root`, `anti_frida`, `anti_tampering`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
+| `--tamper-method METHOD` | no | `auto` (default; static + module/Frida probe), `static` (APK only) or `frida` (in-memory probe only) |
 | `--avd` | no | Audit against the configured AVD instead of the physical device (boots the emulator, waits for boot and shuts it down afterwards) |
 | `--avd-config PATH` | no | JSON configuration of the emulated environment (default `~/.raspilot/avd.json` or `$RASPILOT_AVD_CONFIG`) |
 | `--avd-name NAME` | no | AVD name, overriding the configuration |
@@ -179,7 +180,7 @@ To split the audit into phases:
 python main.py --package com.example.app \
     --apk ./app.apk --stage static --output-dir reports/stages
 
-# 2) dynamic detection only, no bypass
+# 2) dynamic detection only (root/Frida/tampering/hooking/emulator/SSL), no bypass
 python main.py --package com.example.app --stage detect
 
 # 3) detection + bypass (full behavior)
@@ -231,7 +232,7 @@ beat the protection", while also flagging gaps in bypass-hook coverage.
 It does **not** replace dynamic observation: presence in the APK is not
 proof of execution.
 
-Anti-Frida + anti-hooking observation runs in a **single session**, and anti-hooking/SSL bypasses share another spawn. Anti-Frida detection and bypass use separate spawns: first the app reaction is measured; then native evasion is loaded before resume. The anti-emulator check runs **last**, with its own spawns: the probe makes the app see an emulator, and a shared spawn would contaminate the other checks. The APK cache lives in `~/.raspilot/cache/apk` (disable with `RASPILOT_APK_CACHE=0`); the static profile cache lives in `~/.raspilot/cache/static` (disable with `RASPILOT_STATIC_CACHE=0`).
+Anti-Frida + anti-hooking observation runs in a **single session**, and anti-hooking/SSL bypasses share another spawn. Anti-tampering runs a control phase and a second phase with an in-memory package signature change, preferably through the module (`TamperShield`) with Frida fallback. Anti-Frida detection and bypass use separate spawns: first the app reaction is measured; then native evasion is loaded before resume. The anti-emulator check runs **last**, with its own spawns: the probe makes the app see an emulator, and a shared spawn would contaminate the other checks. The APK cache lives in `~/.raspilot/cache/apk` (disable with `RASPILOT_APK_CACHE=0`); the static profile cache lives in `~/.raspilot/cache/static` (disable with `RASPILOT_STATIC_CACHE=0`).
 
 Status semantics:
 
@@ -329,7 +330,7 @@ It has two layers:
    references the API or string. This is what turns "the APK contains
    the string" into "class `X` references `X509TrustManager`".
 
-For each vector (`frida`, `hooking`, `root`, `emulator`, `pinning`) the
+For each vector (`frida`, `hooking`, `root`, `emulator`, `pinning`, `tamper`) the
 profile records `present`, `confidence`, `findings` (source, class,
 method, evidence) and `possible_gaps` — techniques the current bypass
 scripts do not cover, such as native BoringSSL pinning or native
@@ -557,6 +558,33 @@ vector the protection actually inspects.
   hook-install/native-config logs are diagnostics only. Logcat is attached
   to corroborate TLS/pinning errors.
 
+### 6. Anti-Tampering (`checks/anti_tampering.py`)
+
+Two non-destructive layers:
+
+- **Static**: scans the APK for `GET_SIGNATURES`,
+  `GET_SIGNING_CERTIFICATES`, `PackageInfo.signatures`,
+  `checkSignatures`, `SigningInfo`, `MessageDigest`, CRC/checksum,
+  `getPackageCodePath` and Play Integrity/SafetyNet references.
+- **In-memory dynamic**: runs a control phase with no change and a second
+  phase with the package signature altered in memory
+  (`PackageManager.getPackageInfo` and `checkSignatures`). If the app dies
+  or blocks only in the second phase, the anti-tampering protection was
+  exercised; if it stays alive and usable, the bypass won. When the
+  instrumentation module is available the probe runs through it
+  (`TamperShield`), without Frida's Java bridge; otherwise it uses Frida.
+
+The result has two verdicts: **detection** (`tamper_detected`) and
+**bypass** (`bypass_successful`). `--mode detect` and `--tamper-method
+static` skip the dynamic probe; `--no-java` also blocks it. The method is
+explicit in `bypass_method` (`module` or `frida`).
+
+> The **destructive** test (re-sign/reinstall the APK) is not executed
+> automatically. It requires reinstallation, loses app data and should
+> only run on a disposable device/AVD. In a future MCP tool, this step
+> must ask the user for explicit confirmation before reinstalling
+> anything.
+
 ## Instrumentation module (hooking APK) — optional
 
 Everything in this section is **optional**: without a hooking framework on
@@ -577,8 +605,8 @@ trace of external injection. It is also what allows the anti-emulator and
 anti-root checks to run without instrumentation: the app sees an
 emulator/root environment while running normally.
 
-The module has three configurable layers: `hook` (anti-hook), `root`
-(anti-root) and `emu` (anti-emulator). Anti-root uses `RootShield` to
+The module has four configurable layers: `hook` (anti-hook), `root`
+(anti-root), `tamper` (integrity/signature) and `emu` (anti-emulator). Anti-root uses `RootShield` to
 observe/neutralise RootBeer, `File`, `Runtime.exec`, `SystemProperties`
 and `PackageManager`.
 
@@ -632,7 +660,7 @@ ls instrumentation/build/raspilot-module.apk
 ```
 
 > `instrumentation/build/raspilot-module.apk` is generated locally (the
-> `build/` directory is gitignored) and already contains all three layers.
+> `build/` directory is gitignored) and already contains the available layers.
 > **RASPilot's automatic build also always compiles `RootShield`**: there
 > is no root flag in the main CLI. In `build.sh`, `--root` only sets the
 > default mode baked into the APK; the runtime enables
@@ -771,6 +799,7 @@ raspilot/
 ├── checks/
 │   ├── anti_root.py            # Multi-vector root detection
 │   ├── anti_frida.py           # Frida presence/detection
+│   ├── anti_tampering.py       # Static integrity + in-memory probe
 │   ├── anti_emulator.py        # Anti-emulator detection + bypass
 │   ├── anti_hooking.py         # Anti-hooking detection + bypass
 │   ├── combined.py             # Single-session observation/bypass
@@ -785,6 +814,7 @@ raspilot/
 ├── scripts/
 │   ├── ssl_bypass.js           # Universal SSL pinning bypass (Frida)
 │   ├── anti_frida_bypass.js    # Frida detection bypass (Frida)
+│   ├── tamper_probe.js         # In-memory signature tamper probe
 │   ├── anti_hooking_bypass.js  # Hooking detection bypass (Frida)
 │   ├── root_detection.js       # App root-check observation
 │   ├── emulator_spoof.js       # Emulator spoof: probe and mask (Frida)
@@ -844,6 +874,7 @@ be wrapped as MCP tools with `FastMCP`:
 | `raspilot_start_assessment(package_name, device_id=None) -> dict` | `DeviceManager.connect_adb()` + `setup_frida_server()` + pipeline |
 | `raspilot_check_anti_root(device_id) -> dict` | `AntiRootCheck(dm).run_all()` |
 | `raspilot_check_anti_frida(device_id) -> dict` | `AntiFridaCheck(dm).run_all(session, pid)` |
+| `raspilot_check_anti_tampering(device_id, package_name) -> dict` | `AntiTamperingCheck(dm).run_all(...)` |
 | `raspilot_check_anti_emulator(device_id, package_name) -> dict` | `AntiEmulatorCheck(dm).run_all(package)` |
 | `raspilot_check_anti_hooking(device_id, package_name) -> dict` | `AntiHookingCheck(dm).run_all(package)` |
 | `raspilot_bypass_ssl_pinning(device_id, package_name) -> dict` | `SSLPinningCheck(dm).run_all(package)` |

@@ -91,8 +91,16 @@ def test_config_serializa_propriedade():
         hook="bypass", emulator="probe", target="com.example.app", label="fase"
     )
     assert config.as_property() == (
-        "hook=bypass;root=off;emu=probe;target=com.example.app;label=fase"
+        "hook=bypass;root=off;tamper=off;emu=probe;target=com.example.app;label=fase"
     )
+
+
+def test_config_camada_tamper():
+    """A camada de tampering também é configurável por fase."""
+    config = ModuleConfig(tamper="bypass", target="com.example.app")
+    assert "tamper=bypass" in config.as_property()
+    assert "--tamper" in config.as_build_args()
+    assert "bypass" in config.as_build_args()
 
 
 def test_config_argumentos_de_build():
@@ -279,7 +287,7 @@ def test_apply_runtime_config_confirma_propriedade():
     dm = FakeDM({
         "setprop": "",
         "getprop persist.raspilot.module.config":
-            "hook=bypass;root=off;emu=off;target=com.example.app;label=x",
+            "hook=bypass;root=off;tamper=off;emu=off;target=com.example.app;label=x",
     })
     manager = XposedManager(dm, "com.example.app")
     config = ModuleConfig(hook="bypass", emulator="off", target="com.example.app",

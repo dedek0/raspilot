@@ -22,6 +22,11 @@ public final class RaspilotConfig {
     public static final String ROOT_OBSERVE = "observe";
     public static final String ROOT_BYPASS = "bypass";
 
+    /** Modo da camada de anti-tampering. */
+    public static final String TAMPER_OFF = "off";
+    public static final String TAMPER_OBSERVE = "observe";
+    public static final String TAMPER_BYPASS = "bypass";
+
     /** Modo da camada de emulador. */
     public static final String EMU_OFF = "off";
     public static final String EMU_OBSERVE = "observe";
@@ -32,15 +37,18 @@ public final class RaspilotConfig {
 
     public final String hookMode;
     public final String rootMode;
+    public final String tamperMode;
     public final String emulatorMode;
     public final String targetPackage;
     public final String label;
     public final boolean runtimeOverride;
 
-    private RaspilotConfig(String hookMode, String rootMode, String emulatorMode,
-                            String targetPackage, String label, boolean runtimeOverride) {
+    private RaspilotConfig(String hookMode, String rootMode, String tamperMode,
+                            String emulatorMode, String targetPackage, String label,
+                            boolean runtimeOverride) {
         this.hookMode = hookMode;
         this.rootMode = rootMode;
+        this.tamperMode = tamperMode;
         this.emulatorMode = emulatorMode;
         this.targetPackage = targetPackage;
         this.label = label;
@@ -58,6 +66,7 @@ public final class RaspilotConfig {
         }
         String hook = RaspilotBaked.HOOK_MODE;
         String root = RaspilotBaked.ROOT_MODE;
+        String tamper = RaspilotBaked.TAMPER_MODE;
         String emu = RaspilotBaked.EMULATOR_MODE;
         String target = RaspilotBaked.TARGET_PACKAGE;
         String label = RaspilotBaked.LABEL;
@@ -79,6 +88,9 @@ public final class RaspilotConfig {
                 } else if ("root".equals(key)) {
                     root = value;
                     overridden = true;
+                } else if ("tamper".equals(key)) {
+                    tamper = value;
+                    overridden = true;
                 } else if ("emu".equals(key)) {
                     emu = value;
                     overridden = true;
@@ -92,7 +104,8 @@ public final class RaspilotConfig {
             }
         }
 
-        instance = new RaspilotConfig(hook, root, emu, target, label, overridden);
+        instance = new RaspilotConfig(
+                hook, root, tamper, emu, target, label, overridden);
         return instance;
     }
 
@@ -157,6 +170,24 @@ public final class RaspilotConfig {
      */
     public boolean rootBypass() {
         return ROOT_BYPASS.equals(rootMode);
+    }
+
+    /**
+     * Informa se a camada de anti-tampering deve ser aplicada.
+     *
+     * @return True quando o modo nao e "off".
+     */
+    public boolean tamperEnabled() {
+        return !TAMPER_OFF.equals(tamperMode);
+    }
+
+    /**
+     * Informa se a alteracao de assinatura esta ativa.
+     *
+     * @return True no modo bypass.
+     */
+    public boolean tamperBypass() {
+        return TAMPER_BYPASS.equals(tamperMode);
     }
 
     /**

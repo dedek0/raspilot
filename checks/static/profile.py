@@ -33,6 +33,7 @@ from checks.static.queries import (
     NATIVE_HINTS,
     PROFILE_VERSION,
     ROOT_SIGNATURES,
+    TAMPER_SIGNATURES,
     VECTOR_LABELS,
     VECTORS,
 )
@@ -59,6 +60,8 @@ _KNOWN_MARKERS: Tuple[Tuple[str, str, str], ...] = (
     ("root", "Play Integrity", "Play Integrity"),
     ("pinning", "CertificatePinner", "OkHttp CertificatePinner"),
     ("pinning", "TrustKit", "TrustKit"),
+    ("tamper", "IntegrityToken", "Play Integrity"),
+    ("tamper", "SafetyNet", "SafetyNet"),
     ("pinning", "PinningTrustManager", "PinningTrustManager"),
     ("emulator", "DexGuardEmulatorDetected", "DexGuard"),
     ("emulator", "isRunningOnEmulator", "detecção de emulador"),
@@ -148,6 +151,7 @@ def _builtin_signatures() -> List[tuple]:
     signatures: List[tuple] = [
         ("frida", FRIDA_SIGNATURES),
         ("root", ROOT_SIGNATURES),
+        ("tamper", TAMPER_SIGNATURES),
     ]
     try:
         from checks.anti_hooking import STATIC_SIGNATURES as hook_signatures
@@ -233,6 +237,12 @@ def _builtin_confidence(vector: str, description: str) -> str:
     if vector == "emulator":
         if any(token in text for token in ("dexguard", "emulatordetected", "isrunningonemulator", "emulatorfound", "ro.kernel.qemu", "goldfish", "ranchu", "sdk_gphone", "vbox86", "qemu_pipe")):
             return "high"
+        return "low"
+    if vector == "tamper":
+        if any(token in text for token in ("get_signatures", "get_signing_certificates", "checksignatures", "signinginfo", "play integrity", "safetynet", "integritytoken")):
+            return "high"
+        if any(token in text for token in ("messagedigest", "getpackagecodepath", "getpackageresourcepath", "crc32", "checksum")):
+            return "medium"
         return "low"
     if vector == "pinning":
         if any(token in text for token in ("trustkit", "pinningtrustmanager", "ssl_ctx_set_custom_verify", "publickeypinner", "pin-set", "certificate-pinning")):
@@ -872,8 +882,8 @@ def vector_view(profile: Optional[dict], name: str) -> Optional[dict]:
 
     Args:
         profile: Perfil retornado por :func:`build_static_profile`.
-        name: ``frida``, ``hooking``, ``root``, ``emulator`` ou
-            ``pinning``.
+        name: ``frida``, ``hooking``, ``root``, ``emulator``,
+            ``pinning`` ou ``tamper``.
 
     Returns:
         Dict com ``present``, ``confidence``, ``findings`` e metadados do
