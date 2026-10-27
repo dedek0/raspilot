@@ -146,10 +146,10 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--skip CHECK...` | não | Checks a pular (`anti_root`, `anti_frida`, `anti_tampering`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
 | `--tamper-method MÉTODO` | não | `auto` (default; estático + sonda módulo/Frida), `static` (só APK), `frida` (só sonda em memória) ou `repack` (destrutivo) |
 | `--tamper-allow-reinstall` | não | Confirma que o repack pode desinstalar/reinstalar o app; dados são perdidos |
-| `--tamper-variant VARIANTE` | não | `asset`, `dex`, `resource` ou `manifest`; pode repetir. Default: `asset` e `dex` |
+| `--tamper-variant VARIANTE` | não | `asset`, `dex`, `resource`, `manifest` ou `all`; pode repetir. Default: `asset` e `dex` |
 | `--tamper-installer PKG` | não | Instalador simulado no repack (ex: `com.android.vending`); default: instalador atual |
 | `--tamper-no-restore` | não | Não reinstala o APK original ao final |
-| `--tamper-keep-artifacts` | não | Mantém APKs original/modificados no diretório de saída |
+| `--tamper-keep-artifacts` | não | Mantém APKs original/modificados em `reports/repack/` |
 | `--tamper-timeout SEG` | não | Timeout por build do repack (default `600`) |
 | `--avd` | não | Audita contra o AVD configurado em vez do device físico (sobe o emulador, espera o boot e o encerra no final) |
 | `--avd-config PATH` | não | Configuração JSON do ambiente emulado (default `~/.raspilot/avd.json` ou `$RASPILOT_AVD_CONFIG`) |
@@ -637,6 +637,10 @@ python main.py --package com.exemplo.app \
     --tamper-variant asset --tamper-variant dex \
     --only anti_tampering
 ```
+
+Os artefatos temporários e os APKs mantidos ficam em `reports/repack/`.
+Em apps grandes, o apktool pode exigir mais heap; ajuste com
+`RASPILOT_APKTOOL_XMX` (default `6G`).
 
 > O uninstall remove os dados do app; não há backup automático. Use
 > device/AVD descartável. Sem a chave original não é possível testar

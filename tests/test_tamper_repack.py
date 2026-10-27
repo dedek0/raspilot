@@ -71,6 +71,12 @@ class TestAssetVariant:
             assert "classes.dex" in archive.namelist()
 
 
+class TestVariants:
+    def test_all_expands_to_content_variants(self):
+        tester = repack.RepackTester(object(), "com.example.app", variants=("all",))
+        assert tester.variants == ["asset", "dex", "resource", "manifest"]
+
+
 class TestInterpret:
     def _tester(self):
         return repack.RepackTester(FakeDM(), "com.example.app")
@@ -133,6 +139,36 @@ class TestInterpret:
         assert result["status_hint"] == "SKIP"
         assert result["attribution"] == "tooling"
         assert result["tamper_detected"] is None
+
+    def test_resigned_alive_without_focus_is_inconclusive(self):
+        resigned = _obs("resigned", usable=False)
+        resigned["alive"] = True
+        result = self._tester()._interpret(
+            {
+                "original": _obs("original"),
+                "resigned": resigned,
+                "rebuilt": _obs("rebuilt"),
+                "asset": _obs("asset"),
+            },
+            {},
+        )
+        assert result["status_hint"] == "SKIP"
+        assert result["attribution"] == "inconclusive"
+
+    def test_content_alive_without_focus_is_inconclusive(self):
+        asset = _obs("asset", usable=False)
+        asset["alive"] = True
+        result = self._tester()._interpret(
+            {
+                "original": _obs("original"),
+                "resigned": _obs("resigned"),
+                "rebuilt": _obs("rebuilt"),
+                "asset": asset,
+            },
+            {},
+        )
+        assert result["status_hint"] == "SKIP"
+        assert result["attribution"] == "inconclusive"
 
     def test_original_not_usable_is_inconclusive(self):
         result = self._tester()._interpret(

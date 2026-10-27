@@ -327,6 +327,51 @@ def _dynamic_entry(trace: List[dict], check_name: str, detection: Any) -> None:
     )
 
 
+REPACK_ACTIONS = {
+    "original": "Observar o APK original",
+    "resigned": "Instalar o controle re-assinado sem alteração",
+    "rebuilt": "Instalar o controle reconstruído sem alteração",
+    "asset": "Instalar variante com asset marcador",
+    "dex": "Instalar variante com DEX alterado",
+    "resource": "Instalar variante com recurso alterado",
+    "manifest": "Instalar variante com manifesto alterado",
+}
+
+
+def _repack_entries(trace: List[dict], result: dict) -> None:
+    """Adiciona uma etapa por controle/variante do teste de repack."""
+    details = result.get("bypass_details") or {}
+    if details.get("probe_method") != "repack":
+        return
+    observations = details.get("observations") or {}
+    for label, item in observations.items():
+        if not isinstance(item, dict):
+            continue
+        if item.get("usable") is True:
+            outcome = "success"
+        elif item.get("alive") is False:
+            outcome = "blocked"
+        else:
+            outcome = "inconclusive"
+        parts = [
+            f"vivo={item.get('alive')}",
+            f"em_foco={item.get('foreground')}",
+        ]
+        if item.get("died_after") is not None:
+            parts.append(f"morreu_apos={item.get('died_after')}s")
+        death = (item.get("logcat") or {}).get("death") or {}
+        evidence = death.get("evidence") or []
+        trace.append(
+            _entry(
+                "repack",
+                REPACK_ACTIONS.get(label, f"Observar variante {label}"),
+                outcome,
+                "; ".join(parts),
+                evidence,
+            )
+        )
+
+
 def _bypass_entry(trace: List[dict], check_name: str, result: dict) -> None:
     """Adiciona a etapa de bypass (ou o motivo de ela não ter rodado).
 
@@ -551,6 +596,7 @@ def build_execution_log(
     elif check_name == "anti_tampering":
         _static_entry(trace, check_name, result.get("static_detection"))
         _dynamic_entry(trace, check_name, result.get("app_detection"))
+        _repack_entries(trace, result)
         _bypass_entry(trace, check_name, result)
     elif check_name == "anti_frida":
         _subcheck_entries(trace, check_name, result.get("checks"))

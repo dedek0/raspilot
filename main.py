@@ -170,10 +170,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tamper-variant",
         action="append",
-        choices=("asset", "dex", "resource", "manifest"),
+        choices=("asset", "dex", "resource", "manifest", "all"),
         help=(
             "Variante de modificação do repack; pode repetir. "
-            "Default: asset e dex"
+            "Default: asset e dex; use all para todas"
         ),
     )
     parser.add_argument(

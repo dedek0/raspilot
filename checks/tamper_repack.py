@@ -87,6 +87,19 @@ def _find_tool(name: str, env_var: Optional[str] = None) -> Optional[str]:
     return shutil.which(name)
 
 
+def _apktool_prefix(apktool: str) -> List[str]:
+    """Adiciona heap maior quando o apktool é o wrapper Java padrão."""
+    try:
+        with open(apktool, "r", encoding="utf-8", errors="replace") as handle:
+            head = handle.read(4096)
+        if "exec java" in head and "-J" in head:
+            heap = os.environ.get("RASPILOT_APKTOOL_XMX", "6G")
+            return [apktool, f"-JXmx{heap}"]
+    except OSError:
+        pass
+    return [apktool]
+
+
 def _run(
     cmd: Sequence[str],
     timeout: int = 300,
@@ -176,16 +189,18 @@ def _apktool_modify(
     decoded = os.path.join(work_dir, f"decoded-{variant}")
     if os.path.isdir(decoded):
         shutil.rmtree(decoded)
-    decode_args = [apktool, "d", "-f", "-o", decoded, apk]
-    if variant == "dex":
+    decode_args = _apktool_prefix(apktool) + [
+        "d", "-f", "-j", "4", "-o", decoded, apk,
+    ]
+    if variant in ("dex", "rebuilt-dex"):
         # O DEX é a única parte alterada: mantém recursos e manifesto
         # originais intactos no rebuild.
-        decode_args.insert(2, "-r")
+        decode_args.insert(3, "-r")
     ok, text = _run(decode_args, timeout=timeout)
     if not ok:
         return False, f"apktool d: {text}"
     try:
-        if variant == "rebuilt":
+        if variant in ("rebuilt", "rebuilt-dex"):
             pass
         elif variant == "dex":
             target = os.path.join(
@@ -217,8 +232,10 @@ def _apktool_modify(
                     handle.write(text)
         else:
             return False, f"variante desconhecida: {variant}"
-        build_args = [apktool, "b"]
-        if variant == "dex":
+        build_args = _apktool_prefix(apktool) + [
+            "b", "-j", "4",
+        ]
+        if variant in ("dex", "rebuilt-dex"):
             build_args.append("--copy-original")
         build_args.extend([decoded, "-o", output])
         ok, text = _run(build_args, timeout=timeout)
@@ -291,7 +308,10 @@ class RepackTester:
         self.apk_path = apk_path
         self.output_dir = output_dir or os.path.expanduser("~/.raspilot/repack")
         self.window = max(1, int(window))
-        self.variants = [item for item in variants if item in CONTENT_VARIANTS]
+        requested = list(variants)
+        if "all" in requested:
+            requested = list(CONTENT_VARIANTS)
+        self.variants = [item for item in requested if item in CONTENT_VARIANTS]
         self.installer = installer
         self.allow_reinstall = bool(allow_reinstall)
         self.restore = bool(restore)
@@ -337,6 +357,8 @@ class RepackTester:
         args.extend(apks)
         try:
             output = self.dm._run_adb(args, timeout=300)
+            if "Success" not in output:
+                return False, output
             return True, output
         except Exception as exc:  # noqa: BLE001 - reportado no resultado
             return False, str(exc)
@@ -367,12 +389,22 @@ class RepackTester:
         mark = self.dm.logcat_mark()
         pid = self._launch()
         started = time.monotonic()
+        foreground = False
         if pid is not None:
-            self.dm.wait_for_app_ready(self.package_name, timeout=8, pid=pid)
+            # O foco é medido logo após o launch. A navegação posterior
+            # pode abrir outra tela/app; isso não significa que o app foi
+            # bloqueado pelo anti-tampering.
             try:
-                self.dm.drive_ui(self.package_name, taps=3, timeout=90)
+                foreground = bool(self.dm.wait_for_app_ready(
+                    self.package_name, timeout=20, pid=pid
+                ))
             except Exception:
-                logger.debug("drive_ui falhou no repack %s", label, exc_info=True)
+                foreground = False
+            if foreground:
+                try:
+                    self.dm.drive_ui(self.package_name, taps=3, timeout=90)
+                except Exception:
+                    logger.debug("drive_ui falhou no repack %s", label, exc_info=True)
         died_after = None
         while time.monotonic() - started < self.window:
             time.sleep(1)
@@ -380,14 +412,14 @@ class RepackTester:
                 died_after = int(time.monotonic() - started)
                 break
         alive = bool(pid is not None and self.dm.is_app_alive(pid))
-        foreground = False
+        foreground_end = False
         if alive:
             try:
-                foreground = bool(self.dm.wait_for_app_ready(
+                foreground_end = bool(self.dm.wait_for_app_ready(
                     self.package_name, timeout=2, pid=pid
                 ))
             except Exception:
-                foreground = False
+                foreground_end = False
         logcat = {}
         try:
             logcat = analyze_since(self.dm, mark, self.package_name, pid)
@@ -398,6 +430,7 @@ class RepackTester:
             "pid": pid,
             "alive": alive,
             "foreground": foreground,
+            "foreground_at_end": foreground_end,
             "usable": bool(alive and foreground),
             "died_after": died_after,
             "logcat": logcat,
@@ -441,8 +474,13 @@ class RepackTester:
         ]
         if tool_variants:
             rebuilt = os.path.join(artifacts, "rebuilt-base.apk")
+            rebuilt_mode = (
+                "rebuilt-dex"
+                if all(item == "dex" for item in tool_variants)
+                else "rebuilt"
+            )
             ok, text = _apktool_modify(
-                base, rebuilt, artifacts, "rebuilt", apktool, self.timeout
+                base, rebuilt, artifacts, rebuilt_mode, apktool, self.timeout
             )
             if ok:
                 signed_rebuilt = os.path.join(artifacts, "rebuilt-signed.apk")
@@ -494,12 +532,20 @@ class RepackTester:
                 "verdict_reason": "não foi possível testar o controle re-assinado",
             }
         resigned_usable = bool(resigned.get("usable"))
+        resigned_alive = bool(resigned.get("alive"))
         content = {
             name: observations[name]
             for name in variants
             if name in observations
         }
-        detected = [name for name, item in content.items() if not item.get("usable")]
+        detected = [
+            name for name, item in content.items()
+            if item.get("alive") is False
+        ]
+        inconclusive = [
+            name for name, item in content.items()
+            if item.get("alive") is True and not item.get("usable")
+        ]
         usable = [name for name, item in content.items() if item.get("usable")]
         if not content:
             return {
@@ -516,6 +562,17 @@ class RepackTester:
         ]
         rebuilt = observations.get("rebuilt") or {}
         if tool_variants and not rebuilt.get("usable"):
+            if rebuilt.get("alive") is True:
+                return {
+                    "tamper_detected": None,
+                    "bypass_successful": None,
+                    "attribution": "inconclusive",
+                    "status_hint": "SKIP",
+                    "verdict_reason": (
+                        "o controle reconstruído ficou vivo, mas não em foco; "
+                        "não é possível atribuir o resultado"
+                    ),
+                }
             return {
                 "tamper_detected": None,
                 "bypass_successful": None,
@@ -527,6 +584,17 @@ class RepackTester:
                 ),
             }
         if not resigned_usable:
+            if resigned_alive:
+                return {
+                    "tamper_detected": None,
+                    "bypass_successful": None,
+                    "attribution": "inconclusive",
+                    "status_hint": "SKIP",
+                    "verdict_reason": (
+                        "o controle re-assinado ficou vivo, mas não em foco; "
+                        "resultado inconclusivo"
+                    ),
+                }
             attribution = "signature" if not detected else "signature/content"
             return {
                 "tamper_detected": True,
@@ -546,6 +614,17 @@ class RepackTester:
                 "verdict_reason": (
                     "o app rejeitou variante(s) com conteúdo alterado: "
                     + ", ".join(detected)
+                ),
+            }
+        if inconclusive:
+            return {
+                "tamper_detected": None,
+                "bypass_successful": None,
+                "attribution": "inconclusive",
+                "status_hint": "SKIP",
+                "verdict_reason": (
+                    "variante(s) viva(s), mas sem foco para confirmar uso: "
+                    + ", ".join(inconclusive)
                 ),
             }
         return {
@@ -604,11 +683,15 @@ class RepackTester:
                 "timestamp": _now_iso(),
             }
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        root = os.path.join(self.output_dir, f"{self.package_name}_{stamp}")
-        os.makedirs(root, exist_ok=True)
-        artifacts = root if self.keep_artifacts else tempfile.mkdtemp(
-            prefix="raspilot_repack_"
-        )
+        base_dir = os.path.join(self.output_dir, "repack")
+        os.makedirs(base_dir, exist_ok=True)
+        if self.keep_artifacts:
+            artifacts = os.path.join(base_dir, f"{self.package_name}_{stamp}")
+            os.makedirs(artifacts, exist_ok=True)
+        else:
+            artifacts = tempfile.mkdtemp(
+                prefix=f"{self.package_name}_{stamp}_", dir=base_dir
+            )
         observations: Dict[str, dict] = {}
         errors: Dict[str, str] = {}
         built: Dict[str, List[str]] = {}

@@ -450,3 +450,39 @@ class TestRepackIntegration:
         assert result["tamper_detected"] is True
         assert result["bypass_successful"] is False
         assert result["app_detection"]["variants_detected"] == ["asset"]
+
+
+def test_execution_log_includes_repack_controls():
+    reporter = Reporter(
+        device_info={"serial": "SER"},
+        package_name="com.example.app",
+    )
+    reporter.collect("anti_tampering", {
+        "tamper_detected": False,
+        "static_detected": True,
+        "bypass_successful": True,
+        "bypass_method": "repack",
+        "status_hint": "FALHOU",
+        "bypass_details": {
+            "probe_method": "repack",
+            "observations": {
+                "original": {"label": "original", "alive": True,
+                             "foreground": True, "usable": True},
+                "resigned": {"label": "resigned", "alive": True,
+                             "foreground": True, "usable": True},
+                "asset": {"label": "asset", "alive": True,
+                          "foreground": True, "usable": True},
+            },
+        },
+    })
+    doc = reporter.generate_json()
+    repack_steps = [
+        step for step in doc["execution_log"]
+        if step["check"] == "anti_tampering" and step["phase"] == "repack"
+    ]
+    assert len(repack_steps) == 3
+    assert {step["action"] for step in repack_steps} == {
+        "Observar o APK original",
+        "Instalar o controle re-assinado sem alteração",
+        "Instalar variante com asset marcador",
+    }
