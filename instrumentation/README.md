@@ -73,6 +73,10 @@ Opções: `--hook off|observe|bypass`, `--root off|observe|bypass`,
 `--emu off|observe|probe|mask`, `--target PACOTE`,
 `--label NOME`, `--out CAMINHO_APK`.
 
+`RootShield` é compilado em **todas** as builds; `--root` define apenas o
+modo padrão embutido. O RASPilot usa a configuração em runtime
+(`root=observe`/`root=bypass`) para trocar de fase sem reinstalar o APK.
+
 O build usa apenas o SDK do Android (`build-tools` + `platform`) e um JDK.
 As classes da API Xposed em `xposed/api/` servem **apenas** à compilação:
 em tempo de execução elas são fornecidas pelo framework do dispositivo e

@@ -637,9 +637,11 @@ ls instrumentation/build/raspilot-module.apk
 
 > O APK em `instrumentation/build/raspilot-module.apk` é gerado localmente
 > (o diretório `build/` é ignorado pelo git) e já contém as três camadas.
-> APKs antigos, sem `RootShield`, não servem para a fase de root; use o
-> build automático ou regenere com `instrumentation/build.sh --root off`
-> (o runtime liga `root=observe`/`root=bypass` por fase).
+> **O build automático do RASPilot também sempre compila o `RootShield`**:
+> não existe flag de root no CLI principal. No `build.sh`, `--root` apenas
+> define o modo padrão embutido no APK; o runtime liga
+> `root=observe`/`root=bypass` por fase. Só é preciso atenção se você usar
+> `--module-apk` apontando para um APK antigo, gerado antes do `RootShield`.
 
 ### Cobertura e limitações
 
