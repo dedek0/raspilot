@@ -470,10 +470,10 @@ class AntiRootCheck:
         )
         phase = manager.run_phase(config, window=window, interact=True)
         run = phase.get("run") or {}
-        observed = [
+        observed = list(dict.fromkeys(
             f"{item.get('method')}: {item.get('detail')}".strip(": ")
             for item in run.get("observed", [])
-        ]
+        ))
         result = {
             "detected": bool(observed),
             "detection_methods_found": observed,
@@ -514,14 +514,14 @@ class AntiRootCheck:
         )
         phase = manager.run_phase(config, window=window, interact=True)
         run = phase.get("run") or {}
-        neutralized = [
+        neutralized = list(dict.fromkeys(
             f"{item.get('method')}: {item.get('detail')}".strip(": ")
             for item in run.get("neutralized", [])
-        ]
-        observed = [
+        ))
+        observed = list(dict.fromkeys(
             f"{item.get('method')}: {item.get('detail')}".strip(": ")
             for item in run.get("observed", [])
-        ]
+        ))
         logs.extend(f"[bypass] {item}" for item in neutralized)
         app_alive = run.get("app_alive_at_end")
         if app_alive is False:
