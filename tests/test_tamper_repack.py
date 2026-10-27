@@ -405,6 +405,16 @@ class TestInterpret:
         assert result["tamper_detected"] is None
 
 
+class TestObserve:
+    def test_observe_has_ui_and_signals(self):
+        tester = repack.RepackTester(FakeDM(), "com.example.app", window=1)
+        observation = tester._observe("original")
+        assert observation["alive"] is True
+        assert "ui" in observation
+        assert "signals" in observation
+        assert observation["usable"] is True
+
+
 class TestRunFlow:
     def _tester(self, tmp_path):
         return repack.RepackTester(

@@ -127,7 +127,7 @@ GADGET_PROVIDER_SCRIPT_SMALI = """\
 .end method
 
 .method public onCreate()Z
-    .locals 4
+    .locals 5
     :try_start_0
     invoke-virtual {p0}, Lcom/raspilot/repack/GadgetProvider;->getContext()Landroid/content/Context;
     move-result-object v0
@@ -143,17 +143,26 @@ GADGET_PROVIDER_SCRIPT_SMALI = """\
     new-instance v2, Ljava/io/File;
     const-string v3, "raspilot-gadget.js"
     invoke-direct {v2, v1, v3}, Ljava/io/File;-><init>(Ljava/io/File;Ljava/lang/String;)V
-    new-instance v1, Ljava/io/FileOutputStream;
-    invoke-direct {v1, v2}, Ljava/io/FileOutputStream;-><init>(Ljava/io/File;)V
-    invoke-static {v0, v1}, Ljava/nio/file/Files;->copy(Ljava/io/InputStream;Ljava/io/OutputStream;)J
-    invoke-virtual {v1}, Ljava/io/FileOutputStream;->close()V
+    new-instance v4, Ljava/io/FileOutputStream;
+    invoke-direct {v4, v2}, Ljava/io/FileOutputStream;-><init>(Ljava/io/File;)V
+    const/16 v1, 0x1000
+    new-array v1, v1, [B
+    :goto_0
+    invoke-virtual {v0, v1}, Ljava/io/InputStream;->read([B)I
+    move-result v2
+    if-lez v2, :goto_1
+    const/4 v3, 0x0
+    invoke-virtual {v4, v1, v3, v2}, Ljava/io/FileOutputStream;->write([BII)V
+    goto :goto_0
+    :goto_1
+    invoke-virtual {v4}, Ljava/io/FileOutputStream;->close()V
     invoke-virtual {v0}, Ljava/io/InputStream;->close()V
     :try_end_0
     .catch Ljava/lang/Throwable; {:try_start_0 .. :try_end_0} :catch_0
-    goto :goto_0
+    goto :goto_2
     :catch_0
     move-exception v0
-    :goto_0
+    :goto_2
     new-instance v0, Ljava/lang/Thread;
     new-instance v1, Lcom/raspilot/repack/GadgetLoader;
     invoke-direct {v1}, Lcom/raspilot/repack/GadgetLoader;-><init>()V
@@ -987,6 +996,9 @@ class RepackTester:
             )
         except Exception:
             logger.debug("logcat do repack %s falhou", label, exc_info=True)
+        ui = self._ui_snapshot() if alive else {
+            "ui_text": "", "ui_signals": [], "ui_blocked": False,
+        }
         return {
             "label": label,
             "pid": pid,
