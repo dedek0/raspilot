@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest import mock
 
-from checks.combined import run_combined_bypass, run_combined_observation
+from checks.combined import _hooking_detection, run_combined_bypass, run_combined_observation
 
 
 class _Script:
@@ -202,3 +202,33 @@ def test_combined_bypass_includes_the_verdict_hook_in_the_bundle():
     assert "VERDICT_METHODS" in java_sources[0]
     # o catálogo do host substitui os placeholders do script
     assert "__RASPILOT_VERDICT_METHODS__" not in java_sources[0]
+
+
+def test_hooking_death_without_hook_signal_is_not_attributed():
+    """Morte causada por detecção de Frida não vira proteção anti-hook."""
+    logcat = {
+        "available": True,
+        "death": {"kind": "crash", "detected": True},
+        "crash_origin": "app",
+        "categories": {"frida_agent_crash": 3},
+        "security_signals": [
+            {"category": "frida_agent_crash", "confidence": "low", "line": "agent"},
+        ],
+        "instrumentation_kill": False,
+    }
+    result = _hooking_detection(
+        found=[],
+        strong=[],
+        weak=[],
+        logcat=logcat,
+        baseline={"available": True, "alive_at_end": True},
+        died_after=5,
+        app_alive=False,
+        java_load_error=None,
+        java_skipped=False,
+        stealth_used=False,
+        window=10,
+    )
+    assert result["detected"] is False
+    assert result["death_classification"] == "unattributed_death"
+    assert not any("frida_agent_crash" in item for item in result["detection_methods_found"])

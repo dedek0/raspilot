@@ -105,25 +105,29 @@ class TestGenerateJson:
                 "observation_status": None, "detection_signals": [],
                 "protection_detected": False, "static_present": False,
                 "static_engine": None, "protection_sources": [],
-                "coverage_gaps": [],
+                "coverage_gaps": [], "static_owners": {}, "app_evidence": False,
+                "bypass_successful": None, "bypass_method": None,
             },
             "anti_emulator": {
                 "status": "OK", "protection_detected": True,
                 "bypass_successful": False, "device_is_emulator": False,
                 "protection_sources": [], "static_engine": None,
-                "coverage_gaps": [],
+                "coverage_gaps": [], "static_owners": {}, "app_evidence": False,
             },
             "ssl_pinning": {
                 "status": "FALHOU", "pinning_detected": True,
+                "pinning_suspected": False,
                 "pinning_type": "okhttp", "bypass_successful": True,
                 "intercepted_hosts": ["api.x.com"], "evidence_strength": None,
                 "static_engine": None, "coverage_gaps": [],
+                "static_owners": {}, "app_evidence": False,
             },
             "anti_hooking": {
                 "status": "FALHOU", "protection_detected": True,
                 "bypass_successful": True, "hook_frameworks_present": True,
                 "protection_sources": ["static_apk", "dynamic"],
                 "static_engine": None, "coverage_gaps": [],
+                "static_owners": {}, "app_evidence": False,
             },
         }
         assert doc["details"] == RESULTS

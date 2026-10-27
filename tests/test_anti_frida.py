@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest import mock
 
 from checks.anti_frida import DETECTION_SCRIPT, AntiFridaCheck, _contains_token
+from reporter import Reporter
 
 
 class FakeModule:
@@ -438,3 +439,121 @@ class TestObservationReliability:
     def test_detection_script_has_port_placeholder(self):
         """O script usa o placeholder para receber a porta real no load."""
         assert "__RASPILOT_FRIDA_PORT__" in DETECTION_SCRIPT
+
+
+class TestBypassPhase:
+    """A detecção não termina a auditoria: a evasão é medida à parte."""
+
+    @staticmethod
+    def _detection():
+        return {
+            "vulnerable": False,
+            "detected": True,
+            "observation_status": "ok",
+            "detection_methods_found": ["native_strcmp: needle=/frida/runtime"],
+            "strong_signals": [],
+            "weak_signals": [],
+            "app_alive_at_end": False,
+            "session_unsafe": False,
+        }
+
+    @staticmethod
+    def _patch_device(check):
+        return [
+            mock.patch.object(
+                check, "check_frida_processes", return_value={"detected": True}
+            ),
+            mock.patch.object(
+                check, "check_frida_ports", return_value={"detected": False}
+            ),
+            mock.patch.object(
+                check, "check_frida_threads", return_value={"detected": False}
+            ),
+            mock.patch.object(
+                check, "check_frida_libraries", return_value={"detected": False}
+            ),
+        ]
+
+    def test_bypass_is_attempted_when_protection_is_detected(self):
+        dm = mock.MagicMock()
+        check = AntiFridaCheck(dm, mode="bypass")
+        bypass = {
+            "success": True,
+            "method": "stealth",
+            "app_alive_at_end": True,
+            "neutralized": ["libc.memcmp ocultou marcador"],
+            "bypass_logs": [],
+            "detection_signals": [],
+            "details": "app sobreviveu",
+            "timestamp": "2026-10-27T00:00:00+00:00",
+        }
+        patches = self._patch_device(check)
+        for item in patches:
+            item.start()
+        try:
+            with mock.patch.object(
+                check, "attempt_bypass", return_value=bypass
+            ) as attempt:
+                result = check.run_all(
+                    None,
+                    pid=1,
+                    package_name="com.example.app",
+                    app_detection=self._detection(),
+                )
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        attempt.assert_called_once()
+        assert result["bypass_successful"] is True
+        assert result["bypass_method"] == "stealth"
+        status, summary = Reporter._status_for("anti_frida", result)
+        assert status == "FALHOU"
+        assert summary["bypass_successful"] is True
+
+    def test_detect_mode_does_not_run_bypass(self):
+        dm = mock.MagicMock()
+        check = AntiFridaCheck(dm, mode="detect")
+        patches = self._patch_device(check)
+        for item in patches:
+            item.start()
+        try:
+            with mock.patch.object(check, "attempt_bypass") as attempt:
+                result = check.run_all(
+                    None,
+                    pid=1,
+                    package_name="com.example.app",
+                    app_detection=self._detection(),
+                )
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        attempt.assert_not_called()
+        assert result["bypass_successful"] is None
+        assert "modo detect" in result["bypass_skipped_reason"]
+
+    def test_alive_app_is_bypass_success(self):
+        dm = mock.MagicMock()
+        dm.logcat_mark = None
+        dm.last_spawn_package = "com.example.app"
+        dm.last_spawn_pid = 321
+        dm.is_app_alive.return_value = True
+        check = AntiFridaCheck(dm, mode="bypass", no_java=True)
+        with mock.patch("checks.anti_frida.load_stealth", return_value=[]), \
+             mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
+            result = check.attempt_bypass("com.example.app", window=1)
+        assert result["success"] is True
+        assert result["method"] == "stealth"
+        dm.resume_app.assert_called_once()
+
+    def test_death_during_bypass_is_resistance(self):
+        dm = mock.MagicMock()
+        dm.logcat_mark = None
+        dm.last_spawn_package = "com.example.app"
+        dm.last_spawn_pid = 321
+        dm.is_app_alive.return_value = False
+        check = AntiFridaCheck(dm, mode="bypass", no_java=True)
+        with mock.patch("checks.anti_frida.load_stealth", return_value=[]), \
+             mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
+            result = check.attempt_bypass("com.example.app", window=1)
+        assert result["success"] is False
+        assert "resistiu" in result["details"]

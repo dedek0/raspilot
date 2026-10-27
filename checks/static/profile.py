@@ -25,6 +25,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from checks.apk_utils import pull_apk, scan_apk
 from checks.static.engine import AscEngine, apk_digest, asc_available
+from checks.taxonomy import is_app_evidence, marker_owner, owner_counts
 from checks.static.queries import (
     ASC_QUERIES,
     BYPASS_HOOKS,
@@ -93,6 +94,7 @@ def _finding(
     class_name: str = "",
     method: str = "",
     label: str = "",
+    owner: str = "unknown",
 ) -> dict:
     """Monta um achado estático normalizado."""
     return {
@@ -105,6 +107,7 @@ def _finding(
         "class": class_name,
         "method": method,
         "label": label or value,
+        "owner": owner,
     }
 
 
@@ -155,6 +158,11 @@ def _builtin_signatures() -> List[tuple]:
         return signatures
 
     for signature_type, needles in hook_signatures:
+        # O grupo "frida" do anti-hooking descreve um artefato de
+        # instrumentação, não uma checagem anti-hook. Ele é coberto pelo
+        # vetor frida; misturar os dois contamina o veredito.
+        if signature_type == "frida":
+            continue
         signatures.append(
             (
                 "hooking",
@@ -258,6 +266,7 @@ def _scan_builtin(apks: List[str]) -> List[dict]:
                         evidence=f"[APK] {description}",
                         confidence=_builtin_confidence(vector, description),
                         label=description,
+                        owner="apk",
                     )
                 )
     return findings
@@ -320,7 +329,7 @@ def _classes_from_apks(engine: AscEngine, apks: List[str], errors: List[str]) ->
 def _matches_frida_class(lowered: str) -> bool:
     """Evita marcar o pacote de um app cujo nome contém "frida".
 
-    ``com.exemplo.fridagate`` não é uma classe de detecção; ``FridaDetector``
+    ``com.exemplo.fridaplayer`` não é uma classe de detecção; ``FridaDetector``
     e ``AntiFrida`` são. O teste olha segmentos da classe, não substring.
     """
     if re.search(r"(^|[.$])(anti)?frida([.$]|$)", lowered):
@@ -333,7 +342,7 @@ def _matches_frida_class(lowered: str) -> bool:
     )
 
 
-def _class_findings(classes: List[str]) -> List[dict]:
+def _class_findings(classes: List[str], package_name: str = "") -> List[dict]:
     """Transforma classes conhecidas em achados por vetor."""
     findings: List[dict] = []
     for name in classes:
@@ -344,9 +353,8 @@ def _class_findings(classes: List[str]) -> List[dict]:
                 continue
             if marker.lower() in lowered:
                 confidence = "low" if marker.lower() == "frida" else "medium"
-                if vector == "pinning" and name.startswith(
-                    ("Lokhttp3/", "Lcom/datatheorem/android/trustkit/")
-                ):
+                owner = marker_owner(name, package_name)
+                if vector == "pinning" and owner in ("library", "third_party_sdk"):
                     # A biblioteca pode estar empacotada sem que o app a use
                     # para fixar certificados.
                     confidence = "low"
@@ -361,6 +369,7 @@ def _class_findings(classes: List[str]) -> List[dict]:
                         confidence=confidence,
                         class_name=name,
                         label=label,
+                        owner=owner,
                     )
                 )
     return findings
@@ -415,6 +424,7 @@ def _asc_profile(
     engine: AscEngine,
     apks: List[str],
     errors: List[str],
+    package_name: str = "",
 ) -> dict:
     """Executa as consultas de alto sinal no ASC."""
     dex_apks = [apk for apk in apks if _has_dex(apk)] or apks
@@ -430,7 +440,7 @@ def _asc_profile(
         errors.append(f"getmanifest: {eng_manifest.get('stderr')}")
 
     classes = _classes_from_apks(engine, dex_apks, errors)
-    findings.extend(_class_findings(classes))
+    findings.extend(_class_findings(classes, package_name))
 
     for query in ASC_QUERIES:
         for apk in dex_apks:
@@ -558,6 +568,7 @@ def _asc_profile(
                         class_name=hit_class,
                         method=hit.get("method") or "",
                         label=label,
+                        owner=marker_owner(hit_class, package_name),
                     )
                 )
 
@@ -588,6 +599,13 @@ def _summarize(findings: List[dict], vectors: List[str]) -> Dict[str, dict]:
             if confidence in counts:
                 counts[confidence] += 1
         sources = sorted({item.get("source") for item in items if item.get("source")})
+        owners = owner_counts(item.get("owner") for item in items)
+        app_evidence = any(
+            item.get("source") == "asc"
+            and item.get("confidence") in ("medium", "high")
+            and is_app_evidence(item.get("owner"))
+            for item in items
+        )
         techniques = []
         for item in items:
             label = item.get("label") or item.get("value")
@@ -598,6 +616,8 @@ def _summarize(findings: List[dict], vectors: List[str]) -> Dict[str, dict]:
             "confidence": _confidence_max(item.get("confidence") for item in items),
             "counts": counts,
             "sources": sources,
+            "owners": owners,
+            "app_evidence": app_evidence,
             "techniques": techniques[:12],
             "findings": items[:60],
             "total": len(items),
@@ -632,6 +652,7 @@ def _coverage(vectors: Dict[str, dict], engine: str) -> Dict[str, dict]:
             "bypass_hooks": list(BYPASS_HOOKS.get(vector, [])),
             "possible_gaps": gaps,
             "static_present": bool(summary.get("present")),
+            "app_evidence": bool(summary.get("app_evidence")),
         }
     return coverage
 
@@ -770,7 +791,9 @@ def build_static_profile(
         if effective_engine == "asc":
             asc_engine = AscEngine(timeout=timeout, cache=cache)
             try:
-                asc_data = _asc_profile(asc_engine, apks, errors)
+                asc_data = _asc_profile(
+                    asc_engine, apks, errors, package_name=package_name
+                )
             except Exception as exc:  # o ASC não pode derrubar o pipeline
                 logger.warning("Perfil ASC falhou", exc_info=True)
                 errors.append(f"ASC: {exc}")
@@ -820,6 +843,8 @@ def build_static_profile(
                         "present": vectors_summary[vector]["present"],
                         "confidence": vectors_summary[vector]["confidence"],
                         "total": vectors_summary[vector]["total"],
+                        "owners": vectors_summary[vector].get("owners") or {},
+                        "app_evidence": bool(vectors_summary[vector].get("app_evidence")),
                     }
                     for vector in requested
                 },
@@ -869,6 +894,8 @@ def vector_view(profile: Optional[dict], name: str) -> Optional[dict]:
     view["version"] = profile.get("version")
     view["available"] = True
     view["coverage"] = (profile.get("coverage") or {}).get(name)
+    view["owners"] = dict(vector.get("owners") or {})
+    view["app_evidence"] = bool(vector.get("app_evidence"))
     view["findings"] = list(vector.get("findings") or [])[:20]
     return view
 

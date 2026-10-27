@@ -182,7 +182,7 @@ beat the protection", while also flagging gaps in bypass-hook coverage.
 It does **not** replace dynamic observation: presence in the APK is not
 proof of execution.
 
-Anti-Frida + anti-hooking observation runs in a **single session**, and anti-hooking/SSL bypasses share another spawn. The anti-emulator check runs **last**, with its own spawns: the probe makes the app see an emulator, and a shared spawn would contaminate the other checks. The APK cache lives in `~/.raspilot/cache/apk` (disable with `RASPILOT_APK_CACHE=0`); the static profile cache lives in `~/.raspilot/cache/static` (disable with `RASPILOT_STATIC_CACHE=0`).
+Anti-Frida + anti-hooking observation runs in a **single session**, and anti-hooking/SSL bypasses share another spawn. Anti-Frida detection and bypass use separate spawns: first the app reaction is measured; then native evasion is loaded before resume. The anti-emulator check runs **last**, with its own spawns: the probe makes the app see an emulator, and a shared spawn would contaminate the other checks. The APK cache lives in `~/.raspilot/cache/apk` (disable with `RASPILOT_APK_CACHE=0`); the static profile cache lives in `~/.raspilot/cache/static` (disable with `RASPILOT_STATIC_CACHE=0`).
 
 Status semantics:
 
@@ -199,7 +199,9 @@ Status semantics:
 > the status becomes `N/A` (there was no protection to beat). If the APK
 > references the check but the app does not react, the status stays
 > `FALHOU`: the protection exists in code but was not observed in the
-> window. The reason is stored in `verdict_reason`.
+> window. The reason is stored in `verdict_reason`. When evasion runs, the
+> final status follows `bypass_successful`: `True` ⇒ `FALHOU` (RASP
+> bypassed), `False` ⇒ `OK` (protection resisted evasion).
 
 > **Golden rule:** RASPilot only claims a protection held when there is
 > high-confidence evidence. Generic logcat terms (`root`, `hook`,
@@ -261,6 +263,11 @@ Confidence is calibrated to avoid false positives: bundled
 does not count as anti-hook; and a generic `frida` string does not count
 as anti-Frida.
 
+Each finding also receives an **owner**: `app`, `rasp_sdk`,
+`third_party_sdk`, `framework`, `library` or `unknown` (obfuscated code).
+The report exposes `static_owners` and `app_evidence` to separate an app
+check from a bundled library or third-party SDK class.
+
 The ASC runs as a subprocess with a timeout and per-APK cache. Without
 it (or with `--static-engine builtin`) RASPilot keeps working with the
 byte scan and records the limitation in the report. Cache lives in
@@ -319,6 +326,13 @@ pipeline yet.
   low/medium confidence and do not enter the verdict; only high-confidence
   evidence (detection context, `gum-js-loop`, `linjector`, `libfrida`)
   counts as anti-Frida protection.
+- **Bypass (evasion)**: after detection, a fresh spawn loads
+  `proc_filter.js` + `anti_frida_bypass.js` before resume. Hooks cover
+  `strstr`, `strcmp`, `strncmp` and `memcmp` (fast-path by size/first
+  byte), Frida paths/ports, thread names and self-termination
+  (`raise`/`abort`/`kill`/`exit`). Detection and evasion are separate
+  results: `bypass_successful=True` ⇒ the app survived without reacting
+  (RASP bypassed); `False` ⇒ the protection resisted evasion.
 
 `vulnerable=True` ⇒ the app did **not** detect Frida (RASP failure).
 When the static profile is available and finds no high-confidence
@@ -416,6 +430,12 @@ phases consolidated into `protection_detected` + `bypass_successful`:
 (RASP failure). `bypass_successful=True` ⇒ the protection exists, but the
 bypass won.
 
+Anti-hook detection uses only hooking artifacts (Xposed, LSPosed,
+Substrate, SandHook/YAHFA/LSPlant/Whale/Dobby, Riru/Zygisk). Frida
+artifacts belong to the anti-Frida vector: an app death during
+instrumentation is **not** credited to anti-hook without a specific
+anti-hook signal.
+
 With `--hook-method module` (the default when a hooking framework is
 available on the device) the observation and the bypass run **without**
 external instrumentation: the module is scoped to the target package,
@@ -430,6 +450,11 @@ vector the protection actually inspects.
   Conscrypt/native signatures (binary Manifest, DEX, native libs). With
   ASC the manifest is decoded (`networkSecurityConfig`, `debuggable`) and
   `findrefs impl X509TrustManager` locates custom TrustManagers.
+  References inside the bundled library (okhttp/TrustKit) do not count as
+  app usage.
+- **Weak evidence**: if only weak indicators exist (custom TrustManager,
+  `networkSecurityConfig` without `pin-set`, BoringSSL) and a plausible
+  native gap, the result is `SKIP`/inconclusive, not `N/A`.
 - **Dynamic bypass**: injects `scripts/ssl_bypass.js` (universal) covering
   TrustManager, HostnameVerifier, OkHttp 3/4, NSC, Conscrypt, Apache
   HttpClient, WebView, BoringSSL/OpenSSL and Flutter. Bypass is only
@@ -639,6 +664,7 @@ raspilot/
 │   ├── combined.py             # Single-session observation/bypass
 │   ├── stealth.py              # Native bootstrap before resume
 │   ├── apk_utils.py            # Shared APK helpers + APK cache
+│   ├── taxonomy.py             # Per-vector artifacts + finding owner
 │   ├── static/                 # Static profile (signatures + Droid ASC)
 │   │   ├── engine.py           # ASC subprocess, timeout and cache
 │   │   ├── queries.py          # Signatures and high-signal queries

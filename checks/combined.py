@@ -278,15 +278,8 @@ def _hooking_detection(
     for entry in format_detection_signals(logcat, HOOK_CATEGORIES, limit=4):
         method, _, detail = entry.partition(": ")
         add_signal(method, detail)
-    if _agent_terminated(logcat):
-        for item in logcat.get("security_signals", []) or []:
-            if isinstance(item, dict) and item.get("category") == "frida_agent_crash":
-                # Falha da instrumentação: não é checagem do app.
-                entry = f"frida_agent_crash: {item.get('line', '')}"
-                if entry not in found:
-                    found.append(entry)
-                    weak.append(entry)
-                break
+    # frida_agent_crash é uma falha da instrumentação/Frida, não uma
+    # checagem anti-hook; ela pertence ao vetor anti-Frida.
 
     if not app_alive and died_after is None:
         died_after = max(1, int(window))
@@ -321,6 +314,13 @@ def _hooking_detection(
             category in (logcat.get("categories") or {})
             for category in HIGH_CONFIDENCE_CATEGORIES
         ) or bool(logcat.get("vendor_signals"))
+        hook_logcat = any(
+            isinstance(item, dict)
+            and item.get("category") == "hooking"
+            and item.get("confidence") == "high"
+            for item in logcat.get("security_signals", []) or []
+        )
+        hook_specific = bool(strong) or hook_logcat
         kill_traced = any(item.startswith("app_kill") for item in strong)
         if kill_traced:
             death_classification = "rasp_kill"
@@ -331,7 +331,7 @@ def _hooking_detection(
                 "app encerrou no baseline sem instrumentação; não é possível "
                 "isolar uma reação anti-hook"
             )
-        elif logcat_rasp or _agent_terminated(logcat):
+        elif logcat_rasp:
             death_classification = "rasp_reaction"
         elif logcat.get("instrumentation_kill"):
             death_classification = "start_timeout"
@@ -360,6 +360,17 @@ def _hooking_detection(
                 "o processo encerrou sem que a causa pudesse ser atribuida "
                 f"({death_classification}); não é possível concluir se houve "
                 "reação à instrumentação"
+            )
+
+        # A morte só é atribuída ao anti-hook quando existe um sinal
+        # anti-hook específico. Uma queda causada pela detecção de Frida
+        # não pode virar "proteção anti-hook detectada".
+        if death_classification in ("rasp_kill", "rasp_reaction") and not hook_specific:
+            death_classification = "unattributed_death"
+            observation_status = "inconclusive"
+            error = (
+                "app encerrou durante a instrumentação sem sinal anti-hook "
+                "específico; a morte não é atribuída ao anti-hook"
             )
 
         if death_classification in ("rasp_kill", "rasp_reaction"):

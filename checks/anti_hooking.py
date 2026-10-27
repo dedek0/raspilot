@@ -221,12 +221,16 @@ var RASPILOT_JAVA_ONLY = (typeof __RASPILOT_JAVA_ONLY__ !== 'undefined')
 // Palavras-chave de frameworks de hooking que apps anti-hook procuram
 // (em classes, paths, comandos e buscas nativas).
 //
+// Frida e seus artefatos (frida, libfrida, gum-js, linjector, gadget)
+// pertencem ao vetor anti-Frida. Mantê-los aqui fazia a detecção de
+// Frida aparecer como detecção anti-hook.
+//
 // Termos ambíguos ('whale', 'gadget') só casam quando aparecem como
 // TOKEN isolado: "gadgets" ou "bluewhale" não são evidência de nada.
 var HOOK_KEYWORDS = [
-    'frida', 'libfrida', 'xposed', 'lsposed', 'lspd', 'edxposed', 'substrate',
+    'xposed', 'lsposed', 'lspd', 'edxposed', 'substrate',
     'sandhook', 'yahfa', 'lsplant', 'whale', 'dobby', 'riru', 'zygisk',
-    'gadget', 'gum-js', 'linjector', 'andhook', 'shadowhook'
+    'andhook', 'shadowhook'
 ];
 
 // Casa um termo como TOKEN, e não como substring solta.
@@ -2120,6 +2124,8 @@ class AntiHookingCheck:
                     "vector": "hooking",
                     "present": bool(static_view.get("effective", static_view.get("present"))),
                     "confidence": static_view.get("confidence"),
+                    "owners": static_view.get("owners") or {},
+                    "app_evidence": bool(static_view.get("app_evidence")),
                     "coverage": static_view.get("coverage"),
                 }
                 if static_view is not None

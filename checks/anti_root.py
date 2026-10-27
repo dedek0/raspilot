@@ -473,6 +473,8 @@ class AntiRootCheck:
                 "vector": "root",
                 "present": bool(static_view.get("present")),
                 "confidence": static_view.get("confidence"),
+                "owners": static_view.get("owners") or {},
+                "app_evidence": bool(static_view.get("app_evidence")),
                 "coverage": static_view.get("coverage"),
             }
         else:

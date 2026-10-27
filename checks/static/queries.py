@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-PROFILE_VERSION = 2
+PROFILE_VERSION = 3
 
 VECTORS: Tuple[str, ...] = (
     "frida",

@@ -1060,6 +1060,206 @@ class AntiFridaCheck:
         return result
 
     # ------------------------------------------------------------------
+    # Bypass (evasão ativa)
+    # ------------------------------------------------------------------
+    def attempt_bypass(self, package_name: str, window: int = 12) -> dict:
+        """Tenta sobreviver à instrumentação com a evasão anti-Frida.
+
+        A fase de observação mede se o app detecta o Frida. Esta fase
+        responde outra pergunta: com os artefatos nativos ocultos antes
+        do resume, o app continua vivo e deixa de reagir?
+
+        A evasão é carregada **antes** do resume (``load_stealth``), para
+        que os hooks de ``/proc``, strings e auto-destruição estejam
+        ativos antes do código do app. O bypass não carrega o script de
+        observação de detecção: ele mede a reação do app (morte/logcat e
+        ações neutralizadas), não a mera chamada de comparação.
+
+        Args:
+            package_name: Package name do alvo.
+            window: Janela de observação em segundos.
+
+        Returns:
+            Dict com ``success`` (bool|None), ``method``, ``app_alive_at_end``,
+            ``neutralized``, ``bypass_logs``, ``detection_signals``,
+            ``error`` e ``timestamp``.
+        """
+        if self.mode == "detect":
+            return {
+                "success": None,
+                "method": "stealth",
+                "skipped_reason": "modo detect: bypass anti-Frida não executado",
+                "app_alive_at_end": None,
+                "neutralized": [],
+                "bypass_logs": [],
+                "detection_signals": [],
+                "timestamp": _now_iso(),
+            }
+        if not package_name:
+            return {
+                "success": None,
+                "method": "stealth",
+                "skipped_reason": "package name ausente",
+                "app_alive_at_end": None,
+                "neutralized": [],
+                "bypass_logs": [],
+                "detection_signals": [],
+                "timestamp": _now_iso(),
+            }
+
+        neutralized: List[str] = []
+        bypass_logs: List[str] = []
+        detection_signals: List[str] = []
+        script_errors: List[str] = []
+        stealth_loaded: List[tuple] = []
+        session = None
+        pid: Optional[int] = None
+        resumed = False
+        error: Optional[str] = None
+        kill_script = None
+        logcat_mark = None
+        try:
+            marker = getattr(self.dm, "logcat_mark", None)
+            if callable(marker):
+                logcat_mark = marker()
+
+            def on_message(message, data):  # noqa: ANN001 - assinatura frida
+                if message.get("type") != "send":
+                    return
+                payload = message.get("payload", {})
+                ptype = payload.get("type")
+                text = str(payload.get("message") or payload.get("detail") or "")
+                if ptype == "raspilot-bypass" and text:
+                    if text not in bypass_logs:
+                        bypass_logs.append(text)
+                elif ptype == "raspilot-neutralized" and text:
+                    if text not in neutralized:
+                        neutralized.append(text)
+                elif ptype == "frida-detection" and text:
+                    if text not in detection_signals:
+                        detection_signals.append(text)
+                elif ptype in ("frida-detection-error", "raspilot-script-error"):
+                    if text:
+                        script_errors.append(text)
+
+            session = self.dm.spawn_app(package_name, resume=False)
+            pid = getattr(self.dm, "last_spawn_pid", None)
+            if pid is None:
+                pid = self.dm.get_app_pid(package_name)
+
+            stealth_loaded = load_stealth(
+                session,
+                on_message=on_message,
+                replacements=self._script_replacements(),
+                include_proc_filter=True,
+                load_native_frida=True,
+            )
+            # Um único script de observação de reação: se o app tentar se
+            # matar, o kill_trace registra; a evasão deve impedir a morte.
+            self.dm.resume_app()
+            resumed = True
+            if not self.no_java:
+                try:
+                    kill_script = load_script_file(
+                        session,
+                        KILL_TRACE_SCRIPT,
+                        on_message=on_message,
+                        name="raspilot-frida-bypass-killtrace",
+                        load_timeout=3.0,
+                    )
+                except Exception:
+                    kill_script = None
+                    logger.debug("kill_trace indisponível no bypass anti-Frida", exc_info=True)
+            for _ in range(max(1, int(window))):
+                time.sleep(OBSERVATION_POLL_INTERVAL)
+                if pid is not None and not self.dm.is_app_alive(pid):
+                    break
+            app_alive = None
+            if pid is not None:
+                try:
+                    app_alive = bool(self.dm.is_app_alive(pid))
+                except Exception:
+                    app_alive = None
+        except Exception as exc:
+            error = str(exc)
+            logger.warning("Bypass anti-Frida falhou", exc_info=True)
+            app_alive = None
+            kill_script = None
+        finally:
+            if not resumed:
+                try:
+                    self.dm.resume_app()
+                except Exception:
+                    logger.debug("Falha ao retomar app após bypass", exc_info=True)
+            try:
+                if kill_script is not None:
+                    safe_unload(kill_script)
+            except Exception:
+                logger.debug("Falha ao descarregar kill_trace", exc_info=True)
+            unload_stealth(stealth_loaded)
+            safe_detach(session)
+
+        logcat = {}
+        if logcat_mark is not None:
+            try:
+                logcat = analyze_since(self.dm, logcat_mark, package_name, pid)
+            except Exception:
+                logger.debug("Falha ao correlacionar logcat no bypass", exc_info=True)
+
+        logcat_rasp = bool(
+            (logcat.get("failure") or {}).get("is_rasp")
+            if isinstance(logcat.get("failure"), dict)
+            else logcat.get("is_rasp")
+        )
+        instrumentation_issue = bool(
+            logcat.get("instrumentation_kill")
+            or logcat.get("agent_terminated")
+        )
+        if error:
+            success = None
+            reason = f"bypass anti-Frida: {error}"
+        elif app_alive is False:
+            success = False
+            reason = "app encerrou durante o bypass: a proteção resistiu à evasão"
+        elif instrumentation_issue:
+            success = None
+            reason = "a instrumentação caiu durante o bypass; resultado inconclusivo"
+        elif logcat_rasp:
+            success = False
+            reason = "logcat registrou reação de RASP durante o bypass"
+        elif app_alive is True:
+            success = True
+            reason = (
+                "app sobreviveu à evasão"
+                + (" com ações neutralizadas" if neutralized else "")
+            )
+        else:
+            success = None
+            reason = "não foi possível confirmar o estado do app"
+
+        result = {
+            "success": success,
+            "method": "stealth",
+            "app_alive_at_end": app_alive,
+            "neutralized": neutralized,
+            "bypass_logs": bypass_logs,
+            "detection_signals": detection_signals,
+            "script_errors": script_errors,
+            "logcat": logcat,
+            "details": reason,
+            "timestamp": _now_iso(),
+        }
+        if success is None:
+            result["skipped_reason"] = reason
+        if error:
+            result["error"] = error
+        logger.info(
+            "Bypass anti-Frida: success=%s alive=%s neutralized=%s",
+            success, app_alive, len(neutralized),
+        )
+        return result
+
+    # ------------------------------------------------------------------
     # Consolidação
     # ------------------------------------------------------------------
     def run_all(
@@ -1150,7 +1350,11 @@ class AntiFridaCheck:
         protection_detected = static_present or detected_by_app
         protection_sources = []
         if static_present:
-            protection_sources.append("static_apk")
+            protection_sources.append(
+                "static_asc"
+                if (static_view or {}).get("engine") == "asc"
+                else "static_apk"
+            )
         if detected_by_app:
             protection_sources.append("dynamic")
 
@@ -1211,6 +1415,28 @@ class AntiFridaCheck:
         if static_view is not None:
             static_detection["asc"] = static_view
 
+        bypass_details: Optional[dict] = None
+        bypass_successful: Optional[bool] = None
+        bypass_skipped_reason: Optional[str] = None
+        bypass_method = "stealth"
+        if self.mode == "detect":
+            bypass_skipped_reason = "modo detect: bypass anti-Frida não executado"
+        elif not protection_detected:
+            bypass_skipped_reason = "sem proteção anti-Frida identificada"
+        elif package_name:
+            bypass_details = self.attempt_bypass(package_name, window=window)
+            bypass_method = str(bypass_details.get("method") or "stealth")
+            if bypass_details.get("success") is None:
+                bypass_skipped_reason = str(
+                    bypass_details.get("skipped_reason")
+                    or bypass_details.get("error")
+                    or "bypass anti-Frida inconclusivo"
+                )
+            else:
+                bypass_successful = bool(bypass_details.get("success"))
+        else:
+            bypass_skipped_reason = "package name ausente"
+
         result = {
             "vulnerable": vulnerable,
             "frida_present": frida_present,
@@ -1224,6 +1450,10 @@ class AntiFridaCheck:
             "static_detection": static_detection,
             "protection_detected": protection_detected,
             "protection_sources": protection_sources,
+            "bypass_successful": bypass_successful,
+            "bypass_method": bypass_method,
+            "bypass_details": bypass_details,
+            "bypass_skipped_reason": bypass_skipped_reason,
             "status_hint": status_hint,
             "verdict_reason": verdict_reason,
             "baseline": app_detection.get("baseline"),
@@ -1236,6 +1466,8 @@ class AntiFridaCheck:
                 "vector": "frida",
                 "present": static_present,
                 "confidence": static_view.get("confidence"),
+                "owners": static_view.get("owners") or {},
+                "app_evidence": bool(static_view.get("app_evidence")),
                 "coverage": static_view.get("coverage"),
             }
         if app_detection.get("error") and status_hint is None:

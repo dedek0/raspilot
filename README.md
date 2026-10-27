@@ -173,7 +173,7 @@ morre sozinho; assim um crash da instrumentação ou o ciclo de vida normal
 do app não é confundido com uma reação do RASP.
 Antes de qualquer spawn, um **perfil estático** do APK é construído uma única vez e compartilhado pelos checks: varredura de assinaturas (sempre) + manifesto, classes e referências de método via Droid ASC (quando instalado). O perfil fica em cache por hash dos APKs e serve para separar "o app não tem proteção" de "o bypass venceu a proteção" e para apontar lacunas de cobertura dos hooks. Ele **não** substitui a observação dinâmica: presença no APK não prova execução.
 
-A observação anti-Frida + anti-hooking roda em uma **sessão única**, e os bypasses de anti-hooking/SSL compartilham outro spawn. O anti-emulador roda **por último**, com spawns próprios: o probe faz o app enxergar um emulador, e um spawn compartilhado contaminaria os demais checks. O cache de APK fica em `~/.raspilot/cache/apk` (desative com `RASPILOT_APK_CACHE=0`); o cache do perfil estático fica em `~/.raspilot/cache/static` (desative com `RASPILOT_STATIC_CACHE=0`).
+A observação anti-Frida + anti-hooking roda em uma **sessão única**, e os bypasses de anti-hooking/SSL compartilham outro spawn. A detecção e o bypass anti-Frida usam spawns separados: primeiro mede-se a reação do app; depois a evasão nativa é carregada antes do resume. O anti-emulador roda **por último**, com spawns próprios: o probe faz o app enxergar um emulador, e um spawn compartilhado contaminaria os demais checks. O cache de APK fica em `~/.raspilot/cache/apk` (desative com `RASPILOT_APK_CACHE=0`); o cache do perfil estático fica em `~/.raspilot/cache/static` (desative com `RASPILOT_STATIC_CACHE=0`).
 
 Semântica de status:
 
@@ -190,7 +190,9 @@ Semântica de status:
 > runtime, o status passa a ser `N/A` (não havia proteção a ser vencida).
 > Se o APK referencia a checagem mas o app não reage, o status continua
 > `FALHOU`: a proteção existe no código, mas não foi observada na janela.
-> O motivo fica em `verdict_reason`.
+> O motivo fica em `verdict_reason`. Quando a evasão é executada, o status
+> final considera `bypass_successful`: `True` ⇒ `FALHOU` (RASP
+> contornado), `False` ⇒ `OK` (proteção resistiu à evasão).
 
 > **Regra de ouro:** o RASPilot só afirma que uma proteção resistiu quando
 > houve evidência de confiança alta. Termos genéricos de logcat (`root`,
@@ -253,6 +255,12 @@ customizado só conta com indício de pinning; `getStackTrace` isolado não
 conta como anti-hook; e uma string `frida` genérica não conta como
 anti-Frida.
 
+Cada achado também recebe um **dono**: `app`, `rasp_sdk`,
+`third_party_sdk`, `framework`, `library` ou `unknown` (código
+ofuscado). O relatório expõe `static_owners` e `app_evidence`, para
+distinguir uma checagem do app de uma classe empacotada de biblioteca
+ou de um SDK terceiro.
+
 O ASC é executado como subprocesso, com timeout e cache por hash do APK.
 Sem ele (ou com `--static-engine builtin`), o RASPilot continua
 funcionando com a varredura de bytes e registra a limitação no relatório.
@@ -312,6 +320,13 @@ pipeline.
   nome do app) ficam em baixa/média confiança e não entram no veredito;
   só evidência de alta confiança (contexto de detecção, `gum-js-loop`,
   `linjector`, `libfrida`) conta como proteção anti-Frida.
+- **Bypass (evasão)**: depois da detecção, um novo spawn carrega
+  `proc_filter.js` + `anti_frida_bypass.js` antes do resume. Os hooks
+  cobrem `strstr`, `strcmp`, `strncmp` e `memcmp` (com fast-path por
+  tamanho/primeiro byte), paths e portas do Frida, nomes de threads e
+  auto-destruição (`raise`/`abort`/`kill`/`exit`). O resultado separa
+  detecção de evasão: `bypass_successful=True` ⇒ o app sobreviveu sem
+  reagir (RASP contornado); `False` ⇒ a proteção resistiu à evasão.
 
 `vulnerable=True` ⇒ o app **não** detectou o Frida (falha de RASP).
 Quando o perfil estático está disponível e não encontra nenhuma proteção
@@ -407,6 +422,11 @@ independentes consolidadas em `protection_detected` + `bypass_successful`:
 observáveis (falha de RASP). `bypass_successful=True` ⇒ a proteção existe,
 mas o bypass venceu.
 
+A detecção anti-hook usa apenas artefatos de hooking (Xposed, LSPosed,
+Substrate, SandHook/YAHFA/LSPlant/Whale/Dobby, Riru/Zygisk). Artefatos do
+Frida são do vetor anti-Frida: a morte do app durante a instrumentação
+**não** é creditada ao anti-hook sem um sinal anti-hook específico.
+
 Com `--hook-method module` (default quando há framework de hooking no
 dispositivo), a observação e o bypass rodam **sem** instrumentação externa:
 o módulo é limitado ao pacote alvo, registra as consultas anti-hook do app
@@ -421,7 +441,12 @@ proteção de fato fiscaliza.
   NetworkSecurityConfig, Flutter e Conscrypt/nativo (Manifest binário,
   DEX, libs nativas). Com ASC, o manifesto é decodificado
   (`networkSecurityConfig`, `debuggable`) e `findrefs impl
-  X509TrustManager` localiza TrustManagers customizados.
+  X509TrustManager` localiza TrustManagers customizados. Referências
+  empacotadas da própria biblioteca (okhttp/TrustKit) não contam como
+  uso pelo app.
+- **Evidência fraca**: se só houver indícios fracos (TrustManager
+  customizado, `networkSecurityConfig` sem `pin-set`, BoringSSL) e uma
+  lacuna nativa plausível, o resultado é `SKIP`/inconclusivo, não `N/A`.
 - **Bypass dinâmico**: injeta `scripts/ssl_bypass.js` (universal) cobrindo
   TrustManager, HostnameVerifier, OkHttp 3/4, NSC, Conscrypt, Apache
   HttpClient, WebView, BoringSSL/OpenSSL e Flutter. Bypass só é considerado
@@ -664,12 +689,13 @@ raspilot/
 │   └── xposed/                 # Fontes do módulo (anti-hook + spoof de emulador)
 ├── checks/
 │   ├── anti_root.py            # Detecção de root multi-vetor
-│   ├── anti_frida.py           # Presença/detecção de Frida
+│   ├── anti_frida.py           # Presença/detecção/bypass de Frida
 │   ├── anti_emulator.py        # Detecção + bypass de anti-emulador
 │   ├── anti_hooking.py         # Detecção + bypass de anti-hooking
 │   ├── combined.py             # Observação/bypass em sessão única
 │   ├── stealth.py              # Bootstrap nativo antes do resume
 │   ├── apk_utils.py            # Helpers compartilhados + cache de APK
+│   ├── taxonomy.py             # Artefatos por vetor + dono do achado
 │   ├── static/                 # Perfil estático (assinaturas + Droid ASC)
 │   │   ├── engine.py           # Subprocesso, timeout e cache do ASC
 │   │   ├── queries.py          # Assinaturas e consultas de alto sinal

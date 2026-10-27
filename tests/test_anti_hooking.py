@@ -376,7 +376,7 @@ class TestAppDetection:
         check = AntiHookingCheck(mock.MagicMock())
         session = FakeSession(detection_messages=[
             _det("status_scan", "/proc/self/status via open"),
-            _det("native_strstr", "needle=frida"),
+            _det("native_strstr", "needle=xposed"),
         ])
         with mock.patch("checks.anti_hooking.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_hook_detection_in_app(session)

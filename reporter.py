@@ -189,13 +189,26 @@ class Reporter:
                 "protection_detected": bool(result.get("protection_detected")),
                 "static_present": bool(static_analysis.get("present")),
                 "static_engine": static_analysis.get("engine"),
+                "static_owners": static_analysis.get("owners") or {},
+                "app_evidence": bool(static_analysis.get("app_evidence")),
                 "protection_sources": list(result.get("protection_sources") or []),
                 "coverage_gaps": (
                     (static_analysis.get("coverage") or {}).get("possible_gaps", [])
                 ),
+                "bypass_successful": result.get("bypass_successful"),
+                "bypass_method": result.get("bypass_method"),
             }
+            if result.get("bypass_skipped_reason"):
+                summary["bypass_skipped_reason"] = result.get("bypass_skipped_reason")
             if result.get("verdict_reason"):
                 summary["verdict_reason"] = result.get("verdict_reason")
+            bypass = result.get("bypass_successful")
+            if bypass is True:
+                summary["reason"] = "bypass anti-Frida venceu: o app sobreviveu à evasão"
+                return "FALHOU", summary
+            if bypass is False:
+                summary["reason"] = "a proteção resistiu à evasão anti-Frida"
+                return "OK", summary
             # N/A explícito: não havia proteção no APK nem detecção em
             # runtime, então não existe "bypass vencedor" a reportar.
             if str(result.get("status_hint") or "").upper() == "N/A":
@@ -221,6 +234,8 @@ class Reporter:
                 "device_is_emulator": bool(result.get("device_is_emulator")),
                 "protection_sources": Reporter._protection_sources(result),
                 "static_engine": (result.get("static_analysis") or {}).get("engine"),
+                "static_owners": (result.get("static_analysis") or {}).get("owners") or {},
+                "app_evidence": bool((result.get("static_analysis") or {}).get("app_evidence")),
                 "coverage_gaps": (
                     ((result.get("static_analysis") or {}).get("coverage") or {})
                     .get("possible_gaps", [])
@@ -260,6 +275,8 @@ class Reporter:
                 "hook_frameworks_present": bool(result.get("hook_frameworks_present")),
                 "protection_sources": Reporter._protection_sources(result),
                 "static_engine": (result.get("static_analysis") or {}).get("engine"),
+                "static_owners": (result.get("static_analysis") or {}).get("owners") or {},
+                "app_evidence": bool((result.get("static_analysis") or {}).get("app_evidence")),
                 "coverage_gaps": (
                     ((result.get("static_analysis") or {}).get("coverage") or {})
                     .get("possible_gaps", [])
@@ -299,6 +316,7 @@ class Reporter:
             bypass_details = result.get("bypass_details") or {}
             summary = {
                 "pinning_detected": pinned,
+                "pinning_suspected": bool(result.get("pinning_suspected")),
                 "pinning_type": result.get("pinning_type"),
                 "bypass_successful": bypass,
                 "intercepted_hosts": list(
@@ -306,6 +324,8 @@ class Reporter:
                 )[:8],
                 "evidence_strength": bypass_details.get("evidence_strength"),
                 "static_engine": (result.get("static_analysis") or {}).get("engine"),
+                "static_owners": (result.get("static_analysis") or {}).get("owners") or {},
+                "app_evidence": bool((result.get("static_analysis") or {}).get("app_evidence")),
                 "coverage_gaps": (
                     ((result.get("static_analysis") or {}).get("coverage") or {})
                     .get("possible_gaps", [])
@@ -316,6 +336,12 @@ class Reporter:
                 summary["blocked_reason"] = (
                     "o app bloqueou a auditoria durante o bypass"
                 )
+            if str(result.get("status_hint") or "").upper() == "SKIP":
+                summary["skip_reason"] = (
+                    result.get("bypass_skipped_reason")
+                    or "evidência estática fraca; resultado inconclusivo"
+                )
+                return "SKIP", summary
             if bypass is True:
                 status = "FALHOU"
             elif bypass is None and pinned:

@@ -576,6 +576,8 @@ class SSLPinningCheck:
                 "vector": "pinning",
                 "present": bool(static_view.get("effective", static_view.get("present"))),
                 "confidence": static_view.get("confidence"),
+                "owners": static_view.get("owners") or {},
+                "app_evidence": bool(static_view.get("app_evidence")),
                 "coverage": static_view.get("coverage"),
             }
             if static_view is not None
@@ -597,6 +599,35 @@ class SSLPinningCheck:
             }
 
         if not detection.get("pinning_detected"):
+            weak_static = bool(
+                static_view
+                and static_view.get("present")
+                and not static_view.get("effective")
+            )
+            coverage = (static_view or {}).get("coverage") or {}
+            gaps = coverage.get("possible_gaps") or []
+            native_gap = any(
+                "nativ" in str(gap).lower() or "boring" in str(gap).lower()
+                for gap in gaps
+            )
+            if weak_static and native_gap:
+                return {
+                    "pinning_detected": False,
+                    "pinning_suspected": True,
+                    "pinning_type": "none",
+                    "bypass_successful": None,
+                    "evidence": [],
+                    "bypass_details": None,
+                    "bypass_skipped_reason": (
+                        "evidência estática fraca e possível pinning nativo; "
+                        "o bypass não foi executado, então o resultado é "
+                        "inconclusivo"
+                    ),
+                    "status_hint": "SKIP",
+                    "detection": detection,
+                    "static_analysis": static_analysis,
+                    "timestamp": _now_iso(),
+                }
             return {
                 "pinning_detected": False,
                 "pinning_type": "none",

@@ -168,17 +168,19 @@ class TestHookingBypassSemantics:
 class TestEvasionHotPath:
     """Os ganchos precisam ser raros: o volume consome o agente."""
 
-    def test_hot_string_functions_are_not_hooked(self):
-        """strcmp e memcmp são chamados milhares de vezes por segundo.
+    def test_hot_string_functions_have_a_fast_path(self):
+        """strcmp/memcmp são caros: o gancho precisa de filtro barato.
 
-        Um gancho nesses pontos consome o tempo do agente de
-        instrumentação, que deixa de responder — e o sintoma é uma
-        sessão que trava sem erro.
+        Sem o fast-path, cada comparação do runtime passa pelo agente e
+        a sessão deixa de responder.
         """
         source = _read("anti_frida_bypass.js")
         hooked = source.split("function hookLibcStringHooks()")[1].split("\n}")[0]
-        assert "'strcmp'" not in hooked
-        assert "'memcmp'" not in hooked
+        assert "'strcmp'" in hooked
+        assert "'memcmp'" in hooked
+        assert "markerFirstByte" in source
+        assert "n > 64" in source
+        assert "readByteArray" in source
 
     def test_no_global_syscall_replacement(self):
         """Substituir syscall() serializa o processo inteiro.

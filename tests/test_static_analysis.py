@@ -171,6 +171,18 @@ class TestProfileBuilding:
         assert profile["manifest"]["available"] is False
         assert any("ASC indisponível" in item for item in profile["limitations"])
 
+    def test_frida_signature_does_not_become_hooking(self, tmp_path, monkeypatch):
+        """A assinatura do Frida pertence ao vetor frida, não ao anti-hook."""
+        monkeypatch.setenv("RASPILOT_STATIC_CACHE", "0")
+        apk = _make_apk(
+            tmp_path / "app.apk", {"classes.dex": b"gum-js-loop libfrida"}
+        )
+        profile = build_static_profile(
+            None, "com.example.app", apk_path=apk, engine="builtin"
+        )
+        assert profile["vectors"]["frida"]["present"] is True
+        assert profile["vectors"]["hooking"]["present"] is False
+
     def test_asc_profile_uses_manifest_classes_and_refs(self, tmp_path, monkeypatch):
         monkeypatch.setenv("RASPILOT_STATIC_CACHE", "0")
         apk = _make_apk(tmp_path / "app.apk", {"classes.dex": b"dex"})
@@ -416,3 +428,17 @@ class TestCheckStaticIntegration:
         assert result["pinning_detected"] is True
         assert result["bypass_successful"] is None
         assert result["static_analysis"]["present"] is True
+
+    def test_ssl_weak_native_evidence_is_skipped(self):
+        """Evidência fraca + lacuna nativa não pode virar N/A."""
+        profile = _profile("pinning", confidence="low")
+        profile["coverage"]["pinning"]["possible_gaps"] = [
+            "possível checagem nativa/fora da camada Java (indício: boringssl)"
+        ]
+        check = SSLPinningCheck(mock.MagicMock(), mode="detect")
+        result = check.run_all("com.example.app", static_profile=profile)
+        assert result["pinning_suspected"] is True
+        assert result["status_hint"] == "SKIP"
+        status, summary = Reporter._status_for("ssl_pinning", result)
+        assert status == "SKIP"
+        assert summary["pinning_suspected"] is True

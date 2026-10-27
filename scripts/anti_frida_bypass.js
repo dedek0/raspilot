@@ -146,18 +146,60 @@ function containsMarkerAt(ptr) {
 }
 
 // ----------------------------------------------------------------------
-// 1) Native — libc.so: strstr
+// 1) Native — libc.so: strstr/strcmp/strncmp/memcmp
 // ----------------------------------------------------------------------
 //
-// Apenas strstr é hookado. strcmp e memcmp são chamados dezenas de
-// milhares de vezes por segundo pelo runtime do app e pelo motor
-// JavaScript do próprio agente: um gancho nesses pontos consome o
-// tempo do agente de instrumentação, que deixa de responder — o
-// sintoma é uma sessão que trava sem erro.
-//
-// A comparação de nomes exatos continua coberta em outro nível: o nome
-// do agente é ofuscado no memfd, no /proc e no nome das threads, e a
-// camada Java esconde a presença dos frameworks de hooking.
+// Os ganchos de comparação são caros: o runtime do app e o motor
+// JavaScript do agente chamam strcmp/memcmp dezenas de milhares de
+// vezes. Por isso eles têm um fast-path: só leem o buffer quando o
+// tamanho é pequeno e o primeiro byte pode iniciar um marcador. A
+// comparação é feita sobre bytes, sem montar string nem chamar
+// NativeFunction dentro do gancho.
+var reportedLibcHide = false;
+
+function reportLibcHide(name) {
+    if (reportedLibcHide) { return; }
+    reportedLibcHide = true;
+    reportNeutralized('libc.' + name + ' ocultou marcador de instrumentação');
+}
+
+function markerFirstByte(c) {
+    var lower = (c >= 65 && c <= 90) ? (c + 32) : c;
+    return lower === 102 || lower === 103 || lower === 108 ||
+           lower === 114 || lower === 109 || lower === 112 ||
+           lower === 47;
+}
+
+function isTokenByte(c) {
+    if (c === 0) { return true; }
+    var lower = (c >= 65 && c <= 90) ? (c + 32) : c;
+    return !((lower >= 97 && lower <= 122) || (lower >= 48 && lower <= 57));
+}
+
+function bytesContainMarker(buffer) {
+    if (buffer === null || buffer === undefined) { return false; }
+    var bytes = new Uint8Array(buffer);
+    for (var k = 0; k < MARKER_BYTES.length; k++) {
+        var marker = MARKER_BYTES[k];
+        var limit = bytes.length - marker.length;
+        for (var p = 0; p <= limit; p++) {
+            var match = true;
+            for (var j = 0; j < marker.length; j++) {
+                var c = bytes[p + j];
+                if (c >= 65 && c <= 90) { c += 32; }
+                if (c !== marker[j]) { match = false; break; }
+            }
+            if (!match) { continue; }
+            var before = p === 0 ? 0 : bytes[p - 1];
+            var after = (p + marker.length < bytes.length)
+                ? bytes[p + marker.length]
+                : 0;
+            if (isTokenByte(before) && isTokenByte(after)) { return true; }
+        }
+    }
+    return false;
+}
+
 function hookLibcStringHooks() {
     var names = ['strstr'];
     names.forEach(function (name) {
@@ -177,6 +219,7 @@ function hookLibcStringHooks() {
                 onLeave: function (retval) {
                     if (!this._hide) { return; }
                     retval.replace(ptr(0)); // não encontrado
+                    reportLibcHide(name);
                 }
             });
             report('libc.' + name + ' hookado');
@@ -184,6 +227,83 @@ function hookLibcStringHooks() {
             report('falha ao hookar libc.' + name + ': ' + e);
         }
     });
+
+    // Comparações de string contra nomes de artefatos. O fast-path evita
+    // ler ponteiros que não podem começar com um marcador.
+    ['strcmp', 'strncmp'].forEach(function (name) {
+        try {
+            var addr = raspilotFindExport('libc.so', name);
+            if (addr === null) { return; }
+            Interceptor.attach(addr, {
+                onEnter: function (args) {
+                    this._hide = false;
+                    try {
+                        var firstA = args[0].readU8();
+                        var firstB = args[1].readU8();
+                        if (!markerFirstByte(firstA) &&
+                                !markerFirstByte(firstB)) {
+                            return;
+                        }
+                        if (name === 'strncmp') {
+                            var n = args[2].toInt32();
+                            if (n <= 0 || n > MAX_SCAN_CHARS) { return; }
+                            if (bytesContainMarker(args[0].readByteArray(n)) ||
+                                    bytesContainMarker(args[1].readByteArray(n))) {
+                                this._hide = true;
+                            }
+                        } else if (containsMarkerAt(args[0]) ||
+                                containsMarkerAt(args[1])) {
+                            this._hide = true;
+                        }
+                    } catch (e) { /* best-effort */ }
+                },
+                onLeave: function (retval) {
+                    if (!this._hide) { return; }
+                    retval.replace(1); // strings diferentes
+                    reportLibcHide(name);
+                }
+            });
+            report('libc.' + name + ' hookado');
+        } catch (e) {
+            report('falha ao hookar libc.' + name + ': ' + e);
+        }
+    });
+
+    // memcmp: comparações por tamanho, típicas de checagens nativas sem
+    // string literal. O limite de 64 bytes cobre os nomes de artefatos e
+    // evita ler buffers grandes.
+    try {
+        var memcmpAddr = raspilotFindExport('libc.so', 'memcmp');
+        if (memcmpAddr !== null) {
+            Interceptor.attach(memcmpAddr, {
+                onEnter: function (args) {
+                    this._hide = false;
+                    try {
+                        var n = args[2].toInt32();
+                        if (n <= 0 || n > 64) { return; }
+                        var firstA = args[0].readU8();
+                        var firstB = args[1].readU8();
+                        if (!markerFirstByte(firstA) &&
+                                !markerFirstByte(firstB)) {
+                            return;
+                        }
+                        if (bytesContainMarker(args[0].readByteArray(n)) ||
+                                bytesContainMarker(args[1].readByteArray(n))) {
+                            this._hide = true;
+                        }
+                    } catch (e) { /* best-effort */ }
+                },
+                onLeave: function (retval) {
+                    if (!this._hide) { return; }
+                    retval.replace(1); // buffers diferentes
+                    reportLibcHide('memcmp');
+                }
+            });
+            report('libc.memcmp hookado (fast-path)');
+        }
+    } catch (e) {
+        report('falha ao hookar libc.memcmp: ' + e);
+    }
 }
 
 // ----------------------------------------------------------------------

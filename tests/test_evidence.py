@@ -360,7 +360,10 @@ class TestAgentCrashIsNotProtection:
             java_skipped=False, stealth_used=False, window=5,
         )
         assert hooking["detected"] is False
-        assert hooking["weak_signals"], "o crash do agente é contexto"
+        assert hooking["weak_signals"] == []
+        assert "frida_agent_crash" not in " ".join(
+            hooking["detection_methods_found"]
+        )
 
 
 class TestVendorSignalScope:

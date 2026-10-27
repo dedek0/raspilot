@@ -62,6 +62,7 @@ SUBCHECK_ACTIONS: Dict[str, Dict[str, str]] = {
 }
 
 BYPASS_ACTIONS = {
+    "anti_frida": "Tentar sobreviver à instrumentação com evasão anti-Frida",
     "anti_hooking": "Tentar neutralizar as checagens anti-hook do app",
     "anti_emulator": "Tentar ocultar os artefatos decisivos de emulador",
     "ssl_pinning": "Tentar contornar o SSL pinning e interceptar conexões",
@@ -443,6 +444,7 @@ def _verdict_text(check_name: str, result: dict) -> str:
         return (
             f"vulnerable={result.get('vulnerable')}; "
             f"proteção={bool(result.get('protection_detected'))}; "
+            f"bypass={result.get('bypass_successful')}; "
             f"observação={app_detection.get('observation_status') or 'n/a'}; "
             f"sinais={len(app_detection.get('detection_methods_found') or [])}"
         )
@@ -547,6 +549,7 @@ def build_execution_log(
                     app_detection.get("detection_methods_found"),
                 )
             )
+        _bypass_entry(trace, check_name, result)
     elif check_name == "anti_hooking":
         _subcheck_entries(trace, check_name, result.get("checks"))
         _static_entry(trace, check_name, result.get("static_detection"))
