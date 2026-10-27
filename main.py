@@ -170,7 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tamper-variant",
         action="append",
-        choices=("asset", "dex", "resource", "manifest", "all"),
+        choices=("asset", "dex", "resource", "manifest", "gadget", "all"),
         help=(
             "Variante de modificação do repack; pode repetir. "
             "Default: asset e dex; use all para todas"
@@ -200,6 +200,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=600,
         help="Timeout por operação de build do repack (default 600s)",
+    )
+    parser.add_argument(
+        "--tamper-gadget",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Frida Gadget .so (ou .so.xz) para a variante gadget. "
+            "Default: procura em ~/.raspilot/gadgets/"
+        ),
+    )
+    parser.add_argument(
+        "--tamper-gadget-port",
+        type=int,
+        default=27043,
+        help="Porta local do Frida Gadget na variante gadget (default 27043)",
     )
     parser.add_argument(
         "--verbose",
@@ -663,6 +678,10 @@ def _build_run_context(args: argparse.Namespace, dm: "DeviceManager") -> dict:
                 getattr(args, "tamper_keep_artifacts", False)
             ),
             "tamper_timeout": int(getattr(args, "tamper_timeout", 600)),
+            "tamper_gadget": getattr(args, "tamper_gadget", None),
+            "tamper_gadget_port": int(
+                getattr(args, "tamper_gadget_port", 27043)
+            ),
             "stage": getattr(args, "stage", "full"),
             "only": list(getattr(args, "only", None) or []),
             "apk": getattr(args, "apk", None),
@@ -1176,6 +1195,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 ),
                 output_dir=args.output_dir,
                 repack_timeout=int(getattr(args, "tamper_timeout", 600)),
+                gadget_path=getattr(args, "tamper_gadget", None),
+                gadget_port=int(getattr(args, "tamper_gadget_port", 27043)),
             ).run_all(
                 static_profile=static_profile,
                 package_name=args.package,

@@ -24,12 +24,17 @@ the collected evidence.
 - `adb` (Android Platform Tools) on `PATH`
 - Frida — a compatible `frida-server` is downloaded automatically matching
   the locally installed `frida` package version
-- Android SDK (`build-tools` + `platform`) and a JDK — **only** to build the
-  instrumentation module described below. Without them RASPilot keeps
-  working with the `frida` method (see *Instrumentation module*). The
-  toolchain is installed without system privileges:
-  `./instrumentation/setup_toolchain.sh` (requirements in
-  `instrumentation/requirements.txt`).
+- Android SDK (`build-tools` + `platform`) and a JDK — to build the
+  instrumentation module and for repack (`zipalign`, `apksigner`,
+  `keytool`). Without them RASPilot keeps working with the `frida`
+  method (see *Instrumentation module*). The toolchain is installed
+  without system privileges: `./instrumentation/setup_toolchain.sh`
+  (requirements in `instrumentation/requirements.txt`).
+- `apktool` 3.x — required by the `dex`, `resource`, `manifest` and
+  `gadget` repack variants.
+- **Optional:** Frida Gadget for the device ABI — only for the `gadget`
+  variant. `tools/setup_repack.sh` downloads the version matching the
+  installed `frida` package.
 - **Optional:** Droid ASC (`pip install -r requirements-static.txt`,
   Python 3.10+) for semantic APK analysis. Without it RASPilot uses the
   built-in byte-signature scan.
@@ -49,7 +54,7 @@ protections.
 | Debug authorisation | the "Allow USB debugging" prompt must be accepted | otherwise the device shows up as `unauthorized` and there is no connection |
 | Root | **recommended** (Magisk, KernelSU, APatch) | without root the `frida-server` runs as the `shell` uid and some detection vectors (TracerPid, ports, reading another process's `/proc/<pid>/maps`) stay incomplete |
 | SELinux | `permissive` is easier; `enforcing` works | under enforcing, `frida-server` needs root to inject into app processes |
-| Free space | ~200 MB | `frida-server` (~60 MB) and the APK cache |
+| Free space | ~200 MB for normal audits; 1–6 GB for repack | `frida-server` (~60 MB), APK cache and repack artifacts |
 | Battery | auditing is CPU intensive | a 20–30 s observation window is enough |
 
 Common setup (all optional, but they change the result):
@@ -69,14 +74,17 @@ a clean read, audit on a device without hooking frameworks installed.
 
 ### Permissions and artifacts used
 
-RASPilot is **non-destructive**, but it uses the device in an observable
-way:
+RASPilot is **non-destructive by default**, but it uses the device in an
+observable way. The repack test is the exception: it is **opt-in**,
+uninstalls/reinstalls the app and erases app data.
 
 - `/data/local/tmp` — receives the `frida-server` (under an opaque name)
   during the run and is **removed at the end**
 - `adb forward` — a local tunnel to the Frida server, torn down at the end
 - `logcat` — continuous read of the system buffer
 - The target app is **force-stopped** at the end of every run
+- During repack the app is uninstalled/reinstalled; original APKs are
+  kept and restored at the end, but **app data is not restored**
 
 The `frida-server` and the tunnel are torn down even when the audit fails
 halfway through.
@@ -91,7 +99,16 @@ pip install -r requirements.txt
 pip install -r requirements-dev.txt
 # semantic static analysis (optional, requires Python 3.10+)
 pip install -r requirements-static.txt
+
+# repack + Frida Gadget setup (optional)
+./tools/setup_repack.sh --abi arm64-v8a
 ```
+
+`setup_repack.sh` validates `adb`, `apktool`, `zipalign`/`apksigner`,
+`keytool`, `curl`/`xz` and the `frida` package; creates `~/.raspilot/keys`,
+`~/.raspilot/gadgets` and `~/.raspilot/repack`; and downloads the Frida
+Gadget matching the Python `frida` version for the device ABI. It does
+not install system packages: it reports what is missing and how to fix it.
 
 Quick check:
 
@@ -150,11 +167,13 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--skip CHECK...` | no | Checks to skip (`anti_root`, `anti_frida`, `anti_tampering`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
 | `--tamper-method METHOD` | no | `auto` (default; static + module/Frida probe), `static` (APK only), `frida` (in-memory probe only) or `repack` (destructive) |
 | `--tamper-allow-reinstall` | no | Confirms repack may uninstall/reinstall the app; data is lost |
-| `--tamper-variant VARIANT` | no | `asset`, `dex`, `resource`, `manifest` or `all`; repeatable. Default: `asset` and `dex` |
+| `--tamper-variant VARIANT` | no | `asset`, `dex`, `resource`, `manifest`, `gadget` or `all`; repeatable. Default: `asset` and `dex`; `all` includes gadget (skipped when no binary) |
 | `--tamper-installer PKG` | no | Installer simulated during repack (e.g. `com.android.vending`); default: current installer |
 | `--tamper-no-restore` | no | Do not reinstall the original APK at the end |
 | `--tamper-keep-artifacts` | no | Keep original/modified APKs under `reports/repack/` |
 | `--tamper-timeout SECS` | no | Timeout per repack build (default `600`) |
+| `--tamper-gadget PATH` | no | Frida Gadget `.so`/`.so.xz` for the `gadget` variant; default: `~/.raspilot/gadgets/` |
+| `--tamper-gadget-port PORT` | no | Local Gadget port (default `27043`) |
 | `--avd` | no | Audit against the configured AVD instead of the physical device (boots the emulator, waits for boot and shuts it down afterwards) |
 | `--avd-config PATH` | no | JSON configuration of the emulated environment (default `~/.raspilot/avd.json` or `$RASPILOT_AVD_CONFIG`) |
 | `--avd-name NAME` | no | AVD name, overriding the configuration |
@@ -324,7 +343,7 @@ consumers should use the `status` values.
 
 ### 0. Static APK analysis (`checks/static/`)
 
-The static profile is built once per run and shared by all five checks.
+The static profile is built once per run and shared by all six checks.
 It has two layers:
 
 1. **Byte scan (always available)** — reads `AndroidManifest.xml`,
@@ -566,7 +585,7 @@ vector the protection actually inspects.
 
 ### 6. Anti-Tampering (`checks/anti_tampering.py`)
 
-Two non-destructive layers:
+Two non-destructive layers, plus the opt-in destructive repack described below:
 
 - **Static**: scans the APK for `GET_SIGNATURES`,
   `GET_SIGNING_CERTIFICATES`, `PackageInfo.signatures`,
@@ -601,7 +620,12 @@ Variants:
 - `asset` — add a marker asset (tests ZIP/CRC/asset integrity);
 - `dex` — add a harmless smali class and rebuild DEX (tests DEX integrity);
 - `resource` — add a resource (tests `resources.arsc`);
-- `manifest` — add a harmless meta-data (tests the manifest).
+- `manifest` — add a harmless meta-data (tests the manifest);
+- `gadget` — inject Frida Gadget + config and a provider that loads the
+  library on a background thread; tests whether the app accepts the
+  instrumentation payload. A `gadget-control` injects the provider and
+  libs without loading Gadget, separating provider/manifest detection
+  from payload failure.
 
 The control matrix avoids blaming repack for a crash caused only by the
 signature change, installer or apktool rebuild. In addition to the
@@ -615,11 +639,33 @@ python main.py --package com.example.app \
     --tamper-method repack --tamper-allow-reinstall \
     --tamper-variant asset --tamper-variant dex \
     --only anti_tampering
+
+# with Frida Gadget payload (download first with tools/setup_repack.sh)
+python main.py --package com.example.app \
+    --tamper-method repack --tamper-allow-reinstall \
+    --tamper-variant gadget --tamper-gadget ~/.raspilot/gadgets/libgadget-arm64.so \
+    --window 20 --only anti_tampering
 ```
 
 Temporary artifacts and kept APKs live under `reports/repack/`. For large
 apps apktool may need more heap; adjust `RASPILOT_APKTOOL_XMX` (default
-`6G`).
+`6G`). The `gadget` variant checks `gadget.loaded` via `/proc/<pid>/maps`
+and `gadget.connected` through the Frida endpoint; it only reports
+bypass when both are true.
+
+To interact with Gadget after installation:
+
+```bash
+adb forward tcp:27043 tcp:27043
+frida-ps -H 127.0.0.1:27043
+# objection (example; tool must be installed on the host)
+objection -N -h 127.0.0.1 -p 27043 -g Gadget explore
+```
+
+The Gadget binary must match the device ABI and, ideally, the host Frida
+version. Use `./tools/setup_repack.sh` to download the right one. On
+large apps Gadget loading can take more than 10 s; use `--window 20` or
+more.
 
 > Uninstall removes app data; there is no automatic backup. Use a
 > disposable device/AVD. Without the original key it is not possible to
@@ -833,6 +879,8 @@ raspilot/
 ├── logcat_analyzer.py          # Death/security/TLS logcat correlation
 ├── reporter.py                 # JSON/HTML reports (Jinja2)
 ├── execution_log.py            # Per-check attempt, finding and verdict trace
+├── tools/
+│   └── setup_repack.sh         # Validates host and downloads Frida Gadget
 ├── instrumentation/            # Instrumentation module (hooking APK)
 │   ├── manager.py              # Setup, framework scoping and evidence
 │   ├── build.sh                # APK build (aapt2/d8/apksigner, no Gradle)
@@ -884,8 +932,10 @@ evidence model (high confidence vs context), the bypass layer and the full
 end-to-end pipeline (with a mocked `DeviceManager`). No physical device is
 required to run the tests.
 
-The instrumentation module has its own tests (`tests/test_instrumentation.py`
-for the manager, `tests/test_instrumentation_checks.py` for the check
+Repack has its own tests (`tests/test_tamper_repack.py`): variants,
+control matrix, attribution, payload failure, focus/usability and
+restore. The instrumentation module has its own tests
+(`tests/test_instrumentation.py` for the manager, `tests/test_instrumentation_checks.py` for the check
 integration): configuration, evidence parsing from logcat, scope
 application and restoration on the framework, and the module-based
 bypass/probe phases of the hooking and emulator checks.
@@ -919,6 +969,7 @@ be wrapped as MCP tools with `FastMCP`:
 | `raspilot_check_anti_root(device_id) -> dict` | `AntiRootCheck(dm).run_all()` |
 | `raspilot_check_anti_frida(device_id) -> dict` | `AntiFridaCheck(dm).run_all(session, pid)` |
 | `raspilot_check_anti_tampering(device_id, package_name) -> dict` | `AntiTamperingCheck(dm).run_all(...)` |
+| `raspilot_test_repack(device_id, package_name, variants, gadget=None) -> dict` | `RepackTester(...).run()` — requires explicit confirmation before reinstalling |
 | `raspilot_check_anti_emulator(device_id, package_name) -> dict` | `AntiEmulatorCheck(dm).run_all(package)` |
 | `raspilot_check_anti_hooking(device_id, package_name) -> dict` | `AntiHookingCheck(dm).run_all(package)` |
 | `raspilot_bypass_ssl_pinning(device_id, package_name) -> dict` | `SSLPinningCheck(dm).run_all(package)` |
@@ -954,10 +1005,21 @@ output: `--stage static|detect|bypass`, `--only`, `--apk` and
 | `Estático: droidasc não instalado` | Optional semantic analysis unavailable | `pip install -r requirements-static.txt` (Python 3.10+) or use `--static-engine builtin` |
 | `Estático: timeout após Ns` | Large APK or slow host | Increase `--static-timeout`; the check continues with partial results |
 | `module build failed` | Android SDK or JDK missing on the host | Install `build-tools` + `platform` in `$ANDROID_HOME` and a JDK, or use `--module-apk` |
+| `apktool not found` | Repack without apktool on PATH | Install apktool 3.x and run `./tools/setup_repack.sh` |
+| `Frida Gadget not found` | `gadget` variant without the ABI binary | `./tools/setup_repack.sh --abi <abi>` or use `--tamper-gadget` |
+| `gadget.loaded=false` / `gadget.connected=false` | Gadget did not load or endpoint did not answer | Increase `--window` (20+), check ABI/version and use `--tamper-gadget` |
+| Repack left the app without data | Uninstall/reinstall is destructive | Restore the original APK; app data has no automatic backup. Use a disposable AVD/device |
 
 ---
 
 ## Known limitations
+
+**Repack is destructive and not exhaustive.** Without the original
+signing key, the test measures signer change + content change; it cannot
+alter content under the same signature. Server-side attestation/Play
+Integrity may block the app without a local crash. Uninstall erases app
+data. The `gadget` variant depends on ABI, Frida version, a free port and
+load time; the report separates `payload`/`tooling` from app detection.
 
 **Static analysis is surface, not behaviour.** The APK profile finds
 references to checks and points out coverage gaps, but it does not prove

@@ -24,9 +24,15 @@ coletadas.
 - `adb` (Android Platform Tools) no `PATH`
 - Frida — o `frida-server` compatível é baixado automaticamente na versão
   do pacote `frida` instalado localmente
-- Android SDK (`build-tools` + `platform`) e um JDK — **apenas** para compilar
-  o módulo de instrumentação descrito abaixo. Sem eles, o RASPilot continua
-  funcionando com o método `frida` (veja *Módulo de instrumentação*).
+- Android SDK (`build-tools` + `platform`) e um JDK — para compilar o
+  módulo de instrumentação e para o repack (`zipalign`, `apksigner`,
+  `keytool`). Sem eles, o RASPilot continua funcionando com o método
+  `frida` (veja *Módulo de instrumentação*).
+- `apktool` 3.x — necessário para as variantes `dex`, `resource`,
+  `manifest` e `gadget` do repack.
+- **Opcional:** Frida Gadget da ABI do device — necessário apenas para a
+  variante `gadget`. O script `tools/setup_repack.sh` baixa a versão
+  correspondente ao pacote `frida` instalado.
 - **Opcional:** Droid ASC (`pip install -r requirements-static.txt`,
   Python 3.10+) para a análise estática semântica do APK. Sem ele, o
   RASPilot usa a varredura de assinaturas embutida.
@@ -45,7 +51,7 @@ resultado: emulador não reproduz as proteções de hardware.
 | Autorização de depuração | o popup "Permitir depuração USB" precisa ser aceito | sem isso o aparelho aparece como `unauthorized` e não há conexão |
 | Root | **recomendado** (Magisk, KernelSU, APatch) | sem root o `frida-server` roda com o uid do `shell` e alguns vetores de detecção (TracerPid, portas, leitura de `/proc/<pid>/maps` de outros processos) ficam incompletos |
 | SELinux | `permissive` facilita; `enforcing` funciona | em modo enforcing o `frida-server` precisa de root para injetar em processos de apps |
-| Espaço livre | ~200 MB | `frida-server` (~60 MB) e o cache de APKs |
+| Espaço livre | ~200 MB para auditoria normal; 1–6 GB para repack | `frida-server` (~60 MB), cache de APKs e artefatos do repack |
 | Bateria | o processo de auditoria consome CPU | uma janela de 20–30 s de observação já é suficiente |
 
 Preparação usual (todas opcionais, mas alteram o resultado):
@@ -66,13 +72,18 @@ instalados.
 
 ### Permissões e artefatos usados
 
-O RASPilot é **não destrutivo**, mas usa o aparelho de forma observável:
+O RASPilot é **não destrutivo por padrão**, mas usa o aparelho de forma
+observável. O teste de repack é a exceção: ele é **opt-in**, desinstala e
+reinstala o app e apaga os dados do aplicativo.
 
 - `/data/local/tmp` — recebe o `frida-server` (com nome opaco) durante a
   execução e é **removido ao final**
 - `adb forward` — um túnel local para o servidor do Frida, desfeito ao final
 - `logcat` — leitura contínua do buffer do sistema
 - O app alvo é **forçado a parar** (force-stop) ao final de cada execução
+- No repack, o app é desinstalado/reinstalado; os APKs originais são
+  guardados e restaurados ao final, mas **os dados do app não são
+  restaurados**
 
 O `frida-server` e o túnel são encerrados mesmo quando a auditoria falha
 no meio.
@@ -87,7 +98,16 @@ pip install -r requirements.txt
 pip install -r requirements-dev.txt
 # análise estática semântica (opcional, requer Python 3.10+)
 pip install -r requirements-static.txt
+
+# preparação do repack + Frida Gadget (opcional)
+./tools/setup_repack.sh --abi arm64-v8a
 ```
+
+O `setup_repack.sh` valida `adb`, `apktool`, `zipalign`/`apksigner`,
+`keytool`, `curl`/`xz` e o pacote `frida`; cria `~/.raspilot/keys`,
+`~/.raspilot/gadgets` e `~/.raspilot/repack`; e baixa o Frida Gadget da
+mesma versão do `frida` Python para a ABI do device. Ele não instala
+pacotes do sistema: mostra o que falta e como resolver.
 
 Verificação rápida:
 
@@ -146,11 +166,13 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--skip CHECK...` | não | Checks a pular (`anti_root`, `anti_frida`, `anti_tampering`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
 | `--tamper-method MÉTODO` | não | `auto` (default; estático + sonda módulo/Frida), `static` (só APK), `frida` (só sonda em memória) ou `repack` (destrutivo) |
 | `--tamper-allow-reinstall` | não | Confirma que o repack pode desinstalar/reinstalar o app; dados são perdidos |
-| `--tamper-variant VARIANTE` | não | `asset`, `dex`, `resource`, `manifest` ou `all`; pode repetir. Default: `asset` e `dex` |
+| `--tamper-variant VARIANTE` | não | `asset`, `dex`, `resource`, `manifest`, `gadget` ou `all`; pode repetir. Default: `asset` e `dex`; `all` inclui gadget (pulado se não houver binário) |
 | `--tamper-installer PKG` | não | Instalador simulado no repack (ex: `com.android.vending`); default: instalador atual |
 | `--tamper-no-restore` | não | Não reinstala o APK original ao final |
 | `--tamper-keep-artifacts` | não | Mantém APKs original/modificados em `reports/repack/` |
 | `--tamper-timeout SEG` | não | Timeout por build do repack (default `600`) |
+| `--tamper-gadget PATH` | não | Frida Gadget `.so`/`.so.xz` para a variante `gadget`; default: `~/.raspilot/gadgets/` |
+| `--tamper-gadget-port PORTA` | não | Porta local do Gadget (default `27043`) |
 | `--avd` | não | Audita contra o AVD configurado em vez do device físico (sobe o emulador, espera o boot e o encerra no final) |
 | `--avd-config PATH` | não | Configuração JSON do ambiente emulado (default `~/.raspilot/avd.json` ou `$RASPILOT_AVD_CONFIG`) |
 | `--avd-name NOME` | não | Nome do AVD, sobrescrevendo a configuração |
@@ -318,7 +340,7 @@ exibição.
 ### 0. Análise estática do APK (`checks/static/`)
 
 O perfil estático é construído uma vez por execução e compartilhado pelos
-cinco checks. Ele tem duas camadas:
+seis checks. Ele tem duas camadas:
 
 1. **Varredura de bytes (sempre disponível)** — lê `AndroidManifest.xml`,
    `*.dex`, `lib/**/*.so`, `assets/flutter_assets*` e `res/xml/*` e procura
@@ -585,7 +607,7 @@ proteção de fato fiscaliza.
 
 ### 5.1. Anti-Tampering (`checks/anti_tampering.py`)
 
-Duas camadas, ambas não destrutivas:
+Duas camadas não destrutivas, mais o repack destrutivo opt-in descrito abaixo:
 
 - **Estática**: procura no APK referências a `GET_SIGNATURES`,
   `GET_SIGNING_CERTIFICATES`, `PackageInfo.signatures`,
@@ -621,7 +643,12 @@ Variantes:
 - `dex` — adiciona uma classe smali inofensiva e reconstrói o DEX
   (testa integridade de DEX);
 - `resource` — adiciona um recurso (testa `resources.arsc`);
-- `manifest` — adiciona uma meta-data inofensiva (testa o manifesto).
+- `manifest` — adiciona uma meta-data inofensiva (testa o manifesto);
+- `gadget` — injeta Frida Gadget + config e um provider que carrega a
+  biblioteca em background; testa se o app aceita o payload de
+  instrumentação. Um controle `gadget-control` injeta o provider e as
+  libs sem carregar o Gadget, separando detecção de provider/manifesto
+  de falha do payload.
 
 A matriz de controle evita atribuir ao repack um crash causado apenas
 pela troca de assinatura, pelo instalador ou pelo rebuild do apktool.
@@ -636,11 +663,33 @@ python main.py --package com.exemplo.app \
     --tamper-method repack --tamper-allow-reinstall \
     --tamper-variant asset --tamper-variant dex \
     --only anti_tampering
+
+# com payload Frida Gadget (baixe antes com tools/setup_repack.sh)
+python main.py --package com.exemplo.app \
+    --tamper-method repack --tamper-allow-reinstall \
+    --tamper-variant gadget --tamper-gadget ~/.raspilot/gadgets/libgadget-arm64.so \
+    --window 20 --only anti_tampering
 ```
 
 Os artefatos temporários e os APKs mantidos ficam em `reports/repack/`.
 Em apps grandes, o apktool pode exigir mais heap; ajuste com
-`RASPILOT_APKTOOL_XMX` (default `6G`).
+`RASPILOT_APKTOOL_XMX` (default `6G`). A variante `gadget` valida
+`gadget.loaded` por `/proc/<pid>/maps` e `gadget.connected` pelo endpoint
+Frida; o resultado só considera bypass se os dois forem verdadeiros.
+
+Para interagir com o Gadget depois da instalação:
+
+```bash
+adb forward tcp:27043 tcp:27043
+frida-ps -H 127.0.0.1:27043
+# objection (exemplo; a ferramenta precisa estar instalada no host)
+objection -N -h 127.0.0.1 -p 27043 -g Gadget explore
+```
+
+O binário do Gadget deve corresponder à ABI do device e, idealmente, à
+versão do Frida do host. Use `./tools/setup_repack.sh` para baixar a
+versão correta. Em apps grandes, o carregamento do Gadget pode levar
+mais de 10 s; use `--window 20` ou mais.
 
 > O uninstall remove os dados do app; não há backup automático. Use
 > device/AVD descartável. Sem a chave original não é possível testar
@@ -868,6 +917,8 @@ raspilot/
 ├── logcat_analyzer.py          # Correlação de mortes/segurança/TLS no logcat
 ├── reporter.py                 # Relatórios JSON/HTML (Jinja2)
 ├── execution_log.py            # Trilha: tentativa, achado e veredito por check
+├── tools/
+│   └── setup_repack.sh         # Valida o host e baixa o Frida Gadget
 ├── instrumentation/            # Módulo de instrumentação (APK de hooking)
 │   ├── manager.py              # Preparação, escopo no framework e evidência
 │   ├── build.sh                # Build do APK (aapt2/d8/apksigner, sem Gradle)
@@ -920,7 +971,9 @@ vs contexto), a camada de bypass e o pipeline completo de ponta a ponta
 (com `DeviceManager` mockado). Nenhum dispositivo físico é necessário
 para os testes.
 
-O módulo de instrumentação tem testes próprios
+O repack tem testes próprios (`tests/test_tamper_repack.py`): variantes,
+matriz de controles, atribuição, falha de payload, foco/“utilizável” e
+restore. O módulo de instrumentação tem testes próprios
 (`tests/test_instrumentation.py` para o gerenciador e
 `tests/test_instrumentation_checks.py` para a integração com os checks):
 configuração, leitura da evidência no logcat, aplicação e
@@ -956,6 +1009,7 @@ serem envolvidos como ferramentas MCP com `FastMCP`:
 | `raspilot_verificar_anti_root(device_id) -> dict` | `AntiRootCheck(dm).run_all()` |
 | `raspilot_verificar_anti_frida(device_id) -> dict` | `AntiFridaCheck(dm).run_all(session, pid)` |
 | `raspilot_verificar_anti_tampering(device_id, package_name) -> dict` | `AntiTamperingCheck(dm).run_all(...)` |
+| `raspilot_testar_repack(device_id, package_name, variants, gadget=None) -> dict` | `RepackTester(...).run()` — exige confirmação explícita antes de reinstalar |
 | `raspilot_verificar_anti_emulator(device_id, package_name) -> dict` | `AntiEmulatorCheck(dm).run_all(package)` |
 | `raspilot_verificar_anti_hooking(device_id, package_name) -> dict` | `AntiHookingCheck(dm).run_all(package)` |
 | `raspilot_bypass_ssl_pinning(device_id, package_name) -> dict` | `SSLPinningCheck(dm).run_all(package)` |
@@ -973,7 +1027,10 @@ Para MCP, o pipeline já foi preparado com análise por etapas e saída
 limpa: `--stage static|detect|bypass`, `--only`, `--apk` e `--json-only`.
 Cada ferramenta MCP pode mapear para uma etapa/check e retornar um `dict`
 com `summary` + caminho do relatório, deixando o JSON/HTML completo como
-*resource*. O estado/sessão entre chamadas entra na fase seguinte.
+*resource*. O repack deve ser uma ferramenta separada, com confirmação
+em duas etapas: a primeira informa que o app será desinstalado e que os
+dados serão perdidos; a segunda só executa com autorização explícita.
+O estado/sessão entre chamadas entra na fase seguinte.
 
 ---
 
@@ -993,10 +1050,22 @@ com `summary` + caminho do relatório, deixando o JSON/HTML completo como
 | `Estático: droidasc não instalado` | Análise semântica opcional indisponível | `pip install -r requirements-static.txt` (Python 3.10+) ou use `--static-engine builtin` |
 | `Estático: timeout após Ns` | APK grande ou máquina lenta | Aumente `--static-timeout`; o check continua com o resultado parcial |
 | `build do módulo falhou` | SDK do Android ou JDK ausentes no host | Instale `build-tools` + `platform` em `$ANDROID_HOME` e um JDK, ou use `--module-apk` |
+| `apktool não encontrado` | Repack sem apktool no PATH | Instale apktool 3.x e rode `./tools/setup_repack.sh` |
+| `Frida Gadget não encontrado` | Variante `gadget` sem o binário da ABI | `./tools/setup_repack.sh --abi <abi>` ou use `--tamper-gadget` |
+| `gadget.loaded=false` / `gadget.connected=false` | Gadget não carregou ou endpoint não respondeu | Aumente `--window` (20+), confira ABI/versão e use `--tamper-gadget` |
+| Repack deixou o app sem dados | Uninstall/reinstall é destrutivo | Restaure o APK original; dados não têm backup automático. Use AVD/device descartável |
 
 ---
 
 ## Limitações conhecidas
+
+**O repack é destrutivo e não cobre tudo.** Sem a chave de assinatura
+original, o teste mede troca de assinante + alteração de conteúdo; não é
+possível alterar conteúdo mantendo a mesma assinatura. Attestation
+server-side/Play Integrity pode bloquear o app sem crash local. O
+uninstall apaga os dados do app. A variante `gadget` depende de ABI,
+versão do Frida, porta livre e tempo de carregamento; o relatório separa
+`payload`/`tooling` de detecção do app.
 
 **A análise estática é superfície, não comportamento.** O perfil do APK
 encontra referências a checagens e aponta lacunas de cobertura, mas não

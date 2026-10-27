@@ -74,12 +74,51 @@ class TestAssetVariant:
 class TestVariants:
     def test_all_expands_to_content_variants(self):
         tester = repack.RepackTester(object(), "com.example.app", variants=("all",))
-        assert tester.variants == ["asset", "dex", "resource", "manifest"]
+        assert tester.variants == [
+            "asset", "dex", "resource", "manifest", "gadget"
+        ]
+
+
+class TestGadget:
+    def test_inject_libs_and_config(self, tmp_path):
+        source = tmp_path / "base.apk"
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("AndroidManifest.xml", b"manifest")
+        gadget = tmp_path / "libgadget.so"
+        gadget.write_bytes(b"GADGET")
+        output = tmp_path / "gadget.apk"
+        ok, error = repack._inject_gadget_libs(
+            str(source), str(output), str(gadget), "arm64-v8a", 27043
+        )
+        assert ok, error
+        with zipfile.ZipFile(output) as archive:
+            assert archive.read("lib/arm64-v8a/libgadget.so") == b"GADGET"
+            config = archive.read("lib/arm64-v8a/libgadget.config.so")
+        assert b'"port": 27043' in config
+        assert b'"on_load": "resume"' in config
+
+    def test_resolve_gadget_for_abi(self, tmp_path, monkeypatch):
+        gadget = tmp_path / "custom-arm64.so"
+        gadget.write_bytes(b"G")
+        monkeypatch.setattr(
+            repack.glob, "glob",
+            lambda pattern: [str(gadget)] if "arm64" in pattern else [],
+        )
+        resolved, error = repack._resolve_gadget(None, "arm64-v8a")
+        assert resolved == str(gadget)
+        assert not error
+
+    def test_resolve_gadget_rejects_unknown_abi(self):
+        resolved, error = repack._resolve_gadget(None, "mips")
+        assert resolved is None
+        assert "ABI" in error
 
 
 class TestInterpret:
-    def _tester(self):
-        return repack.RepackTester(FakeDM(), "com.example.app")
+    def _tester(self, variants=("asset", "dex")):
+        return repack.RepackTester(
+            FakeDM(), "com.example.app", variants=variants
+        )
 
     def test_vulnerable_when_all_content_variants_survive(self):
         result = self._tester()._interpret(
@@ -169,6 +208,106 @@ class TestInterpret:
         )
         assert result["status_hint"] == "SKIP"
         assert result["attribution"] == "inconclusive"
+
+    def test_gadget_loaded_but_not_connected_is_inconclusive(self):
+        gadget = _obs("gadget")
+        gadget["gadget_loaded"] = True
+        gadget["gadget_connected"] = False
+        result = self._tester(("gadget",))._interpret(
+            {
+                "original": _obs("original"),
+                "resigned": _obs("resigned"),
+                "rebuilt": _obs("rebuilt"),
+                "gadget": gadget,
+            },
+            {},
+        )
+        assert result["status_hint"] == "SKIP"
+        assert result["attribution"] == "inconclusive"
+
+    def test_gadget_without_load_is_inconclusive(self):
+        gadget = _obs("gadget")
+        gadget["gadget_loaded"] = False
+        gadget["gadget_connected"] = False
+        result = self._tester(("gadget",))._interpret(
+            {
+                "original": _obs("original"),
+                "resigned": _obs("resigned"),
+                "rebuilt": _obs("rebuilt"),
+                "gadget": gadget,
+            },
+            {},
+        )
+        assert result["status_hint"] == "SKIP"
+        assert result["attribution"] == "inconclusive"
+
+    def test_gadget_loaded_is_bypass(self):
+        gadget = _obs("gadget")
+        gadget["gadget_loaded"] = True
+        gadget["gadget_connected"] = True
+        result = self._tester(("gadget",))._interpret(
+            {
+                "original": _obs("original"),
+                "resigned": _obs("resigned"),
+                "rebuilt": _obs("rebuilt"),
+                "gadget": gadget,
+            },
+            {},
+        )
+        assert result["status_hint"] == "FALHOU"
+        assert result["bypass_successful"] is True
+
+    def test_gadget_control_death_is_detection(self):
+        control = _obs("gadget-control", usable=False)
+        control["alive"] = False
+        result = self._tester(("gadget",))._interpret(
+            {
+                "original": _obs("original"),
+                "resigned": _obs("resigned"),
+                "rebuilt": _obs("rebuilt"),
+                "gadget-control": control,
+            },
+            {},
+        )
+        assert result["status_hint"] == "OK"
+        assert result["attribution"] == "content"
+        assert result["tamper_detected"] is True
+
+    def test_gadget_death_without_load_is_payload_failure(self):
+        gadget = _obs("gadget", usable=False)
+        gadget["alive"] = False
+        gadget["gadget_loaded"] = False
+        gadget["gadget_connected"] = False
+        result = self._tester(("gadget",))._interpret(
+            {
+                "original": _obs("original"),
+                "resigned": _obs("resigned"),
+                "rebuilt": _obs("rebuilt"),
+                "gadget": gadget,
+            },
+            {},
+        )
+        assert result["status_hint"] == "SKIP"
+        assert result["attribution"] == "payload"
+        assert result["tamper_detected"] is None
+
+    def test_gadget_death_after_load_is_detection(self):
+        gadget = _obs("gadget", usable=False)
+        gadget["alive"] = False
+        gadget["gadget_loaded"] = True
+        gadget["gadget_connected"] = True
+        result = self._tester(("gadget",))._interpret(
+            {
+                "original": _obs("original"),
+                "resigned": _obs("resigned"),
+                "rebuilt": _obs("rebuilt"),
+                "gadget": gadget,
+            },
+            {},
+        )
+        assert result["status_hint"] == "OK"
+        assert result["attribution"] == "content"
+        assert result["tamper_detected"] is True
 
     def test_original_not_usable_is_inconclusive(self):
         result = self._tester()._interpret(

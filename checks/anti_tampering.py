@@ -84,6 +84,8 @@ class AntiTamperingCheck:
         keep_artifacts: bool = False,
         output_dir: Optional[str] = None,
         repack_timeout: int = 600,
+        gadget_path: Optional[str] = None,
+        gadget_port: int = 27043,
     ) -> None:
         self.dm = dm
         self.mode = mode
@@ -96,6 +98,8 @@ class AntiTamperingCheck:
         self.keep_artifacts = bool(keep_artifacts)
         self.output_dir = output_dir
         self.repack_timeout = int(repack_timeout)
+        self.gadget_path = gadget_path
+        self.gadget_port = int(gadget_port)
         # Gerenciador do módulo de instrumentação (opcional). Quando
         # disponível, a sonda roda no próprio dispositivo, sem a bridge
         # Java do Frida — que alguns alvos tratam como crash de runtime.
@@ -485,6 +489,8 @@ class AntiTamperingCheck:
                 restore=self.restore,
                 keep_artifacts=self.keep_artifacts,
                 timeout=self.repack_timeout,
+                gadget_path=self.gadget_path,
+                gadget_port=self.gadget_port,
             ).run()
             if probe.get("bypass_successful") is None:
                 bypass_skipped_reason = str(

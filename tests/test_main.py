@@ -231,6 +231,19 @@ class TestRepackFlags:
         assert args.tamper_installer == "com.android.vending"
         assert args.tamper_keep_artifacts is True
 
+    def test_gadget_flags(self):
+        args = mainmod.parse_args([
+            "--package", "com.example.app",
+            "--tamper-method", "repack",
+            "--tamper-allow-reinstall",
+            "--tamper-variant", "gadget",
+            "--tamper-gadget", "/tmp/libgadget.so",
+            "--tamper-gadget-port", "27044",
+        ])
+        assert args.tamper_variant == ["gadget"]
+        assert args.tamper_gadget == "/tmp/libgadget.so"
+        assert args.tamper_gadget_port == 27044
+
     def test_detect_stage_does_not_require_reinstall(self):
         args = mainmod.parse_args([
             "--package", "com.example.app",

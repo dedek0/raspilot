@@ -9,3 +9,8 @@ jinja2>=3.1.0
 # O módulo de instrumentação (instrumentation/) é um APK Android e não tem
 # dependências pip: ele exige o SDK do Android e um JDK no host.
 # Veja instrumentation/requirements.txt e instrumentation/setup_toolchain.sh.
+
+# Repack (opcional): apktool 3.x, zipalign/apksigner das build-tools,
+# keytool do JDK e, para a variante gadget, o Frida Gadget da ABI.
+# O script abaixo valida o host e baixa o Gadget:
+#     ./tools/setup_repack.sh --abi arm64-v8a

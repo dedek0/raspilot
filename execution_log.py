@@ -335,6 +335,8 @@ REPACK_ACTIONS = {
     "dex": "Instalar variante com DEX alterado",
     "resource": "Instalar variante com recurso alterado",
     "manifest": "Instalar variante com manifesto alterado",
+    "gadget-control": "Instalar o controle de provider/manifesto do payload",
+    "gadget": "Instalar variante com Frida Gadget",
 }
 
 
