@@ -358,11 +358,25 @@ class SSLPinningCheck:
                 except Exception:
                     logger.debug("kill_trace.js indisponível no bypass SSL", exc_info=True)
             if interact:
-                simulate = getattr(self.dm, "simulate_interaction", None)
-                if callable(simulate):
+                use_drive = callable(getattr(self.dm, "drive_ui", None))
+                driver = (
+                    getattr(self.dm, "drive_ui", None)
+                    if use_drive
+                    else getattr(self.dm, "simulate_interaction", None)
+                )
+                if callable(driver):
                     def _drive() -> None:
                         try:
-                            simulate(package_name, events=25, timeout=max(30, window * 2))
+                            if use_drive:
+                                driver(
+                                    package_name, taps=4,
+                                    timeout=max(30, window * 2),
+                                )
+                            else:
+                                driver(
+                                    package_name, events=25,
+                                    timeout=max(30, window * 2),
+                                )
                         except Exception:
                             logger.debug("Interação SSL falhou", exc_info=True)
 

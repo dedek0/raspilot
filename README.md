@@ -464,10 +464,11 @@ proteção de fato fiscaliza.
 - **Evidência fraca**: se só houver indícios fracos (TrustManager
   customizado, `networkSecurityConfig` sem `pin-set`, BoringSSL) e uma
   lacuna nativa plausível, o bypass é executado como **probe** com janela
-  mínima de 20s e interação (`monkey`) para exercitar requisições TLS.
-  Sem tráfego TLS, o resultado é `SKIP`; com tráfego interceptado, o
-  relatório registra `tls_observed=true` e mantém `pinning_detected=false`
-  (o pinning não foi confirmado no APK).
+  mínima de 20s e navegação direcionada: `uiautomator` toca nós clicáveis
+  do app e, se não houver dump, cai para `monkey`. Sem tráfego TLS, o
+  resultado é `SKIP`; com tráfego interceptado, o relatório registra
+  `tls_observed=true` e mantém `pinning_detected=false` (o pinning não
+  foi confirmado no APK).
 - **Bypass dinâmico**: injeta `scripts/ssl_bypass.js` (universal) cobrindo
   TrustManager, HostnameVerifier, OkHttp 3/4, NSC, Conscrypt, Apache
   HttpClient, WebView, BoringSSL/OpenSSL e Flutter. Bypass só é considerado

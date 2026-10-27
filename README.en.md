@@ -472,8 +472,9 @@ vector the protection actually inspects.
 - **Weak evidence**: if only weak indicators exist (custom TrustManager,
   `networkSecurityConfig` without `pin-set`, BoringSSL) and a plausible
   native gap, the bypass runs as a **probe** with a minimum 20s window and
-  interaction (`monkey`) to exercise TLS requests. Without TLS traffic the
-  result is `SKIP`; with intercepted traffic the report records
+  directed navigation: `uiautomator` taps clickable nodes of the app and
+  falls back to `monkey` when no dump is available. Without TLS traffic
+  the result is `SKIP`; with intercepted traffic the report records
   `tls_observed=true` and keeps `pinning_detected=false` (pinning was not
   confirmed from the APK).
 - **Dynamic bypass**: injects `scripts/ssl_bypass.js` (universal) covering

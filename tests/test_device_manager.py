@@ -711,3 +711,43 @@ class TestPidAndDeviceSelection:
         with mock.patch.object(dm, "_require_frida", return_value=fake_frida):
             with pytest.raises(FridaSetupError):
                 dm._frida_device()
+
+
+class TestDriveUi:
+    """Navegação por uiautomator para exercitar telas/TLS."""
+
+    def test_taps_clickable_nodes_of_the_target_package(self):
+        dm = DeviceManager()
+        xml = (
+            '<hierarchy><node package="com.exemplo.app" clickable="true" '
+            'bounds="[10,20][110,220]" text="Entrar"/></hierarchy>'
+        )
+        calls = []
+
+        def fake_shell(command, timeout=20):
+            calls.append(command)
+            if "uiautomator dump" in command:
+                return {"ok": True, "rc": 0, "stdout": xml, "stderr": ""}
+            return {"ok": True, "rc": 0, "stdout": "", "stderr": ""}
+
+        with mock.patch.object(dm, "run_shell", side_effect=fake_shell), \
+             mock.patch("device_manager.time.sleep"):
+            result = dm.drive_ui("com.exemplo.app", taps=1, timeout=30)
+
+        assert result["method"] == "uiautomator"
+        assert result["tapped"] == 1
+        assert "input tap 60 120" in calls
+
+    def test_falls_back_to_monkey_without_dump(self):
+        dm = DeviceManager()
+        calls = []
+
+        def fake_shell(command, timeout=20):
+            calls.append(command)
+            return {"ok": False, "rc": 1, "stdout": "", "stderr": "no dump"}
+
+        with mock.patch.object(dm, "run_shell", side_effect=fake_shell):
+            result = dm.drive_ui("com.exemplo.app", taps=1, timeout=30)
+
+        assert result["method"] == "monkey"
+        assert any("monkey -p com.exemplo.app" in command for command in calls)

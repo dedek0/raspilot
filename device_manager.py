@@ -471,6 +471,95 @@ class DeviceManager:
         )
         return self.run_shell(command, timeout=timeout)
 
+    def drive_ui(
+        self, package_name: str, taps: int = 4, timeout: int = 120
+    ) -> dict:
+        """Tenta navegar pela UI do app para exercitar telas e TLS.
+
+        Usa ``uiautomator dump`` para localizar nós clicáveis e toca no
+        centro deles. Se o dump não estiver disponível, cai para o
+        ``monkey``. A navegação é genérica: não depende de textos ou
+        fluxos específicos do app.
+
+        Args:
+            package_name: Package name do app alvo.
+            taps: Número máximo de toques.
+            timeout: Timeout dos comandos no dispositivo.
+
+        Returns:
+            Dict com ``ok``, ``method``, ``tapped`` e ``nodes``.
+        """
+        limit = max(1, min(int(taps), 8))
+        dump_path = "/sdcard/raspilot_ui.xml"
+        try:
+            self.run_shell(
+                f"monkey -p {package_name} -c android.intent.category.LAUNCHER 1",
+                timeout=min(30, timeout),
+            )
+            dump = self.run_shell(
+                f"uiautomator dump {dump_path} >/dev/null 2>&1 && cat {dump_path}",
+                timeout=min(30, timeout),
+            )
+        except Exception:
+            logger.debug("uiautomator dump falhou", exc_info=True)
+            dump = {"ok": False, "stdout": ""}
+
+        xml = dump.get("stdout") or ""
+        if dump.get("ok") and "<hierarchy" in xml:
+            try:
+                import xml.etree.ElementTree as element_tree
+
+                root = element_tree.fromstring(xml)
+                nodes = []
+                for node in root.iter("node"):
+                    if node.get("clickable") != "true":
+                        continue
+                    if node.get("package") != package_name:
+                        continue
+                    bounds = node.get("bounds") or ""
+                    match = re.match(
+                        r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds
+                    )
+                    if not match:
+                        continue
+                    x1, y1, x2, y2 = (int(value) for value in match.groups())
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+                    nodes.append({
+                        "text": (node.get("text") or node.get("content-desc") or "").strip(),
+                        "x": (x1 + x2) // 2,
+                        "y": (y1 + y2) // 2,
+                    })
+                tapped = 0
+                for node in nodes[:limit]:
+                    result = self.run_shell(
+                        f"input tap {node['x']} {node['y']}",
+                        timeout=min(20, timeout),
+                    )
+                    if result.get("ok"):
+                        tapped += 1
+                    time.sleep(0.7)
+                if tapped:
+                    self.run_shell(f"rm -f {dump_path}", timeout=10)
+                    return {
+                        "ok": True,
+                        "method": "uiautomator",
+                        "tapped": tapped,
+                        "nodes": nodes[:limit],
+                    }
+            except Exception:
+                logger.debug("Parse do uiautomator falhou", exc_info=True)
+
+        fallback = self.simulate_interaction(
+            package_name, events=max(8, limit * 6), timeout=timeout
+        )
+        return {
+            "ok": bool(fallback.get("ok")),
+            "method": "monkey",
+            "tapped": 0,
+            "nodes": [],
+        }
+
     def logcat_mark(self) -> int:
         """Retorna o índice atual (monotônico) do buffer de logcat.
 
