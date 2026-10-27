@@ -243,6 +243,27 @@ class TestRepackFlags:
         assert args.tamper_variant == ["gadget"]
         assert args.tamper_gadget == "/tmp/libgadget.so"
         assert args.tamper_gadget_port == 27044
+        assert args.tamper_gadget_mode == "listen"
+
+    def test_script_and_original_key_flags(self):
+        args = mainmod.parse_args([
+            "--package", "com.example.app",
+            "--tamper-method", "repack",
+            "--tamper-allow-reinstall",
+            "--tamper-variant", "gadget",
+            "--tamper-gadget-mode", "script",
+            "--tamper-gadget-script", "/tmp/probe.js",
+            "--tamper-key", "/tmp/original.jks",
+            "--tamper-key-alias", "release",
+            "--tamper-key-pass", "kp",
+            "--tamper-store-pass", "sp",
+        ])
+        assert args.tamper_gadget_mode == "script"
+        assert args.tamper_gadget_script == "/tmp/probe.js"
+        assert args.tamper_key == "/tmp/original.jks"
+        assert args.tamper_key_alias == "release"
+        assert args.tamper_key_pass == "kp"
+        assert args.tamper_store_pass == "sp"
 
     def test_detect_stage_does_not_require_reinstall(self):
         args = mainmod.parse_args([

@@ -33,6 +33,9 @@ coletadas.
 - **Opcional:** Frida Gadget da ABI do device — necessário apenas para a
   variante `gadget`. O script `tools/setup_repack.sh` baixa a versão
   correspondente ao pacote `frida` instalado.
+- **Opcional:** keystore original do app (`--tamper-key`) para testar
+  conteúdo alterado mantendo o mesmo assinante. Sem ele, o repack usa
+  uma chave de debug.
 - **Opcional:** Droid ASC (`pip install -r requirements-static.txt`,
   Python 3.10+) para a análise estática semântica do APK. Sem ele, o
   RASPilot usa a varredura de assinaturas embutida.
@@ -173,6 +176,12 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--tamper-timeout SEG` | não | Timeout por build do repack (default `600`) |
 | `--tamper-gadget PATH` | não | Frida Gadget `.so`/`.so.xz` para a variante `gadget`; default: `~/.raspilot/gadgets/` |
 | `--tamper-gadget-port PORTA` | não | Porta local do Gadget (default `27043`) |
+| `--tamper-gadget-mode MODO` | não | `listen` (host conecta), `wait` (app aguarda) ou `script` (executa script embutido) |
+| `--tamper-gadget-script PATH` | não | Script JS embutido na variante `gadget` no modo `script` |
+| `--tamper-key PATH` | não | Keystore original para preservar o assinante; sem ele usa a chave de debug |
+| `--tamper-key-alias ALIAS` | não | Alias da chave original (default `raspilot`) |
+| `--tamper-key-pass SENHA` | não | Senha da chave original (default `android`) |
+| `--tamper-store-pass SENHA` | não | Senha do keystore original (default `android`) |
 | `--avd` | não | Audita contra o AVD configurado em vez do device físico (sobe o emulador, espera o boot e o encerra no final) |
 | `--avd-config PATH` | não | Configuração JSON do ambiente emulado (default `~/.raspilot/avd.json` ou `$RASPILOT_AVD_CONFIG`) |
 | `--avd-name NOME` | não | Nome do AVD, sobrescrevendo a configuração |
@@ -646,9 +655,14 @@ Variantes:
 - `manifest` — adiciona uma meta-data inofensiva (testa o manifesto);
 - `gadget` — injeta Frida Gadget + config e um provider que carrega a
   biblioteca em background; testa se o app aceita o payload de
-  instrumentação. Um controle `gadget-control` injeta o provider e as
-  libs sem carregar o Gadget, separando detecção de provider/manifesto
-  de falha do payload.
+  instrumentação. Modos: `listen` (host conecta), `wait` (app aguarda) e
+  `script` (script JS embutido, com marcador de execução). Um controle
+  `gadget-control` injeta o provider e as libs sem carregar o Gadget,
+  separando detecção de provider/manifesto de falha do payload.
+
+A observação registra também `ui`/`ui_signals` (texto e possíveis telas de
+bloqueio) e `server_signals` (contagem de morte, segurança, TLS e sinais
+de vendor). Sinal fraco não vira veredito sozinho.
 
 A matriz de controle evita atribuir ao repack um crash causado apenas
 pela troca de assinatura, pelo instalador ou pelo rebuild do apktool.
@@ -691,10 +705,26 @@ versão do Frida do host. Use `./tools/setup_repack.sh` para baixar a
 versão correta. Em apps grandes, o carregamento do Gadget pode levar
 mais de 10 s; use `--window 20` ou mais.
 
+Para um payload de script:
+
+```bash
+python main.py --package com.exemplo.app \
+    --tamper-method repack --tamper-allow-reinstall \
+    --tamper-variant gadget --tamper-gadget-mode script \
+    --tamper-gadget-script ./probe.js \
+    --window 20 --only anti_tampering
+```
+
+O script é copiado pelo provider para o diretório privado do app e o
+Gadget o executa. Um marcador em `files/raspilot-gadget-ok` confirma a
+execução; o relatório expõe `gadget.script_ran`. A leitura do marcador
+usa `run-as` (app debuggable) ou root.
+
 > O uninstall remove os dados do app; não há backup automático. Use
 > device/AVD descartável. Sem a chave original não é possível testar
 > conteúdo alterado mantendo a mesma assinatura: o teste cobre a troca
-> de assinante e a alteração de conteúdo. Em uma futura ferramenta MCP,
+> de assinante e a alteração de conteúdo. Com `--tamper-key`, o controle
+> e a variante usam o mesmo assinante, isolando integridade de conteúdo. Em uma futura ferramenta MCP,
 > o repack deve exigir confirmação explícita em duas etapas antes de
 > desinstalar/reinstalar qualquer coisa.
 
@@ -1054,14 +1084,16 @@ O estado/sessão entre chamadas entra na fase seguinte.
 | `Frida Gadget não encontrado` | Variante `gadget` sem o binário da ABI | `./tools/setup_repack.sh --abi <abi>` ou use `--tamper-gadget` |
 | `gadget.loaded=false` / `gadget.connected=false` | Gadget não carregou ou endpoint não respondeu | Aumente `--window` (20+), confira ABI/versão e use `--tamper-gadget` |
 | Repack deixou o app sem dados | Uninstall/reinstall é destrutivo | Restaure o APK original; dados não têm backup automático. Use AVD/device descartável |
+| `keystore não encontrado` | Caminho de `--tamper-key` inválido | Confira o caminho, alias e senhas do keystore original |
+| `modo script exige --tamper-gadget-script` | Modo script sem JS | Informe `--tamper-gadget-script` ou use `--tamper-gadget-mode listen` |
 
 ---
 
 ## Limitações conhecidas
 
-**O repack é destrutivo e não cobre tudo.** Sem a chave de assinatura
-original, o teste mede troca de assinante + alteração de conteúdo; não é
-possível alterar conteúdo mantendo a mesma assinatura. Attestation
+**O repack é destrutivo e não cobre tudo.** Sem `--tamper-key`, o teste
+mede troca de assinante + alteração de conteúdo; com a chave original,
+mede conteúdo mantendo o assinante. Attestation
 server-side/Play Integrity pode bloquear o app sem crash local. O
 uninstall apaga os dados do app. A variante `gadget` depende de ABI,
 versão do Frida, porta livre e tempo de carregamento; o relatório separa

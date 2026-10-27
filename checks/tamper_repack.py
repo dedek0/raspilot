@@ -4,7 +4,9 @@ O check de anti-tampering em memória cobre apenas checagens que passam pelo
 ``PackageManager`` em runtime. Este módulo faz o teste destrutivo, porém
 controlado: altera o APK, reconstrói, re-assina e reinstala no dispositivo
 para verificar se o app detecta o repack. Variantes de conteúdo cobrem
-asset, DEX, recurso, manifesto e o payload de Frida Gadget.
+asset, DEX, recurso, manifesto e o payload de Frida Gadget. O assinante
+pode ser o de debug ou o keystore original (``key_path``); o Gadget
+suporta listen/wait/script. A observação separa app, UI, logcat e payload.
 
 A instalação é sempre opt-in (``allow_reinstall``). O fluxo salva os APKs
 originais, testa um controle re-assinado sem alteração de conteúdo e, por
@@ -33,7 +35,6 @@ from logcat_analyzer import analyze_since
 logger = logging.getLogger("raspilot.checks.tamper_repack")
 
 CONTENT_VARIANTS = ("asset", "dex", "resource", "manifest", "gadget")
-ALL_VARIANTS = ("resigned", "rebuilt") + CONTENT_VARIANTS
 ASSET_NAME = "assets/raspilot_repack_probe.txt"
 ASSET_CONTENT = b"RASPilot repack probe\n"
 SMALI_CLASS = """\
@@ -75,6 +76,84 @@ GADGET_PROVIDER_SMALI = """.class public Lcom/raspilot/repack/GadgetProvider;
 
 .method public onCreate()Z
     .locals 2
+    new-instance v0, Ljava/lang/Thread;
+    new-instance v1, Lcom/raspilot/repack/GadgetLoader;
+    invoke-direct {v1}, Lcom/raspilot/repack/GadgetLoader;-><init>()V
+    invoke-direct {v0, v1}, Ljava/lang/Thread;-><init>(Ljava/lang/Runnable;)V
+    invoke-virtual {v0}, Ljava/lang/Thread;->start()V
+    const/4 v0, 0x1
+    return v0
+.end method
+
+.method public query(Landroid/net/Uri;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;
+    .locals 1
+    const/4 v0, 0x0
+    return-object v0
+.end method
+
+.method public getType(Landroid/net/Uri;)Ljava/lang/String;
+    .locals 1
+    const/4 v0, 0x0
+    return-object v0
+.end method
+
+.method public insert(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;
+    .locals 1
+    const/4 v0, 0x0
+    return-object v0
+.end method
+
+.method public delete(Landroid/net/Uri;Ljava/lang/String;[Ljava/lang/String;)I
+    .locals 1
+    const/4 v0, 0x0
+    return v0
+.end method
+
+.method public update(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I
+    .locals 1
+    const/4 v0, 0x0
+    return v0
+.end method
+"""
+GADGET_PROVIDER_SCRIPT_SMALI = """\
+.class public Lcom/raspilot/repack/GadgetProvider;
+.super Landroid/content/ContentProvider;
+.source "GadgetProvider.java"
+
+.method public constructor <init>()V
+    .locals 0
+    invoke-direct {p0}, Landroid/content/ContentProvider;-><init>()V
+    return-void
+.end method
+
+.method public onCreate()Z
+    .locals 4
+    :try_start_0
+    invoke-virtual {p0}, Lcom/raspilot/repack/GadgetProvider;->getContext()Landroid/content/Context;
+    move-result-object v0
+    invoke-virtual {v0}, Landroid/content/Context;->getAssets()Landroid/content/res/AssetManager;
+    move-result-object v0
+    const-string v1, "raspilot_gadget.js"
+    invoke-virtual {v0, v1}, Landroid/content/res/AssetManager;->open(Ljava/lang/String;)Ljava/io/InputStream;
+    move-result-object v0
+    invoke-virtual {p0}, Lcom/raspilot/repack/GadgetProvider;->getContext()Landroid/content/Context;
+    move-result-object v1
+    invoke-virtual {v1}, Landroid/content/Context;->getFilesDir()Ljava/io/File;
+    move-result-object v1
+    new-instance v2, Ljava/io/File;
+    const-string v3, "raspilot-gadget.js"
+    invoke-direct {v2, v1, v3}, Ljava/io/File;-><init>(Ljava/io/File;Ljava/lang/String;)V
+    new-instance v1, Ljava/io/FileOutputStream;
+    invoke-direct {v1, v2}, Ljava/io/FileOutputStream;-><init>(Ljava/io/File;)V
+    invoke-static {v0, v1}, Ljava/nio/file/Files;->copy(Ljava/io/InputStream;Ljava/io/OutputStream;)J
+    invoke-virtual {v1}, Ljava/io/FileOutputStream;->close()V
+    invoke-virtual {v0}, Ljava/io/InputStream;->close()V
+    :try_end_0
+    .catch Ljava/lang/Throwable; {:try_start_0 .. :try_end_0} :catch_0
+    goto :goto_0
+    :catch_0
+    move-exception v0
+    :goto_0
     new-instance v0, Ljava/lang/Thread;
     new-instance v1, Lcom/raspilot/repack/GadgetLoader;
     invoke-direct {v1}, Lcom/raspilot/repack/GadgetLoader;-><init>()V
@@ -180,15 +259,15 @@ GADGET_LOADER_SMALI = """\
     return-void
 .end method
 """
-GADGET_CONFIG = {
-    "interaction": {
-        "type": "listen",
-        "address": "127.0.0.1",
-        "port": 27043,
-        "on_port_conflict": "pick-next",
-        "on_load": "resume",
-    }
-}
+GADGET_MARKER_NAME = "raspilot-gadget-ok"
+GADGET_MARKER_JS = b"""
+try {
+    var marker = new File('/data/user/0/__RASPILOT_PACKAGE_NAME__/files/raspilot-gadget-ok', 'w');
+    marker.write('ok');
+    marker.flush();
+    marker.close();
+} catch (e) { }
+"""
 KEYSTORE_PASSWORD = "android"
 
 
@@ -278,6 +357,21 @@ def _keystore(path: Optional[str] = None) -> Tuple[Optional[str], str]:
     return target, ""
 
 
+def _resolve_keystore(
+    key_path: Optional[str],
+    key_alias: str,
+    key_pass: str,
+    store_pass: str,
+) -> Tuple[Optional[str], str, str]:
+    """Resolve a chave de assinatura e informa o modo usado."""
+    if key_path:
+        if not os.path.isfile(key_path):
+            return None, "original", f"keystore não encontrado: {key_path}"
+        return key_path, "original", ""
+    path, error = _keystore()
+    return path, "debug", error
+
+
 def _copy_apks(paths: Sequence[str], dest_dir: str) -> List[str]:
     os.makedirs(dest_dir, exist_ok=True)
     copied: List[str] = []
@@ -313,6 +407,7 @@ def _apktool_modify(
     apktool: Optional[str],
     timeout: int,
     package_name: str = "",
+    gadget_mode: str = "listen",
 ) -> Tuple[bool, str]:
     """Decodifica com apktool, injeta a alteração e reconstrói o APK."""
     if not apktool:
@@ -367,11 +462,14 @@ def _apktool_modify(
                 "GadgetProvider.smali",
             )
             os.makedirs(os.path.dirname(target), exist_ok=True)
-            provider_smali = (
-                GADGET_PROVIDER_SMALI
-                if variant == "gadget"
-                else GADGET_PROVIDER_CONTROL_SMALI
-            )
+            if variant == "gadget":
+                provider_smali = (
+                    GADGET_PROVIDER_SCRIPT_SMALI
+                    if gadget_mode == "script"
+                    else GADGET_PROVIDER_SMALI
+                )
+            else:
+                provider_smali = GADGET_PROVIDER_CONTROL_SMALI
             with open(target, "w", encoding="utf-8") as handle:
                 handle.write(provider_smali)
             if variant == "gadget":
@@ -435,6 +533,9 @@ def _sign_apk(
     keystore: str,
     zipalign: Optional[str],
     apksigner: Optional[str],
+    alias: str = "raspilot",
+    key_pass: str = KEYSTORE_PASSWORD,
+    store_pass: str = KEYSTORE_PASSWORD,
 ) -> Tuple[bool, str]:
     if not zipalign or not apksigner:
         return False, "zipalign/apksigner não encontrados"
@@ -446,8 +547,9 @@ def _sign_apk(
         ok, text = _run([
             apksigner, "sign",
             "--ks", keystore,
-            "--ks-pass", f"pass:{KEYSTORE_PASSWORD}",
-            "--key-pass", f"pass:{KEYSTORE_PASSWORD}",
+            "--ks-pass", f"pass:{store_pass}",
+            "--key-pass", f"pass:{key_pass}",
+            "--ks-key-alias", alias,
             "--out", output, aligned,
         ], timeout=180)
     finally:
@@ -465,6 +567,29 @@ def _signature(apk: str, apksigner: Optional[str]) -> str:
         return ""
     ok, text = _run([apksigner, "verify", "--print-certs", apk], timeout=120)
     return text if ok else ""
+
+
+def _gadget_config(
+    mode: str, port: int, package_name: str, script_device: str = ""
+) -> dict:
+    """Monta a configuração do Gadget para o modo escolhido."""
+    if mode == "script":
+        return {
+            "interaction": {
+                "type": "script",
+                "path": script_device,
+                "on_change": "reload",
+            }
+        }
+    return {
+        "interaction": {
+            "type": "listen",
+            "address": "127.0.0.1",
+            "port": int(port),
+            "on_port_conflict": "pick-next",
+            "on_load": "wait" if mode == "wait" else "resume",
+        }
+    }
 
 
 def _device_gadget_arch(abi: str) -> Optional[str]:
@@ -514,18 +639,22 @@ def _inject_gadget_libs(
     gadget_path: str,
     abi: str,
     port: int,
+    mode: str = "listen",
+    package_name: str = "",
+    script: Optional[bytes] = None,
 ) -> Tuple[bool, str]:
-    """Adiciona libgadget.so e libgadget.config.so ao APK."""
+    """Adiciona libgadget.so, configuração e script opcional ao APK."""
     try:
         with open(gadget_path, "rb") as handle:
             gadget = handle.read()
-        config = json.dumps({
-            **GADGET_CONFIG,
-            "interaction": {
-                **GADGET_CONFIG["interaction"],
-                "port": int(port),
-            },
-        }, ensure_ascii=False).encode("utf-8")
+        script_device = (
+            f"/data/user/0/{package_name}/files/raspilot-gadget.js"
+            if package_name else ""
+        )
+        config = json.dumps(
+            _gadget_config(mode, port, package_name, script_device),
+            ensure_ascii=False,
+        ).encode("utf-8")
         lib_dir = f"lib/{abi}"
         gadget_entry = f"{lib_dir}/libgadget.so"
         config_entry = f"{lib_dir}/libgadget.config.so"
@@ -538,6 +667,15 @@ def _inject_gadget_libs(
                 dst.writestr(item, src.read(item.filename))
             dst.writestr(gadget_entry, gadget)
             dst.writestr(config_entry, config)
+            if mode == "script" and script is not None:
+                marker = GADGET_MARKER_JS.replace(
+                    b"__RASPILOT_PACKAGE_NAME__",
+                    (package_name or "").encode("utf-8"),
+                )
+                dst.writestr(
+                    "assets/raspilot_gadget.js",
+                    script.rstrip() + b"\n" + marker,
+                )
         return True, ""
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
@@ -561,6 +699,12 @@ class RepackTester:
         timeout: int = 600,
         gadget_path: Optional[str] = None,
         gadget_port: int = 27043,
+        gadget_mode: str = "listen",
+        gadget_script: Optional[str] = None,
+        key_path: Optional[str] = None,
+        key_alias: str = "raspilot",
+        key_pass: str = KEYSTORE_PASSWORD,
+        store_pass: str = KEYSTORE_PASSWORD,
     ) -> None:
         self.dm = dm
         self.package_name = package_name
@@ -578,6 +722,12 @@ class RepackTester:
         self.timeout = int(timeout)
         self.gadget_path = gadget_path
         self.gadget_port = int(gadget_port)
+        self.gadget_mode = gadget_mode or "listen"
+        self.gadget_script = gadget_script
+        self.key_path = key_path
+        self.key_alias = key_alias or "raspilot"
+        self.key_pass = key_pass or KEYSTORE_PASSWORD
+        self.store_pass = store_pass or KEYSTORE_PASSWORD
         self._resolved_installer: Optional[str] = None
 
     def _apks(self, dest: str) -> List[str]:
@@ -721,6 +871,59 @@ class RepackTester:
             except Exception:
                 pass
 
+    def _gadget_script_ran(self) -> bool:
+        path = (
+            f"/data/user/0/{self.package_name}/files/{GADGET_MARKER_NAME}"
+        )
+        res = self.dm.run_shell(
+            f"run-as {self.package_name} cat files/{GADGET_MARKER_NAME} "
+            "2>/dev/null",
+            timeout=10,
+        )
+        if "ok" in (res.get("stdout") or ""):
+            return True
+        try:
+            res = self.dm.run_shell_root(
+                f"test -f {path} && echo ok", timeout=10
+            )
+            return "ok" in (res.get("stdout") or "")
+        except Exception:
+            return False
+
+    def _ui_snapshot(self) -> dict:
+        """Captura texto da UI para detectar telas de bloqueio."""
+        dump = (
+            f"/sdcard/raspilot_repack_ui.xml"
+        )
+        res = self.dm.run_shell(
+            f"uiautomator dump {dump} >/dev/null 2>&1 && cat {dump}",
+            timeout=30,
+        )
+        text = res.get("stdout") or ""
+        try:
+            self.dm.run_shell(f"rm -f {dump}", timeout=10)
+        except Exception:
+            pass
+        values = re.findall(r'text="([^"]*)"', text)
+        merged = " | ".join(
+            value.strip() for value in values if value.strip()
+        )[:800]
+        lowered = merged.lower()
+        strong = (
+            "root detected", "tamper detected", "app modified",
+            "modified app", "integrity check", "untrusted app",
+            "security check failed", "device compromised",
+            "dispositivo modificado", "app modificado",
+            "integridade do app", "bloqueado por segurança",
+            "não é possível continuar", "ambiente não confiável",
+        )
+        matched = [token for token in strong if token in lowered]
+        return {
+            "ui_text": merged,
+            "ui_signals": matched,
+            "ui_blocked": bool(matched),
+        }
+
     def _observe(self, label: str) -> dict:
         mark = self.dm.logcat_mark()
         pid = self._launch()
@@ -728,6 +931,7 @@ class RepackTester:
         foreground = False
         gadget_loaded = False
         gadget_connected = False
+        gadget_script_ran = False
         if pid is not None:
             # O foco é medido logo após o launch. A navegação posterior
             # pode abrir outra tela/app; isso não significa que o app foi
@@ -754,7 +958,9 @@ class RepackTester:
             if label == "gadget":
                 if not gadget_loaded:
                     gadget_loaded = self._gadget_loaded()
-                if gadget_loaded and not gadget_connected:
+                if gadget_loaded and self.gadget_mode == "script":
+                    gadget_script_ran = self._gadget_script_ran()
+                elif gadget_loaded and not gadget_connected:
                     gadget_connected = self._gadget_connected()
         pids = self._app_pids()
         alive = bool(pids)
@@ -769,7 +975,10 @@ class RepackTester:
             if label == "gadget" and not gadget_loaded:
                 gadget_loaded = self._gadget_loaded()
                 if gadget_loaded:
-                    gadget_connected = self._gadget_connected()
+                    if self.gadget_mode == "script":
+                        gadget_script_ran = self._gadget_script_ran()
+                    else:
+                        gadget_connected = self._gadget_connected()
         logcat = {}
         try:
             logcat = analyze_since(
@@ -785,9 +994,17 @@ class RepackTester:
             "alive": alive,
             "foreground": foreground,
             "foreground_at_end": foreground_end,
-            "usable": bool(alive and foreground),
+            "usable": bool(alive and foreground and not ui.get("ui_blocked")),
+            "ui": ui,
+            "signals": {
+                "death": bool((logcat or {}).get("death", {}).get("detected")),
+                "security": len((logcat or {}).get("security_signals") or []),
+                "tls": len((logcat or {}).get("tls_errors") or []),
+                "vendor": len((logcat or {}).get("vendor_signals") or []),
+            },
             "gadget_loaded": gadget_loaded,
             "gadget_connected": gadget_connected,
+            "gadget_script_ran": gadget_script_ran,
             "died_after": died_after,
             "logcat": logcat,
         }
@@ -803,6 +1020,11 @@ class RepackTester:
         gadget_path: Optional[str] = None,
         gadget_abi: str = "",
         gadget_port: int = 27043,
+        gadget_mode: str = "listen",
+        gadget_script: Optional[bytes] = None,
+        key_alias: str = "raspilot",
+        key_pass: str = KEYSTORE_PASSWORD,
+        store_pass: str = KEYSTORE_PASSWORD,
     ) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
         built: Dict[str, List[str]] = {}
         errors: Dict[str, str] = {}
@@ -813,7 +1035,8 @@ class RepackTester:
                 artifacts, f"split-{index}-{os.path.basename(split)}"
             )
             ok, text = _sign_apk(
-                split, signed_split, keystore, zipalign, apksigner
+                split, signed_split, keystore, zipalign, apksigner,
+                alias=key_alias, key_pass=key_pass, store_pass=store_pass,
             )
             if not ok:
                 errors["splits"] = text
@@ -821,7 +1044,10 @@ class RepackTester:
             signed_splits.append(signed_split)
 
         signed_base = os.path.join(artifacts, "resigned-base.apk")
-        ok, text = _sign_apk(base, signed_base, keystore, zipalign, apksigner)
+        ok, text = _sign_apk(
+            base, signed_base, keystore, zipalign, apksigner,
+            alias=key_alias, key_pass=key_pass, store_pass=store_pass,
+        )
         if not ok:
             errors["resigned"] = text
         else:
@@ -845,7 +1071,8 @@ class RepackTester:
             if ok:
                 signed_rebuilt = os.path.join(artifacts, "rebuilt-signed.apk")
                 ok, text = _sign_apk(
-                    rebuilt, signed_rebuilt, keystore, zipalign, apksigner
+                    rebuilt, signed_rebuilt, keystore, zipalign, apksigner,
+                    alias=key_alias, key_pass=key_pass, store_pass=store_pass,
                 )
                 if ok:
                     built["rebuilt"] = [signed_rebuilt] + signed_splits
@@ -864,7 +1091,8 @@ class RepackTester:
                 )
                 ok, text = _inject_gadget_libs(
                     control_apk, control_injected, gadget_path,
-                    gadget_abi, gadget_port,
+                    gadget_abi, gadget_port, mode="listen",
+                    package_name=self.package_name,
                 )
                 if ok:
                     control_signed = os.path.join(
@@ -872,7 +1100,8 @@ class RepackTester:
                     )
                     ok, text = _sign_apk(
                         control_injected, control_signed, keystore,
-                        zipalign, apksigner,
+                        zipalign, apksigner, alias=key_alias,
+                        key_pass=key_pass, store_pass=store_pass,
                     )
                     if ok:
                         built["gadget-control"] = [control_signed] + signed_splits
@@ -887,6 +1116,7 @@ class RepackTester:
                 ok, text = _apktool_modify(
                     base, modified, artifacts, variant, apktool,
                     self.timeout, package_name=self.package_name,
+                    gadget_mode=gadget_mode,
                 )
             if not ok:
                 errors[variant] = text
@@ -897,14 +1127,19 @@ class RepackTester:
                     continue
                 injected = os.path.join(artifacts, "gadget-injected.apk")
                 ok, text = _inject_gadget_libs(
-                    modified, injected, gadget_path, gadget_abi, gadget_port
+                    modified, injected, gadget_path, gadget_abi, gadget_port,
+                    mode=gadget_mode, package_name=self.package_name,
+                    script=gadget_script,
                 )
                 if not ok:
                     errors[variant] = text
                     continue
                 modified = injected
             signed = os.path.join(artifacts, f"{variant}-signed.apk")
-            ok, text = _sign_apk(modified, signed, keystore, zipalign, apksigner)
+            ok, text = _sign_apk(
+                modified, signed, keystore, zipalign, apksigner,
+                alias=key_alias, key_pass=key_pass, store_pass=store_pass,
+            )
             if not ok:
                 errors[variant] = text
                 continue
@@ -947,7 +1182,13 @@ class RepackTester:
             if item.get("usable")
             and (
                 name != "gadget"
-                or (item.get("gadget_loaded") and item.get("gadget_connected"))
+                or (
+                    item.get("gadget_loaded")
+                    and (
+                        item.get("gadget_connected")
+                        or item.get("gadget_script_ran")
+                    )
+                )
             )
         ]
         inconclusive = [
@@ -1041,7 +1282,10 @@ class RepackTester:
         gadget_detected = (
             "gadget" in detected
             and bool(content["gadget"].get("gadget_loaded"))
-            and bool(content["gadget"].get("gadget_connected"))
+            and bool(
+                content["gadget"].get("gadget_connected")
+                or content["gadget"].get("gadget_script_ran")
+            )
         )
         payload_failed = "gadget" in detected and not gadget_detected
         if real_detected or gadget_detected:
@@ -1113,7 +1357,9 @@ class RepackTester:
                 "skipped_reason": "nenhuma variante de repack selecionada",
                 "timestamp": _now_iso(),
             }
-        keystore, error = _keystore()
+        keystore, signature_mode, error = _resolve_keystore(
+            self.key_path, self.key_alias, self.key_pass, self.store_pass
+        )
         if not keystore:
             return {
                 "tamper_detected": None,
@@ -1178,6 +1424,7 @@ class RepackTester:
                 }
             gadget_path = None
             gadget_abi = ""
+            gadget_script: Optional[bytes] = None
             if "gadget" in self.variants:
                 gadget_abi = self._device_abi()
                 gadget_path, gadget_error = _resolve_gadget(
@@ -1199,10 +1446,51 @@ class RepackTester:
                     self.variants = [
                         item for item in self.variants if item != "gadget"
                     ]
+                if gadget_path and self.gadget_mode == "script":
+                    if not self.gadget_script:
+                        return {
+                            "tamper_detected": None,
+                            "bypass_successful": None,
+                            "probe_method": "repack",
+                            "status_hint": "SKIP",
+                            "skipped_reason": (
+                                "modo script exige --tamper-gadget-script"
+                            ),
+                            "observations": observations,
+                            "errors": errors,
+                            "timestamp": _now_iso(),
+                        }
+                    try:
+                        with open(self.gadget_script, "rb") as handle:
+                            gadget_script = handle.read()
+                    except OSError as exc:
+                        return {
+                            "tamper_detected": None,
+                            "bypass_successful": None,
+                            "probe_method": "repack",
+                            "status_hint": "ERROR",
+                            "skipped_reason": (
+                                f"não foi possível ler o script do Gadget: {exc}"
+                            ),
+                            "observations": observations,
+                            "errors": errors,
+                            "timestamp": _now_iso(),
+                        }
+            if signature_mode == "original":
+                build_alias = self.key_alias
+                build_key_pass = self.key_pass
+                build_store_pass = self.store_pass
+            else:
+                build_alias = "raspilot"
+                build_key_pass = KEYSTORE_PASSWORD
+                build_store_pass = KEYSTORE_PASSWORD
             built, errors = self._build(
                 original, artifacts, keystore, zipalign, apksigner, apktool,
                 gadget_path=gadget_path, gadget_abi=gadget_abi,
-                gadget_port=self.gadget_port,
+                gadget_port=self.gadget_port, gadget_mode=self.gadget_mode,
+                gadget_script=gadget_script,
+                key_alias=build_alias, key_pass=build_key_pass,
+                store_pass=build_store_pass,
             )
             if "resigned" not in built:
                 return {
@@ -1270,6 +1558,7 @@ class RepackTester:
                 if self.variants else None,
                 "observations": observations,
                 "errors": errors,
+                "signature_mode": signature_mode,
                 "signature_before": signature_before,
                 "signature_after": _signature(
                     (built.get("asset") or built.get("dex")
@@ -1278,15 +1567,37 @@ class RepackTester:
                     apksigner,
                 ),
                 "installer": self._installer_name(),
+                "splits": [os.path.basename(item) for item in original[1:]],
+                "ui_blocked": [
+                    name for name, item in observations.items()
+                    if (item.get("ui") or {}).get("ui_blocked")
+                ],
+                "server_signals": {
+                    name: (item.get("signals") or {})
+                    for name, item in observations.items()
+                },
                 "gadget": {
                     "path": gadget_path,
                     "abi": gadget_abi,
                     "port": self.gadget_port,
+                    "mode": self.gadget_mode,
+                    "script": self.gadget_script,
                     "loaded": bool(
                         (observations.get("gadget") or {}).get("gadget_loaded")
                     ),
                     "connected": bool(
                         (observations.get("gadget") or {}).get("gadget_connected")
+                    ),
+                    "script_ran": bool(
+                        (observations.get("gadget") or {}).get("gadget_script_ran")
+                    ),
+                    "objection_command": (
+                        f"objection -N -h 127.0.0.1 -p {self.gadget_port} "
+                        "-g Gadget explore"
+                        if (observations.get("gadget") or {}).get(
+                            "gadget_connected"
+                        )
+                        else None
                     ),
                 } if "gadget" in self.variants else None,
                 "data_warning": (

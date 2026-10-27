@@ -79,6 +79,37 @@ class TestVariants:
         ]
 
 
+class TestKeyAndConfig:
+    def test_resolve_original_key(self, tmp_path):
+        key = tmp_path / "original.jks"
+        key.write_bytes(b"jks")
+        path, mode, error = repack._resolve_keystore(
+            str(key), "release", "kp", "sp"
+        )
+        assert path == str(key)
+        assert mode == "original"
+        assert not error
+
+    def test_missing_original_key(self, tmp_path):
+        path, mode, error = repack._resolve_keystore(
+            str(tmp_path / "missing.jks"), "release", "kp", "sp"
+        )
+        assert path is None
+        assert mode == "original"
+        assert "não encontrado" in error
+
+    def test_gadget_config_modes(self):
+        listen = repack._gadget_config("listen", 27043, "pkg")
+        wait = repack._gadget_config("wait", 27043, "pkg")
+        script = repack._gadget_config(
+            "script", 27043, "pkg", "/data/user/0/pkg/files/x.js"
+        )
+        assert listen["interaction"]["on_load"] == "resume"
+        assert wait["interaction"]["on_load"] == "wait"
+        assert script["interaction"]["type"] == "script"
+        assert script["interaction"]["path"].endswith("/files/x.js")
+
+
 class TestGadget:
     def test_inject_libs_and_config(self, tmp_path):
         source = tmp_path / "base.apk"
@@ -96,6 +127,45 @@ class TestGadget:
             config = archive.read("lib/arm64-v8a/libgadget.config.so")
         assert b'"port": 27043' in config
         assert b'"on_load": "resume"' in config
+
+    def test_inject_script_mode(self, tmp_path):
+        source = tmp_path / "base.apk"
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("AndroidManifest.xml", b"manifest")
+        gadget = tmp_path / "libgadget.so"
+        gadget.write_bytes(b"GADGET")
+        output = tmp_path / "gadget-script.apk"
+        ok, error = repack._inject_gadget_libs(
+            str(source), str(output), str(gadget), "arm64-v8a", 27043,
+            mode="script", package_name="com.example.app",
+            script=b"send('probe');",
+        )
+        assert ok, error
+        with zipfile.ZipFile(output) as archive:
+            config = archive.read(
+                "lib/arm64-v8a/libgadget.config.so"
+            )
+            script = archive.read("assets/raspilot_gadget.js")
+        assert b'"type": "script"' in config
+        assert b"/data/user/0/com.example.app/files/raspilot-gadget.js" in config
+        assert b"send('probe')" in script
+        assert b"raspilot-gadget-ok" in script
+
+    def test_ui_snapshot_marks_block_screen(self):
+        class UIDM(FakeDM):
+            def run_shell(self, command, timeout=20):
+                if "uiautomator dump" in command:
+                    return {
+                        "ok": True,
+                        "stdout": '<node text="App modified" />',
+                        "stderr": "",
+                    }
+                return {"ok": True, "stdout": "", "stderr": ""}
+
+        tester = repack.RepackTester(UIDM(), "com.example.app")
+        ui = tester._ui_snapshot()
+        assert ui["ui_blocked"] is True
+        assert "app modified" in ui["ui_signals"]
 
     def test_resolve_gadget_for_abi(self, tmp_path, monkeypatch):
         gadget = tmp_path / "custom-arm64.so"
@@ -290,6 +360,24 @@ class TestInterpret:
         assert result["status_hint"] == "SKIP"
         assert result["attribution"] == "payload"
         assert result["tamper_detected"] is None
+
+    def test_gadget_death_after_script_is_detection(self):
+        gadget = _obs("gadget", usable=False)
+        gadget["alive"] = False
+        gadget["gadget_loaded"] = True
+        gadget["gadget_connected"] = False
+        gadget["gadget_script_ran"] = True
+        result = self._tester(("gadget",))._interpret(
+            {
+                "original": _obs("original"),
+                "resigned": _obs("resigned"),
+                "rebuilt": _obs("rebuilt"),
+                "gadget": gadget,
+            },
+            {},
+        )
+        assert result["status_hint"] == "OK"
+        assert result["tamper_detected"] is True
 
     def test_gadget_death_after_load_is_detection(self):
         gadget = _obs("gadget", usable=False)

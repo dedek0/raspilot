@@ -86,6 +86,12 @@ class AntiTamperingCheck:
         repack_timeout: int = 600,
         gadget_path: Optional[str] = None,
         gadget_port: int = 27043,
+        gadget_mode: str = "listen",
+        gadget_script: Optional[str] = None,
+        key_path: Optional[str] = None,
+        key_alias: str = "raspilot",
+        key_pass: str = "android",
+        store_pass: str = "android",
     ) -> None:
         self.dm = dm
         self.mode = mode
@@ -100,6 +106,12 @@ class AntiTamperingCheck:
         self.repack_timeout = int(repack_timeout)
         self.gadget_path = gadget_path
         self.gadget_port = int(gadget_port)
+        self.gadget_mode = gadget_mode or "listen"
+        self.gadget_script = gadget_script
+        self.key_path = key_path
+        self.key_alias = key_alias or "raspilot"
+        self.key_pass = key_pass or "android"
+        self.store_pass = store_pass or "android"
         # Gerenciador do módulo de instrumentação (opcional). Quando
         # disponível, a sonda roda no próprio dispositivo, sem a bridge
         # Java do Frida — que alguns alvos tratam como crash de runtime.
@@ -491,6 +503,12 @@ class AntiTamperingCheck:
                 timeout=self.repack_timeout,
                 gadget_path=self.gadget_path,
                 gadget_port=self.gadget_port,
+                gadget_mode=self.gadget_mode,
+                gadget_script=self.gadget_script,
+                key_path=self.key_path,
+                key_alias=self.key_alias,
+                key_pass=self.key_pass,
+                store_pass=self.store_pass,
             ).run()
             if probe.get("bypass_successful") is None:
                 bypass_skipped_reason = str(

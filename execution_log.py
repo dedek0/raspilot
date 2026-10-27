@@ -361,6 +361,9 @@ def _repack_entries(trace: List[dict], result: dict) -> None:
         ]
         if item.get("died_after") is not None:
             parts.append(f"morreu_apos={item.get('died_after')}s")
+        ui = item.get("ui") or {}
+        if ui.get("ui_blocked"):
+            parts.append("ui=sinal de bloqueio")
         death = (item.get("logcat") or {}).get("death") or {}
         evidence = death.get("evidence") or []
         trace.append(

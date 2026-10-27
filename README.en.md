@@ -35,6 +35,9 @@ the collected evidence.
 - **Optional:** Frida Gadget for the device ABI — only for the `gadget`
   variant. `tools/setup_repack.sh` downloads the version matching the
   installed `frida` package.
+- **Optional:** the app's original keystore (`--tamper-key`) to test
+  modified content under the same signer. Without it, repack uses a
+  debug key.
 - **Optional:** Droid ASC (`pip install -r requirements-static.txt`,
   Python 3.10+) for semantic APK analysis. Without it RASPilot uses the
   built-in byte-signature scan.
@@ -174,6 +177,12 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--tamper-timeout SECS` | no | Timeout per repack build (default `600`) |
 | `--tamper-gadget PATH` | no | Frida Gadget `.so`/`.so.xz` for the `gadget` variant; default: `~/.raspilot/gadgets/` |
 | `--tamper-gadget-port PORT` | no | Local Gadget port (default `27043`) |
+| `--tamper-gadget-mode MODE` | no | `listen` (host connects), `wait` (app waits) or `script` (runs embedded script) |
+| `--tamper-gadget-script PATH` | no | Embedded JS script for the `gadget` variant in `script` mode |
+| `--tamper-key PATH` | no | Original keystore to preserve the signer; otherwise uses the debug key |
+| `--tamper-key-alias ALIAS` | no | Original key alias (default `raspilot`) |
+| `--tamper-key-pass PASS` | no | Original key password (default `android`) |
+| `--tamper-store-pass PASS` | no | Original keystore password (default `android`) |
 | `--avd` | no | Audit against the configured AVD instead of the physical device (boots the emulator, waits for boot and shuts it down afterwards) |
 | `--avd-config PATH` | no | JSON configuration of the emulated environment (default `~/.raspilot/avd.json` or `$RASPILOT_AVD_CONFIG`) |
 | `--avd-name NAME` | no | AVD name, overriding the configuration |
@@ -623,9 +632,14 @@ Variants:
 - `manifest` — add a harmless meta-data (tests the manifest);
 - `gadget` — inject Frida Gadget + config and a provider that loads the
   library on a background thread; tests whether the app accepts the
-  instrumentation payload. A `gadget-control` injects the provider and
-  libs without loading Gadget, separating provider/manifest detection
-  from payload failure.
+  instrumentation payload. Modes: `listen` (host connects), `wait` (app
+  waits) and `script` (embedded JS with an execution marker). A
+  `gadget-control` injects the provider and libs without loading Gadget,
+  separating provider/manifest detection from payload failure.
+
+Observations also record `ui`/`ui_signals` (text and possible block
+screens) and `server_signals` (death/security/TLS/vendor counts). A weak
+signal never becomes a verdict on its own.
 
 The control matrix avoids blaming repack for a crash caused only by the
 signature change, installer or apktool rebuild. In addition to the
@@ -651,7 +665,8 @@ Temporary artifacts and kept APKs live under `reports/repack/`. For large
 apps apktool may need more heap; adjust `RASPILOT_APKTOOL_XMX` (default
 `6G`). The `gadget` variant checks `gadget.loaded` via `/proc/<pid>/maps`
 and `gadget.connected` through the Frida endpoint; it only reports
-bypass when both are true.
+bypass when both are true. When connected, the JSON includes
+`gadget.objection_command` with a ready-to-use Objection command.
 
 To interact with Gadget after installation:
 
@@ -667,12 +682,28 @@ version. Use `./tools/setup_repack.sh` to download the right one. On
 large apps Gadget loading can take more than 10 s; use `--window 20` or
 more.
 
+For a script payload:
+
+```bash
+python main.py --package com.example.app \
+    --tamper-method repack --tamper-allow-reinstall \
+    --tamper-variant gadget --tamper-gadget-mode script \
+    --tamper-gadget-script ./probe.js \
+    --window 20 --only anti_tampering
+```
+
+The provider copies the script to the app's private files directory and
+Gadget runs it. A marker in `files/raspilot-gadget-ok` confirms execution;
+the report exposes `gadget.script_ran`. The marker check uses `run-as`
+(debuggable app) or root.
+
 > Uninstall removes app data; there is no automatic backup. Use a
 > disposable device/AVD. Without the original key it is not possible to
 > test modified content under the same signer: the test covers signer
-> change plus content change. In a future MCP tool, repack must require
-> explicit two-step confirmation before uninstalling/reinstalling
-> anything.
+> change plus content change. With `--tamper-key`, control and variant
+> use the same signer, isolating content integrity. In a future MCP tool,
+> repack must require explicit two-step confirmation before uninstalling/
+> reinstalling anything.
 
 ## Instrumentation module (hooking APK) — optional
 
@@ -1009,14 +1040,16 @@ output: `--stage static|detect|bypass`, `--only`, `--apk` and
 | `Frida Gadget not found` | `gadget` variant without the ABI binary | `./tools/setup_repack.sh --abi <abi>` or use `--tamper-gadget` |
 | `gadget.loaded=false` / `gadget.connected=false` | Gadget did not load or endpoint did not answer | Increase `--window` (20+), check ABI/version and use `--tamper-gadget` |
 | Repack left the app without data | Uninstall/reinstall is destructive | Restore the original APK; app data has no automatic backup. Use a disposable AVD/device |
+| `keystore não encontrado` | Invalid `--tamper-key` path | Check the path, alias and passwords for the original keystore |
+| `modo script exige --tamper-gadget-script` | Script mode without JS | Pass `--tamper-gadget-script` or use `--tamper-gadget-mode listen` |
 
 ---
 
 ## Known limitations
 
-**Repack is destructive and not exhaustive.** Without the original
-signing key, the test measures signer change + content change; it cannot
-alter content under the same signature. Server-side attestation/Play
+**Repack is destructive and not exhaustive.** Without `--tamper-key`, the
+test measures signer change + content change; with the original key it
+measures content integrity under the same signer. Server-side attestation/Play
 Integrity may block the app without a local crash. Uninstall erases app
 data. The `gadget` variant depends on ABI, Frida version, a free port and
 load time; the report separates `payload`/`tooling` from app detection.

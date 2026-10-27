@@ -217,6 +217,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Porta local do Frida Gadget na variante gadget (default 27043)",
     )
     parser.add_argument(
+        "--tamper-gadget-mode",
+        choices=("listen", "wait", "script"),
+        default="listen",
+        help=(
+            "Modo do Gadget: listen (host conecta), wait (app aguarda) "
+            "ou script (executa --tamper-gadget-script)"
+        ),
+    )
+    parser.add_argument(
+        "--tamper-gadget-script",
+        default=None,
+        metavar="PATH",
+        help="Script JS embutido na variante gadget (modo script)",
+    )
+    parser.add_argument(
+        "--tamper-key",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Keystore original para preservar o assinante no repack; "
+            "sem ele usa a chave de debug"
+        ),
+    )
+    parser.add_argument(
+        "--tamper-key-alias",
+        default="raspilot",
+        help="Alias da chave em --tamper-key (default raspilot)",
+    )
+    parser.add_argument(
+        "--tamper-key-pass",
+        default="android",
+        help="Senha da chave em --tamper-key (default android)",
+    )
+    parser.add_argument(
+        "--tamper-store-pass",
+        default="android",
+        help="Senha do keystore em --tamper-key (default android)",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Ativa logging em nível DEBUG",
@@ -682,6 +721,10 @@ def _build_run_context(args: argparse.Namespace, dm: "DeviceManager") -> dict:
             "tamper_gadget_port": int(
                 getattr(args, "tamper_gadget_port", 27043)
             ),
+            "tamper_gadget_mode": getattr(args, "tamper_gadget_mode", "listen"),
+            "tamper_gadget_script": getattr(args, "tamper_gadget_script", None),
+            "tamper_key": getattr(args, "tamper_key", None),
+            "tamper_key_alias": getattr(args, "tamper_key_alias", "raspilot"),
             "stage": getattr(args, "stage", "full"),
             "only": list(getattr(args, "only", None) or []),
             "apk": getattr(args, "apk", None),
@@ -1197,6 +1240,12 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 repack_timeout=int(getattr(args, "tamper_timeout", 600)),
                 gadget_path=getattr(args, "tamper_gadget", None),
                 gadget_port=int(getattr(args, "tamper_gadget_port", 27043)),
+                gadget_mode=getattr(args, "tamper_gadget_mode", "listen"),
+                gadget_script=getattr(args, "tamper_gadget_script", None),
+                key_path=getattr(args, "tamper_key", None),
+                key_alias=getattr(args, "tamper_key_alias", "raspilot"),
+                key_pass=getattr(args, "tamper_key_pass", "android"),
+                store_pass=getattr(args, "tamper_store_pass", "android"),
             ).run_all(
                 static_profile=static_profile,
                 package_name=args.package,
