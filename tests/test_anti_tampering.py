@@ -404,3 +404,49 @@ class TestModuleProbe:
         check = AntiTamperingCheck(FakeDevice(), xposed=manager)
         result = check.probe_in_memory("com.example.app", window=1)
         assert result["bypass_successful"] is True
+
+
+class TestRepackIntegration:
+    def test_repack_result_maps_to_two_verdicts(self, monkeypatch):
+        check = AntiTamperingCheck(
+            FakeDevice(), method="repack", allow_reinstall=True
+        )
+        monkeypatch.setattr(
+            check, "detect_static",
+            lambda *a, **k: {
+                "tamper_detected": True,
+                "static_detected": True,
+                "types": ["method"],
+                "evidence": ["checkSignatures"],
+                "confidence": "high",
+                "owners": {"app": 1},
+                "app_evidence": True,
+                "asc": {"engine": "asc"},
+                "details": "",
+            },
+        )
+        monkeypatch.setattr(
+            "checks.tamper_repack.RepackTester.run",
+            lambda self: {
+                "tamper_detected": True,
+                "bypass_successful": False,
+                "probe_method": "repack",
+                "status_hint": "OK",
+                "verdict_reason": "conteúdo alterado bloqueado",
+                "control_alive": True,
+                "tamper_alive": False,
+                "observations": {
+                    "original": {"label": "original", "usable": True},
+                    "resigned": {"label": "resigned", "usable": True},
+                    "asset": {"label": "asset", "usable": False},
+                },
+            },
+        )
+        result = check.run_all(
+            static_profile=_profile(), package_name="com.example.app"
+        )
+        assert result["status_hint"] == "OK"
+        assert result["bypass_method"] == "repack"
+        assert result["tamper_detected"] is True
+        assert result["bypass_successful"] is False
+        assert result["app_detection"]["variants_detected"] == ["asset"]

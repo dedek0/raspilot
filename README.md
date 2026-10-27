@@ -144,7 +144,13 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--js-runtime RUNTIME` | não | Runtime JavaScript do Frida: `qjs` (default) ou `v8` |
 | `--verbose` | não | Logging em nível DEBUG |
 | `--skip CHECK...` | não | Checks a pular (`anti_root`, `anti_frida`, `anti_tampering`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
-| `--tamper-method MÉTODO` | não | `auto` (default; estático + sonda módulo/Frida), `static` (só APK) ou `frida` (só sonda em memória) |
+| `--tamper-method MÉTODO` | não | `auto` (default; estático + sonda módulo/Frida), `static` (só APK), `frida` (só sonda em memória) ou `repack` (destrutivo) |
+| `--tamper-allow-reinstall` | não | Confirma que o repack pode desinstalar/reinstalar o app; dados são perdidos |
+| `--tamper-variant VARIANTE` | não | `asset`, `dex`, `resource` ou `manifest`; pode repetir. Default: `asset` e `dex` |
+| `--tamper-installer PKG` | não | Instalador simulado no repack (ex: `com.android.vending`); default: instalador atual |
+| `--tamper-no-restore` | não | Não reinstala o APK original ao final |
+| `--tamper-keep-artifacts` | não | Mantém APKs original/modificados no diretório de saída |
+| `--tamper-timeout SEG` | não | Timeout por build do repack (default `600`) |
 | `--avd` | não | Audita contra o AVD configurado em vez do device físico (sobe o emulador, espera o boot e o encerra no final) |
 | `--avd-config PATH` | não | Configuração JSON do ambiente emulado (default `~/.raspilot/avd.json` ou `$RASPILOT_AVD_CONFIG`) |
 | `--avd-name NOME` | não | Nome do AVD, sobrescrevendo a configuração |
@@ -598,11 +604,46 @@ O resultado traz dois vereditos: **detecção** (`tamper_detected`) e
 static` pulam a sonda dinâmica; `--no-java` também impede a sonda. O
 método fica explícito em `bypass_method` (`module` ou `frida`).
 
-> O teste **destrutivo** (re-assinar/reinstalar o APK) não é executado
-> automaticamente. Ele exige reinstalação, perde os dados do app e só
-> deve rodar em device/AVD descartável. Em uma futura ferramenta MCP,
-> essa etapa deve pedir confirmação explícita ao usuário antes de
-> reinstalar qualquer coisa.
+### 5.2. Teste de repack (`checks/tamper_repack.py`)
+
+O teste destrutivo, opt-in, responde se o app detecta um APK alterado e
+re-assinado. Fluxo:
+
+1. puxa e guarda os APKs originais (base + splits);
+2. observa o app original como controle;
+3. instala um **controle re-assinado sem alteração de conteúdo**;
+4. instala variantes com conteúdo alterado e re-assinadas;
+5. restaura o APK original ao final.
+
+Variantes:
+
+- `asset` — adiciona um asset marcador (testa ZIP/CRC/integridade de assets);
+- `dex` — adiciona uma classe smali inofensiva e reconstrói o DEX
+  (testa integridade de DEX);
+- `resource` — adiciona um recurso (testa `resources.arsc`);
+- `manifest` — adiciona uma meta-data inofensiva (testa o manifesto).
+
+A matriz de controle evita atribuir ao repack um crash causado apenas
+pela troca de assinatura, pelo instalador ou pelo rebuild do apktool.
+Além do controle `resigned`, variantes que passam pelo apktool têm um
+controle `rebuilt` (decodificado e reconstruído sem alteração). O
+resultado separa `original`, `resigned`, `rebuilt` e cada variante, com
+`attribution` (`signature`, `content`, `signature/content`, `tooling`,
+`environment`, `inconclusive` ou `none`).
+
+```bash
+python main.py --package com.exemplo.app \
+    --tamper-method repack --tamper-allow-reinstall \
+    --tamper-variant asset --tamper-variant dex \
+    --only anti_tampering
+```
+
+> O uninstall remove os dados do app; não há backup automático. Use
+> device/AVD descartável. Sem a chave original não é possível testar
+> conteúdo alterado mantendo a mesma assinatura: o teste cobre a troca
+> de assinante e a alteração de conteúdo. Em uma futura ferramenta MCP,
+> o repack deve exigir confirmação explícita em duas etapas antes de
+> desinstalar/reinstalar qualquer coisa.
 
 ### 6. Hook de veredito (`scripts/verdict_hook.js`)
 Enganar as primitivas de detecção não é o bastante: o SDK ainda
@@ -833,6 +874,7 @@ raspilot/
 │   ├── anti_root.py            # Detecção de root multi-vetor
 │   ├── anti_frida.py           # Presença/detecção/bypass de Frida
 │   ├── anti_tampering.py       # Integridade estática + sonda em memória
+│   ├── tamper_repack.py        # Repack destrutivo com controles + restore
 │   ├── anti_emulator.py        # Detecção + bypass de anti-emulador
 │   ├── anti_hooking.py         # Detecção + bypass de anti-hooking
 │   ├── combined.py             # Observação/bypass em sessão única

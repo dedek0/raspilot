@@ -203,3 +203,38 @@ class TestStagedFlags:
         doc = json.loads(files[0].read_text(encoding="utf-8"))
         assert doc["metadata"]["run"]["stage"] == "static"
         assert doc["static_profile"]["engine"] == "builtin"
+
+
+class TestRepackFlags:
+    """Flags do teste destrutivo de repack."""
+
+    def test_repack_requires_explicit_reinstall_permission(self):
+        with pytest.raises(SystemExit) as exc:
+            mainmod.parse_args([
+                "--package", "com.example.app",
+                "--tamper-method", "repack",
+            ])
+        assert exc.value.code == 2
+
+    def test_repack_accepts_permission_and_variants(self):
+        args = mainmod.parse_args([
+            "--package", "com.example.app",
+            "--tamper-method", "repack",
+            "--tamper-allow-reinstall",
+            "--tamper-variant", "asset",
+            "--tamper-variant", "dex",
+            "--tamper-installer", "com.android.vending",
+            "--tamper-keep-artifacts",
+        ])
+        assert args.tamper_allow_reinstall is True
+        assert args.tamper_variant == ["asset", "dex"]
+        assert args.tamper_installer == "com.android.vending"
+        assert args.tamper_keep_artifacts is True
+
+    def test_detect_stage_does_not_require_reinstall(self):
+        args = mainmod.parse_args([
+            "--package", "com.example.app",
+            "--tamper-method", "repack",
+            "--stage", "detect",
+        ])
+        assert args.stage == "detect"

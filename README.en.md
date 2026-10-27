@@ -148,7 +148,13 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--js-runtime RUNTIME` | no | Frida JavaScript runtime: `qjs` (default) or `v8` |
 | `--verbose` | no | DEBUG-level logging |
 | `--skip CHECK...` | no | Checks to skip (`anti_root`, `anti_frida`, `anti_tampering`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
-| `--tamper-method METHOD` | no | `auto` (default; static + module/Frida probe), `static` (APK only) or `frida` (in-memory probe only) |
+| `--tamper-method METHOD` | no | `auto` (default; static + module/Frida probe), `static` (APK only), `frida` (in-memory probe only) or `repack` (destructive) |
+| `--tamper-allow-reinstall` | no | Confirms repack may uninstall/reinstall the app; data is lost |
+| `--tamper-variant VARIANT` | no | `asset`, `dex`, `resource` or `manifest`; repeatable. Default: `asset` and `dex` |
+| `--tamper-installer PKG` | no | Installer simulated during repack (e.g. `com.android.vending`); default: current installer |
+| `--tamper-no-restore` | no | Do not reinstall the original APK at the end |
+| `--tamper-keep-artifacts` | no | Keep original/modified APKs in the output directory |
+| `--tamper-timeout SECS` | no | Timeout per repack build (default `600`) |
 | `--avd` | no | Audit against the configured AVD instead of the physical device (boots the emulator, waits for boot and shuts it down afterwards) |
 | `--avd-config PATH` | no | JSON configuration of the emulated environment (default `~/.raspilot/avd.json` or `$RASPILOT_AVD_CONFIG`) |
 | `--avd-name NAME` | no | AVD name, overriding the configuration |
@@ -579,10 +585,43 @@ The result has two verdicts: **detection** (`tamper_detected`) and
 static` skip the dynamic probe; `--no-java` also blocks it. The method is
 explicit in `bypass_method` (`module` or `frida`).
 
-> The **destructive** test (re-sign/reinstall the APK) is not executed
-> automatically. It requires reinstallation, loses app data and should
-> only run on a disposable device/AVD. In a future MCP tool, this step
-> must ask the user for explicit confirmation before reinstalling
+### 6.1. Repack test (`checks/tamper_repack.py`)
+
+The opt-in destructive test answers whether the app detects a modified,
+re-signed APK. Flow:
+
+1. pull and keep the original APKs (base + splits);
+2. observe the original app as control;
+3. install a **re-signed control with unchanged content**;
+4. install content-modified re-signed variants;
+5. restore the original APK at the end.
+
+Variants:
+
+- `asset` — add a marker asset (tests ZIP/CRC/asset integrity);
+- `dex` — add a harmless smali class and rebuild DEX (tests DEX integrity);
+- `resource` — add a resource (tests `resources.arsc`);
+- `manifest` — add a harmless meta-data (tests the manifest).
+
+The control matrix avoids blaming repack for a crash caused only by the
+signature change, installer or apktool rebuild. In addition to the
+`resigned` control, apktool variants get a `rebuilt` control (decoded
+and rebuilt with no change). The result separates `original`, `resigned`,
+`rebuilt` and each variant, with `attribution` (`signature`, `content`,
+`signature/content`, `tooling`, `environment`, `inconclusive` or `none`).
+
+```bash
+python main.py --package com.example.app \
+    --tamper-method repack --tamper-allow-reinstall \
+    --tamper-variant asset --tamper-variant dex \
+    --only anti_tampering
+```
+
+> Uninstall removes app data; there is no automatic backup. Use a
+> disposable device/AVD. Without the original key it is not possible to
+> test modified content under the same signer: the test covers signer
+> change plus content change. In a future MCP tool, repack must require
+> explicit two-step confirmation before uninstalling/reinstalling
 > anything.
 
 ## Instrumentation module (hooking APK) — optional
@@ -800,6 +839,7 @@ raspilot/
 │   ├── anti_root.py            # Multi-vector root detection
 │   ├── anti_frida.py           # Frida presence/detection
 │   ├── anti_tampering.py       # Static integrity + in-memory probe
+│   ├── tamper_repack.py        # Destructive repack with controls + restore
 │   ├── anti_emulator.py        # Anti-emulator detection + bypass
 │   ├── anti_hooking.py         # Anti-hooking detection + bypass
 │   ├── combined.py             # Single-session observation/bypass

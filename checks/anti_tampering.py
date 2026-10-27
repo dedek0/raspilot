@@ -1,6 +1,6 @@
 """RASPilot — Verificação de Anti-Tampering.
 
-Duas camadas:
+Três camadas:
 
 1. **Estática** — procura APIs/strings de integridade no APK (assinatura
    de pacote, `MessageDigest`, Play Integrity/SafetyNet, CRC etc.).
@@ -9,19 +9,21 @@ Duas camadas:
    módulo do dispositivo (`TamperShield`) quando disponível; senão,
    Frida com stealth. Se o app morre só na fase com tamper, ele detectou
    a alteração.
-
-O teste destrutivo (re-assinar/reinstalar o APK) é deliberadamente
-separado e não é executado por esta classe.
+3. **Repack destrutivo** — opcional e opt-in (`method="repack"`):
+   reconstrói o APK, re-assina e reinstala para medir a reação do app.
+   Exige `allow_reinstall`; o fluxo de controles e restore fica em
+   :mod:`checks.tamper_repack`.
 """
 
 from __future__ import annotations
 
+import glob
 import logging
 import os
 import tempfile
 import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 from checks.apk_utils import pull_apk, scan_apk
 from checks.static import vector_view
@@ -66,7 +68,7 @@ def _confidence(descriptions: List[str]) -> str:
 
 
 class AntiTamperingCheck:
-    """Detecta proteção anti-tampering e testa uma alteração em memória."""
+    """Detecta anti-tampering e testa sonda em memória ou repack."""
 
     def __init__(
         self,
@@ -75,11 +77,25 @@ class AntiTamperingCheck:
         no_java: bool = False,
         method: str = "auto",
         xposed=None,
+        repack_variants: Optional[Sequence[str]] = None,
+        allow_reinstall: bool = False,
+        installer: Optional[str] = None,
+        restore: bool = True,
+        keep_artifacts: bool = False,
+        output_dir: Optional[str] = None,
+        repack_timeout: int = 600,
     ) -> None:
         self.dm = dm
         self.mode = mode
         self.no_java = bool(no_java)
         self.method = method or "auto"
+        self.repack_variants = list(repack_variants or ("asset", "dex"))
+        self.allow_reinstall = bool(allow_reinstall)
+        self.installer = installer
+        self.restore = bool(restore)
+        self.keep_artifacts = bool(keep_artifacts)
+        self.output_dir = output_dir
+        self.repack_timeout = int(repack_timeout)
         # Gerenciador do módulo de instrumentação (opcional). Quando
         # disponível, a sonda roda no próprio dispositivo, sem a bridge
         # Java do Frida — que alguns alvos tratam como crash de runtime.
@@ -125,7 +141,12 @@ class AntiTamperingCheck:
             }
 
         with tempfile.TemporaryDirectory(prefix="raspilot_tamper_") as tmp:
-            apks = [apk_path] if apk_path else pull_apk(self.dm, package_name, tmp)
+            if apk_path and os.path.isdir(apk_path):
+                apks = sorted(glob.glob(os.path.join(apk_path, "*.apk")))
+            elif apk_path:
+                apks = [apk_path]
+            else:
+                apks = pull_apk(self.dm, package_name, tmp)
             if not apks:
                 return {
                     "tamper_detected": False,
@@ -449,6 +470,26 @@ class AntiTamperingCheck:
             bypass_skipped_reason = "modo detect: sonda dinâmica não executada"
         elif not package_name:
             bypass_skipped_reason = "package name ausente"
+        elif self.method == "repack":
+            from checks.tamper_repack import RepackTester
+
+            probe = RepackTester(
+                self.dm,
+                package_name,
+                apk_path=apk_path,
+                output_dir=self.output_dir,
+                window=window,
+                variants=self.repack_variants,
+                installer=self.installer,
+                allow_reinstall=self.allow_reinstall,
+                restore=self.restore,
+                keep_artifacts=self.keep_artifacts,
+                timeout=self.repack_timeout,
+            ).run()
+            if probe.get("bypass_successful") is None:
+                bypass_skipped_reason = str(
+                    probe.get("skipped_reason") or "repack inconclusivo"
+                )
         elif self.no_java:
             bypass_skipped_reason = "--no-java: sonda de tamper exige Java"
         else:
@@ -465,7 +506,14 @@ class AntiTamperingCheck:
 
         status_hint = None
         verdict_reason = None
-        if bypass_successful is True:
+        if probe is not None and probe.get("probe_method") == "repack":
+            status_hint = probe.get("status_hint") or "SKIP"
+            verdict_reason = (
+                probe.get("verdict_reason")
+                or probe.get("skipped_reason")
+                or "repack inconclusivo"
+            )
+        elif bypass_successful is True:
             status_hint = "FALHOU"
             verdict_reason = "app sobreviveu à alteração de assinatura em memória"
         elif bypass_successful is False:
@@ -480,6 +528,15 @@ class AntiTamperingCheck:
 
         app_detection = None
         if probe is not None:
+            observations = probe.get("observations") or {}
+            detected_variants = [
+                item for item in observations.values()
+                if isinstance(item, dict)
+                and item.get("usable") is False
+                and item.get("label") in (
+                    "asset", "dex", "resource", "manifest"
+                )
+            ]
             app_detection = {
                 "detected": tamper_detected,
                 "app_alive_at_end": probe.get("tamper_alive"),
@@ -487,9 +544,19 @@ class AntiTamperingCheck:
                 "observation_status": (
                     "ok" if tamper_detected is not None else "inconclusive"
                 ),
-                "details": probe.get("details"),
+                "details": probe.get("verdict_reason") or probe.get("details"),
                 "error": probe.get("skipped_reason") if tamper_detected is None else None,
             }
+            if probe.get("probe_method") == "repack":
+                app_detection["observation_status"] = (
+                    "ok" if probe.get("status_hint") in ("OK", "FALHOU")
+                    else "inconclusive"
+                )
+                app_detection["variants_detected"] = sorted(
+                    str(item.get("label"))
+                    for item in detected_variants
+                    if item.get("label")
+                )
 
         result = {
             "tamper_detected": tamper_detected,

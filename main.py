@@ -151,12 +151,55 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tamper-method",
-        choices=("auto", "static", "frida"),
+        choices=("auto", "static", "frida", "repack"),
         default="auto",
         help=(
             "Método do anti-tampering: auto=estático + módulo/Frida; "
-            "static=só análise do APK; frida=só sonda em memória"
+            "static=só análise do APK; frida=só sonda em memória; "
+            "repack=re-assina/reinstala o APK (destrutivo)"
         ),
+    )
+    parser.add_argument(
+        "--tamper-allow-reinstall",
+        action="store_true",
+        help=(
+            "Autoriza o teste de repack a desinstalar/reinstalar o app. "
+            "Os dados do app são perdidos; use device/AVD descartável."
+        ),
+    )
+    parser.add_argument(
+        "--tamper-variant",
+        action="append",
+        choices=("asset", "dex", "resource", "manifest"),
+        help=(
+            "Variante de modificação do repack; pode repetir. "
+            "Default: asset e dex"
+        ),
+    )
+    parser.add_argument(
+        "--tamper-installer",
+        default=None,
+        metavar="PKG",
+        help=(
+            "Instalador simulado no repack (ex: com.android.vending). "
+            "Default: o instalador atual do app"
+        ),
+    )
+    parser.add_argument(
+        "--tamper-no-restore",
+        action="store_true",
+        help="Não reinstala o APK original ao final do teste de repack",
+    )
+    parser.add_argument(
+        "--tamper-keep-artifacts",
+        action="store_true",
+        help="Mantém os APKs original/modificados no diretório de saída",
+    )
+    parser.add_argument(
+        "--tamper-timeout",
+        type=int,
+        default=600,
+        help="Timeout por operação de build do repack (default 600s)",
     )
     parser.add_argument(
         "--verbose",
@@ -323,6 +366,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         parser.error(
             f"checks desconhecidos em --skip: {', '.join(unknown)}. "
             f"Conhecidos: {', '.join(KNOWN_CHECKS)}"
+        )
+    if (
+        args.tamper_method == "repack"
+        and not args.tamper_allow_reinstall
+        and args.stage not in ("static", "detect")
+        and args.mode != "detect"
+        and "anti_tampering" not in args.skip
+    ):
+        parser.error(
+            "--tamper-method repack desinstala e reinstala o app; "
+            "use --tamper-allow-reinstall para confirmar que os dados "
+            "podem ser perdidos"
         )
     return args
 
@@ -596,6 +651,18 @@ def _build_run_context(args: argparse.Namespace, dm: "DeviceManager") -> dict:
             "static_engine": getattr(args, "static_engine", "auto"),
             "static_timeout": getattr(args, "static_timeout", 60.0),
             "tamper_method": getattr(args, "tamper_method", "auto"),
+            "tamper_variants": list(getattr(args, "tamper_variant", None) or []),
+            "tamper_allow_reinstall": bool(
+                getattr(args, "tamper_allow_reinstall", False)
+            ),
+            "tamper_installer": getattr(args, "tamper_installer", None),
+            "tamper_no_restore": bool(
+                getattr(args, "tamper_no_restore", False)
+            ),
+            "tamper_keep_artifacts": bool(
+                getattr(args, "tamper_keep_artifacts", False)
+            ),
+            "tamper_timeout": int(getattr(args, "tamper_timeout", 600)),
             "stage": getattr(args, "stage", "full"),
             "only": list(getattr(args, "only", None) or []),
             "apk": getattr(args, "apk", None),
@@ -1096,6 +1163,19 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 no_java=args.no_java,
                 method=getattr(args, "tamper_method", "auto"),
                 xposed=xposed,
+                repack_variants=(
+                    getattr(args, "tamper_variant", None) or ("asset", "dex")
+                ),
+                allow_reinstall=bool(
+                    getattr(args, "tamper_allow_reinstall", False)
+                ),
+                installer=getattr(args, "tamper_installer", None),
+                restore=not bool(getattr(args, "tamper_no_restore", False)),
+                keep_artifacts=bool(
+                    getattr(args, "tamper_keep_artifacts", False)
+                ),
+                output_dir=args.output_dir,
+                repack_timeout=int(getattr(args, "tamper_timeout", 600)),
             ).run_all(
                 static_profile=static_profile,
                 package_name=args.package,
