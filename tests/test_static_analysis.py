@@ -468,3 +468,22 @@ class TestCheckStaticIntegration:
         status, summary = Reporter._status_for("ssl_pinning", result)
         assert status == "SKIP"
         assert summary["tls_observed"] is True
+
+
+def test_ssl_native_tls_activity_counts_as_observed():
+    """X509/verify nativo prova atividade TLS mesmo sem host Java."""
+    profile = _profile("pinning", confidence="low")
+    profile["coverage"]["pinning"]["possible_gaps"] = [
+        "possível checagem nativa/fora da camada Java (indício: boringssl)"
+    ]
+    check = SSLPinningCheck(mock.MagicMock(), mode="bypass")
+    probe = {
+        "success": False,
+        "intercepted_hosts": [],
+        "bypass_logs": ["libssl.so: X509_verify_cert -> X509_V_OK"],
+        "app_alive_at_end": True,
+    }
+    with mock.patch.object(check, "attempt_bypass", return_value=probe):
+        result = check.run_all("com.example.app", static_profile=profile)
+    assert result["tls_observed"] is True
+    assert result["status_hint"] == "SKIP"

@@ -303,12 +303,16 @@ class SSLPinningCheck:
             # Spawn suspenso: instala os hooks ANTES do app rodar, para
             # não perder validações de certificado da inicialização.
             session = self.dm.spawn_app(package_name, resume=False)
-            if self.mode == "stealth":
+            if self.mode != "detect":
+                # Em bypass/stealth a evasão anti-Frida precisa estar ativa:
+                # sem ela o app pode encerrar antes de a requisição TLS
+                # acontecer, e o probe SSL nunca é exercitado.
                 stealth_loaded = load_stealth(
                     session,
                     on_message=on_message,
                     replacements=self._script_replacements(),
                     include_proc_filter=True,
+                    load_native_frida=True,
                 )
             # Fase 1 (antes do resume): hooks nativos SSL + filtro /proc,
             # sem bridge Java.
@@ -342,7 +346,7 @@ class SSLPinningCheck:
                         session, SSL_BYPASS_SCRIPT, on_message=on_message,
                         replacements=self._script_replacements(java_only=True),
                         with_java_bridge=True,
-                        load_timeout=5.0,
+                        load_timeout=20.0,
                     )
                 except Exception as exc:
                     java_load_error = str(exc)
@@ -658,7 +662,12 @@ class SSLPinningCheck:
                         package_name, window=probe_window, interact=True
                     )
                 intercepted = list(probe.get("intercepted_hosts") or [])
-                tls_observed = bool(intercepted)
+                native_tls = any(
+                    "ssl_get_verify_result ->" in str(item).lower()
+                    or "x509_verify_cert ->" in str(item).lower()
+                    for item in probe.get("bypass_logs") or []
+                )
+                tls_observed = bool(intercepted) or native_tls
                 blocked = bool(probe.get("blocked"))
                 probe_error = probe.get("error") if not probe.get("success") else None
                 if blocked:
