@@ -741,7 +741,13 @@ def run_pipeline(args: argparse.Namespace) -> int:
         _run_step(
             reporter,
             "anti_root",
-            lambda: AntiRootCheck(dm).run_all(static_profile=static_profile),
+            lambda: AntiRootCheck(
+                dm, mode=args.mode, no_java=args.no_java
+            ).run_all(
+                static_profile=static_profile,
+                package_name=args.package,
+                window=args.window,
+            ),
             skipped="anti_root" in args.skip,
         )
 

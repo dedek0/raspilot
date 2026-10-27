@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from unittest import mock
+
 from checks.anti_root import ROOT_APP_PACKAGES, SU_PATHS, AntiRootCheck
+from reporter import Reporter
 from tests.conftest import FakeShellDM
 
 
@@ -155,3 +158,175 @@ class TestRunAll:
         """Magisk e SuperSU estão na lista de apps perigosos."""
         assert "com.topjohnwu.magisk" in ROOT_APP_PACKAGES
         assert "eu.chainfire.supersu" in ROOT_APP_PACKAGES
+
+
+def _root_profile(present=True):
+    """Perfil estático mínimo para a fase no app."""
+    return {
+        "available": True,
+        "engine": "asc",
+        "version": "0.1.2",
+        "vectors": {
+            "root": {
+                "present": present,
+                "confidence": "high" if present else "none",
+                "findings": [{
+                    "vector": "root",
+                    "source": "asc",
+                    "kind": "string_ref",
+                    "value": "magisk",
+                    "evidence": "Lcom/x;->checkRoot referencia magisk",
+                    "confidence": "high",
+                    "class": "Lcom/x;",
+                    "method": "checkRoot",
+                    "label": "referência ao Magisk",
+                    "owner": "app",
+                }] if present else [],
+                "total": 1 if present else 0,
+                "sources": ["asc"],
+                "owners": {"app": 1} if present else {},
+                "app_evidence": present,
+                "techniques": ["referência ao Magisk"] if present else [],
+            }
+        },
+        "coverage": {
+            "root": {
+                "bypass_hooks": ["RootBeer", "File.exists"],
+                "possible_gaps": [],
+                "static_present": present,
+                "app_evidence": present,
+            }
+        },
+        "manifest": {"available": True, "package": "com.example.app"},
+        "rasp_sdks": [],
+        "classes_count": 10,
+        "summary": {"available": True, "engine": "asc", "vectors_present": []},
+        "limitations": [],
+        "errors": [],
+        "timestamp": "2026-10-27T00:00:00+00:00",
+        "cached": False,
+    }
+
+
+class TestAppRootDetectionAndBypass:
+    """O check mede a proteção de root do app, não só o dispositivo."""
+
+    def test_bypass_win_sets_failure(self, clean_dm):
+        check = AntiRootCheck(clean_dm, mode="bypass")
+        detection = {
+            "detected": True,
+            "detection_methods_found": ["File.exists: /system/xbin/su"],
+            "app_alive_at_end": True,
+            "details": "app consultou su",
+        }
+        bypass = {
+            "success": True,
+            "method": "frida",
+            "app_alive_at_end": True,
+            "neutralized": ["File.exists -> false"],
+            "bypass_logs": [],
+            "details": "neutralizado",
+        }
+        with mock.patch.object(
+            check, "_detect_app_root", return_value=detection
+        ), mock.patch.object(check, "_attempt_bypass", return_value=bypass):
+            result = check.run_all(
+                static_profile=_root_profile(),
+                package_name="com.example.app",
+                window=1,
+            )
+        assert result["app_detection"] is detection
+        assert result["protection_detected"] is True
+        assert result["bypass_successful"] is True
+        assert result["status_hint"] == "FALHOU"
+        assert result["is_rooted"] is False
+        status, summary = Reporter._status_for("anti_root", result)
+        assert status == "FALHOU"
+        assert summary["bypass_successful"] is True
+
+    def test_resisted_bypass_is_ok(self, clean_dm):
+        check = AntiRootCheck(clean_dm, mode="bypass")
+        with mock.patch.object(
+            check,
+            "_detect_app_root",
+            return_value={"detected": True, "detection_methods_found": ["x"]},
+        ), mock.patch.object(
+            check,
+            "_attempt_bypass",
+            return_value={"success": False, "method": "frida", "app_alive_at_end": False},
+        ):
+            result = check.run_all(
+                static_profile=_root_profile(),
+                package_name="com.example.app",
+                window=1,
+            )
+        assert result["bypass_successful"] is False
+        assert result["status_hint"] == "OK"
+        status, _summary = Reporter._status_for("anti_root", result)
+        assert status == "OK"
+
+    def test_detect_mode_does_not_run_bypass(self, clean_dm):
+        check = AntiRootCheck(clean_dm, mode="detect")
+        with mock.patch.object(
+            check,
+            "_detect_app_root",
+            return_value={"detected": True, "detection_methods_found": ["x"]},
+        ), mock.patch.object(check, "_attempt_bypass") as bypass:
+            result = check.run_all(
+                static_profile=_root_profile(),
+                package_name="com.example.app",
+                window=1,
+            )
+        bypass.assert_not_called()
+        assert result["bypass_successful"] is None
+        assert result["status_hint"] == "SKIP"
+
+    def test_attempt_bypass_marks_exercised_check(self):
+        dm = mock.MagicMock()
+        dm.spawn_app.return_value = mock.MagicMock()
+        dm.last_spawn_pid = 1
+        dm.is_app_alive.return_value = True
+        dm.logcat_mark = None
+        dm.last_spawn_package = "com.example.app"
+        check = AntiRootCheck(dm, mode="bypass")
+
+        def fake_load(session, path, on_message=None, **kwargs):
+            if on_message:
+                on_message({"type": "send", "payload": {
+                    "type": "raspilot-bypass",
+                    "message": "File.exists(/system/xbin/su) -> false",
+                }}, None)
+            return mock.MagicMock()
+
+        with mock.patch("checks.anti_root.load_script_file", side_effect=fake_load), \
+             mock.patch("checks.anti_root.load_stealth", return_value=[]), \
+             mock.patch("checks.anti_root.ROOT_OBSERVATION_POLL_INTERVAL", 0.0):
+            result = check._attempt_bypass("com.example.app", window=1)
+        assert result["success"] is True
+        assert result["exercised"] is True
+        assert result["neutralized"]
+
+    def test_detect_app_root_collects_java_signal(self):
+        dm = mock.MagicMock()
+        dm.spawn_app.return_value = mock.MagicMock()
+        dm.last_spawn_pid = 1
+        dm.is_app_alive.return_value = True
+        dm.logcat_mark = None
+        dm.last_spawn_package = "com.example.app"
+        check = AntiRootCheck(dm, mode="detect")
+
+        def fake_load(session, path, on_message=None, **kwargs):
+            if on_message:
+                on_message({"type": "send", "payload": {
+                    "type": "root-detection",
+                    "method": "File.exists",
+                    "detail": "/system/xbin/su",
+                }}, None)
+            return mock.MagicMock()
+
+        with mock.patch("checks.anti_root.load_script_file", side_effect=fake_load), \
+             mock.patch("checks.anti_root.load_stealth", return_value=[]), \
+             mock.patch("checks.anti_root.ROOT_OBSERVATION_POLL_INTERVAL", 0.0):
+            result = check._detect_app_root("com.example.app", window=1)
+        assert result["detected"] is True
+        assert "File.exists" in result["detection_methods_found"][0]

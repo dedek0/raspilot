@@ -11,15 +11,33 @@ Marca: RASPilot — Piloto Automático de Auditoria RASP para Android.
 from __future__ import annotations
 
 import logging
+import os
+import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 from checks.static import vector_view
+from checks.stealth import load_stealth, unload_stealth
+from logcat_analyzer import analyze_since
+from script_loader import load_script_file, safe_detach, safe_unload
 
 if TYPE_CHECKING:  # evita import circular em tempo de importação
     from device_manager import DeviceManager
 
 logger = logging.getLogger("raspilot.checks.anti_root")
+
+# Intervalo de polling da observação dinâmica (exposto para testes).
+ROOT_OBSERVATION_POLL_INTERVAL = 1.0
+
+# A bridge Java do app pode demorar a subir depois do resume; o script de
+# root precisa de mais folga que os hooks nativos.
+ROOT_SCRIPT_TIMEOUT = 20.0
+
+SCRIPTS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"
+)
+ROOT_DETECTION_SCRIPT = os.path.join(SCRIPTS_DIR, "root_detection.js")
+ROOT_BYPASS_SCRIPT = os.path.join(SCRIPTS_DIR, "anti_root_bypass.js")
 
 # Caminhos clássicos onde o binário `su` costuma existir.
 SU_PATHS = [
@@ -83,13 +101,23 @@ class AntiRootCheck:
     um vetor com problema não derrube os demais.
     """
 
-    def __init__(self, dm: "DeviceManager") -> None:
+    def __init__(
+        self,
+        dm: "DeviceManager",
+        mode: str = "bypass",
+        no_java: bool = False,
+    ) -> None:
         """Inicializa o check com o gerenciador de dispositivo.
 
         Args:
             dm: Instância conectada de ``DeviceManager``.
+            mode: ``detect``, ``bypass`` ou ``stealth``. ``detect`` mede
+                a detecção de root do app sem tentar o bypass.
+            no_java: Se True, a observação Java é pulada.
         """
         self.dm = dm
+        self.mode = mode
+        self.no_java = bool(no_java)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -394,27 +422,319 @@ class AntiRootCheck:
         return result
 
     # ------------------------------------------------------------------
+    # Detecção e bypass no app
+    # ------------------------------------------------------------------
+    def _script_replacements(self, java_only: bool = False) -> Dict[str, str]:
+        """Placeholders comuns aos scripts de root."""
+        return {
+            "__RASPILOT_JAVA_ONLY__": "true" if java_only else "false",
+            "__RASPILOT_PACKAGE_NAME__": (
+                getattr(self.dm, "last_spawn_package", None) or ""
+            ),
+        }
+
+    @staticmethod
+    def _exercise_message(message: str) -> bool:
+        """Distingue instalação de hook de checagem realmente exercitada."""
+        text = str(message or "")
+        lower = text.lower()
+        if "->" in text or "ioexception" in lower:
+            return True
+        if "rootbeer." in lower and ("false" in lower or "true" in lower):
+            return True
+        return False
+
+    def _detect_app_root(self, package_name: str, window: int = 12) -> dict:
+        """Observa chamadas de detecção de root feitas pelo app."""
+        found: List[str] = []
+        errors: List[str] = []
+        loaded: List[object] = []
+        stealth_loaded: List[tuple] = []
+        session = None
+        pid: Optional[int] = None
+        resumed = False
+        logcat_mark = None
+        try:
+            marker = getattr(self.dm, "logcat_mark", None)
+            if callable(marker):
+                logcat_mark = marker()
+
+            def on_message(message, data):  # noqa: ANN001 - assinatura frida
+                if message.get("type") != "send":
+                    return
+                payload = message.get("payload", {})
+                ptype = payload.get("type")
+                method = str(payload.get("method") or "")
+                detail = str(payload.get("detail") or "")
+                if ptype == "root-detection":
+                    entry = f"{method}: {detail}"
+                    if entry not in found:
+                        found.append(entry)
+                elif ptype in ("root-detection-error", "raspilot-script-error"):
+                    text = str(payload.get("message") or "")
+                    if text:
+                        errors.append(text)
+
+            session = self.dm.spawn_app(package_name, resume=False)
+            pid = getattr(self.dm, "last_spawn_pid", None)
+            if pid is None:
+                pid = self.dm.get_app_pid(package_name)
+
+            # A observação de root usa Frida; sem a evasão nativa o app
+            # pode reagir à instrumentação antes de executar a checagem.
+            try:
+                stealth_loaded = load_stealth(
+                    session,
+                    on_message=on_message,
+                    replacements=self._script_replacements(),
+                    include_proc_filter=True,
+                    load_native_frida=True,
+                )
+            except Exception:
+                logger.debug("Stealth indisponível no anti-root", exc_info=True)
+
+            native_script = load_script_file(
+                session,
+                ROOT_DETECTION_SCRIPT,
+                on_message=on_message,
+                replacements=self._script_replacements(java_only=False),
+                with_java_bridge=False,
+                name="raspilot-root-detect-native",
+                load_timeout=ROOT_SCRIPT_TIMEOUT,
+            )
+            loaded.append(native_script)
+            self.dm.resume_app()
+            resumed = True
+
+            if not self.no_java:
+                wait = getattr(self.dm, "wait_for_app_ready", None)
+                if callable(wait):
+                    try:
+                        wait(package_name, pid=pid)
+                    except Exception:
+                        logger.debug("wait_for_app_ready falhou no anti-root", exc_info=True)
+                try:
+                    java_script = load_script_file(
+                        session,
+                        ROOT_DETECTION_SCRIPT,
+                        on_message=on_message,
+                        replacements=self._script_replacements(java_only=True),
+                        with_java_bridge=True,
+                        name="raspilot-root-detect-java",
+                        load_timeout=ROOT_SCRIPT_TIMEOUT,
+                    )
+                    loaded.append(java_script)
+                except Exception as exc:
+                    errors.append(f"camada Java: {exc}")
+                    logger.warning("Observação Java de root não carregou", exc_info=True)
+
+            for _ in range(max(1, int(window))):
+                time.sleep(ROOT_OBSERVATION_POLL_INTERVAL)
+                if pid is not None and not self.dm.is_app_alive(pid):
+                    break
+            app_alive = None
+            if pid is not None:
+                try:
+                    app_alive = bool(self.dm.is_app_alive(pid))
+                except Exception:
+                    app_alive = None
+        except Exception as exc:
+            errors.append(str(exc))
+            app_alive = None
+            logger.warning("Observação de root do app falhou", exc_info=True)
+        finally:
+            if not resumed:
+                try:
+                    self.dm.resume_app()
+                except Exception:
+                    logger.debug("Falha ao retomar após observação de root", exc_info=True)
+            for script in loaded:
+                safe_unload(script)
+            unload_stealth(stealth_loaded)
+            safe_detach(session)
+
+        logcat = {}
+        if logcat_mark is not None:
+            try:
+                logcat = analyze_since(self.dm, logcat_mark, package_name, pid)
+            except Exception:
+                logger.debug("Falha ao correlacionar logcat no anti-root", exc_info=True)
+
+        detected = bool(found)
+        details = (
+            f"App executou checagens de root: {'; '.join(found[:4])}"
+            if detected
+            else "Nenhuma checagem de root observada no app"
+        )
+        result = {
+            "detected": detected,
+            "detection_methods_found": found,
+            "app_alive_at_end": app_alive,
+            "logcat": logcat,
+            "details": details,
+            "timestamp": _now_iso(),
+        }
+        if errors:
+            result["error"] = "; ".join(errors)
+        return result
+
+    def _attempt_bypass(self, package_name: str, window: int = 12) -> dict:
+        """Executa ``anti_root_bypass.js`` e mede a reação do app."""
+        if self.mode == "detect":
+            return {
+                "success": None,
+                "method": "frida",
+                "skipped_reason": "modo detect: bypass de root não executado",
+                "app_alive_at_end": None,
+                "neutralized": [],
+                "bypass_logs": [],
+                "timestamp": _now_iso(),
+            }
+
+        bypass_logs: List[str] = []
+        errors: List[str] = []
+        stealth_loaded: List[tuple] = []
+        script = None
+        session = None
+        pid: Optional[int] = None
+        resumed = False
+        logcat_mark = None
+        try:
+            marker = getattr(self.dm, "logcat_mark", None)
+            if callable(marker):
+                logcat_mark = marker()
+
+            def on_message(message, data):  # noqa: ANN001 - assinatura frida
+                if message.get("type") != "send":
+                    return
+                payload = message.get("payload", {})
+                text = str(payload.get("message") or "")
+                if payload.get("type") == "raspilot-bypass" and text:
+                    if text not in bypass_logs:
+                        bypass_logs.append(text)
+                elif payload.get("type") in (
+                    "raspilot-script-error", "raspilot-java-unavailable",
+                ):
+                    if text:
+                        errors.append(text)
+
+            session = self.dm.spawn_app(package_name, resume=False)
+            pid = getattr(self.dm, "last_spawn_pid", None)
+            if pid is None:
+                pid = self.dm.get_app_pid(package_name)
+            try:
+                stealth_loaded = load_stealth(
+                    session,
+                    on_message=on_message,
+                    replacements=self._script_replacements(),
+                    include_proc_filter=True,
+                    load_native_frida=True,
+                )
+            except Exception:
+                logger.debug("Stealth indisponível no bypass de root", exc_info=True)
+            self.dm.resume_app()
+            resumed = True
+            script = load_script_file(
+                session,
+                ROOT_BYPASS_SCRIPT,
+                on_message=on_message,
+                replacements=self._script_replacements(java_only=False),
+                name="raspilot-root-bypass",
+                load_timeout=ROOT_SCRIPT_TIMEOUT,
+            )
+            for _ in range(max(1, int(window))):
+                time.sleep(ROOT_OBSERVATION_POLL_INTERVAL)
+                if pid is not None and not self.dm.is_app_alive(pid):
+                    break
+            app_alive = None
+            if pid is not None:
+                try:
+                    app_alive = bool(self.dm.is_app_alive(pid))
+                except Exception:
+                    app_alive = None
+        except Exception as exc:
+            errors.append(str(exc))
+            app_alive = None
+            logger.warning("Bypass de root falhou", exc_info=True)
+        finally:
+            if not resumed:
+                try:
+                    self.dm.resume_app()
+                except Exception:
+                    logger.debug("Falha ao retomar após bypass de root", exc_info=True)
+            if script is not None:
+                safe_unload(script)
+            unload_stealth(stealth_loaded)
+            safe_detach(session)
+
+        logcat = {}
+        if logcat_mark is not None:
+            try:
+                logcat = analyze_since(self.dm, logcat_mark, package_name, pid)
+            except Exception:
+                logger.debug("Falha ao correlacionar logcat no bypass de root", exc_info=True)
+
+        exercised = [item for item in bypass_logs if self._exercise_message(item)]
+        if errors:
+            success = None
+            reason = f"bypass de root: {'; '.join(errors)}"
+        elif app_alive is False:
+            success = False
+            reason = "app encerrou durante o bypass: a proteção resistiu à evasão"
+        elif exercised:
+            success = True
+            reason = f"checagens de root exercitadas/neutralizadas: {len(exercised)}"
+        else:
+            success = None
+            reason = "bypass não exercitado: nenhuma checagem de root observada"
+
+        result = {
+            "success": success,
+            "method": "frida",
+            "app_alive_at_end": app_alive,
+            "neutralized": exercised,
+            "bypass_logs": bypass_logs,
+            "exercised": bool(exercised),
+            "logcat": logcat,
+            "details": reason,
+            "timestamp": _now_iso(),
+        }
+        if success is None:
+            result["skipped_reason"] = reason
+        if errors:
+            result["error"] = "; ".join(errors)
+        return result
+
+    # ------------------------------------------------------------------
     # Consolidação
     # ------------------------------------------------------------------
-    def run_all(self, static_profile: Optional[dict] = None) -> dict:
-        """Executa todos os vetores anti-root e consolida o veredito.
+    def run_all(
+        self,
+        static_profile: Optional[dict] = None,
+        package_name: Optional[str] = None,
+        window: int = 12,
+    ) -> dict:
+        """Executa vetores de dispositivo, detecção no app e bypass.
 
         Consolidação: ``is_rooted=True`` se **qualquer** vetor positivo
         (exceto evidências "informativas" como bootloader). Confiança:
         ``high`` (>= 2 vetores), ``medium`` (1), ``low`` (0).
 
-        O perfil estático é **informativo**: ele responde se o app tem
-        código de detecção de root, mas o veredito ``is_rooted`` continua
-        medindo o dispositivo. Misturar os dois faria um device limpo
-        parecer rooteado só porque o app sabe detectar root.
+        O perfil estático e a detecção dinâmica respondem se o app tem
+        código de detecção de root. O bypass mede se essa proteção resiste.
+        ``is_rooted`` continua medindo o dispositivo — são dimensões
+        diferentes e aparecem separadas no relatório.
 
         Args:
             static_profile: Perfil estático do APK (opcional).
+            package_name: Package name do alvo (habilita a fase no app).
+            window: Janela de observação da detecção/bypass no app.
 
         Returns:
-            Dict com ``is_rooted`` (bool), ``confidence``
-            ('high'|'medium'|'low'), ``checks`` (dict por vetor),
-            ``app_root_detection`` e ``timestamp`` (ISO8601).
+            Dict com ``is_rooted``, ``confidence``, ``checks``,
+            ``app_root_detection``, ``app_detection``,
+            ``protection_detected``, ``bypass_successful`` e
+            ``timestamp``.
         """
         checks = {
             "su_binaries": self.check_su_binaries(),
@@ -448,6 +768,75 @@ class AntiRootCheck:
         else:
             confidence = "none"
 
+        static_view = vector_view(static_profile, "root")
+        static_present = bool(static_view and static_view.get("present"))
+        app_root_detection = None
+        app_detection = None
+        protection_detected = None
+        bypass_details = None
+        bypass_successful = None
+        bypass_method = None
+        bypass_skipped_reason = None
+        status_hint = None
+        verdict_reason = None
+
+        if static_view is not None:
+            app_root_detection = dict(static_view)
+            app_root_detection["static_detected"] = static_present
+            app_root_detection["details"] = (
+                "o APK referencia APIs/paths de detecção de root"
+            )
+
+        # A fase no app só roda quando há um perfil do APK: sem ele, o
+        # pipeline não tem como distinguir "sem proteção" de "APK não
+        # analisado", e um spawn extra só adicionaria ruído.
+        if static_view is not None and package_name:
+            app_detection = self._detect_app_root(package_name, window=window)
+            dynamic_detected = bool(app_detection.get("detected"))
+            protection_detected = static_present or dynamic_detected
+            if app_root_detection is None:
+                app_root_detection = {
+                    "present": False,
+                    "confidence": None,
+                    "static_detected": False,
+                }
+            app_root_detection["dynamic"] = app_detection
+            app_root_detection["dynamic_detected"] = dynamic_detected
+            app_root_detection["detected"] = protection_detected
+            app_root_detection["details"] = app_detection.get("details") or (
+                "detecção de root no APK e no runtime"
+            )
+
+            if self.mode == "detect":
+                bypass_skipped_reason = "modo detect: bypass de root não executado"
+            elif protection_detected:
+                bypass_details = self._attempt_bypass(package_name, window=window)
+                bypass_method = str(bypass_details.get("method") or "frida")
+                if bypass_details.get("success") is None:
+                    bypass_skipped_reason = str(
+                        bypass_details.get("skipped_reason")
+                        or bypass_details.get("error")
+                        or "bypass de root inconclusivo"
+                    )
+                else:
+                    bypass_successful = bool(bypass_details.get("success"))
+            else:
+                bypass_skipped_reason = "nenhuma detecção de root identificada no app"
+
+            if bypass_successful is True:
+                status_hint = "FALHOU"
+                verdict_reason = "bypass de root venceu: proteção contornada"
+            elif bypass_successful is False:
+                status_hint = "OK"
+                verdict_reason = "proteção de root resistiu à evasão"
+            elif protection_detected:
+                status_hint = "SKIP"
+                verdict_reason = (
+                    bypass_skipped_reason or "bypass de root não avaliado"
+                )
+        elif static_view is not None:
+            protection_detected = static_present
+
         result = {
             "is_rooted": is_rooted,
             "confidence": confidence,
@@ -455,30 +844,29 @@ class AntiRootCheck:
             "evaluated_vectors": evaluated,
             "failed_vectors": failed,
             "checks": checks,
+            "app_root_detection": app_root_detection,
+            "app_detection": app_detection,
+            "protection_detected": protection_detected,
+            "bypass_successful": bypass_successful,
+            "bypass_method": bypass_method,
+            "bypass_details": bypass_details,
+            "bypass_skipped_reason": bypass_skipped_reason,
+            "status_hint": status_hint,
+            "verdict_reason": verdict_reason,
             "timestamp": _now_iso(),
         }
-        static_view = vector_view(static_profile, "root")
         if static_view is not None:
-            app_root_detection = dict(static_view)
-            app_root_detection["detected"] = bool(static_view.get("present"))
-            app_root_detection["static_detected"] = bool(static_view.get("present"))
-            app_root_detection["details"] = (
-                "o APK referencia APIs/paths de detecção de root; "
-                "isto não altera o veredito do dispositivo"
-            )
-            result["app_root_detection"] = app_root_detection
             result["static_analysis"] = {
                 "engine": static_view.get("engine"),
                 "version": static_view.get("version"),
                 "vector": "root",
-                "present": bool(static_view.get("present")),
+                "present": static_present,
                 "confidence": static_view.get("confidence"),
                 "owners": static_view.get("owners") or {},
                 "app_evidence": bool(static_view.get("app_evidence")),
                 "coverage": static_view.get("coverage"),
             }
         else:
-            result["app_root_detection"] = None
             result["static_analysis"] = None
         if not evaluated:
             result["error"] = (
@@ -486,7 +874,7 @@ class AntiRootCheck:
                 f"falhas em {', '.join(failed) or 'todos os vetores'}"
             )
         logger.info(
-            "Anti-Root: is_rooted=%s confidence=%s vetores=%s",
-            is_rooted, confidence, positive,
+            "Anti-Root: is_rooted=%s confidence=%s vetores=%s app_root=%s bypass=%s",
+            is_rooted, confidence, positive, protection_detected, bypass_successful,
         )
         return result

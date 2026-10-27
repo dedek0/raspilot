@@ -150,24 +150,34 @@ class Reporter:
             positive = list(result.get("positive_vectors") or [])
             evaluated = list(result.get("evaluated_vectors") or [])
             app_root = result.get("app_root_detection") or {}
-            return (
-                "FALHOU" if is_rooted else "OK",
-                {
-                    "is_rooted": is_rooted,
-                    "confidence": result.get("confidence"),
-                    "positive_vectors": positive,
-                    "evaluated_vectors": len(evaluated),
-                    "app_root_detection": {
-                        "present": bool(app_root.get("present")),
-                        "confidence": app_root.get("confidence"),
-                        "engine": (result.get("static_analysis") or {}).get("engine"),
-                    },
-                    "coverage_gaps": (
-                        ((result.get("static_analysis") or {}).get("coverage") or {})
-                        .get("possible_gaps", [])
-                    ),
+            static_analysis = result.get("static_analysis") or {}
+            summary = {
+                "is_rooted": is_rooted,
+                "confidence": result.get("confidence"),
+                "positive_vectors": positive,
+                "evaluated_vectors": len(evaluated),
+                "app_root_detection": {
+                    "present": bool(app_root.get("present")),
+                    "confidence": app_root.get("confidence"),
+                    "engine": static_analysis.get("engine"),
+                    "dynamic_detected": app_root.get("dynamic_detected"),
                 },
-            )
+                "protection_detected": result.get("protection_detected"),
+                "bypass_successful": result.get("bypass_successful"),
+                "bypass_method": result.get("bypass_method"),
+                "coverage_gaps": (
+                    (static_analysis.get("coverage") or {})
+                    .get("possible_gaps", [])
+                ),
+            }
+            if result.get("verdict_reason"):
+                summary["verdict_reason"] = result.get("verdict_reason")
+            if result.get("bypass_skipped_reason"):
+                summary["skip_reason"] = result.get("bypass_skipped_reason")
+            hint = str(result.get("status_hint") or "").upper()
+            if hint in ("OK", "FALHOU", "SKIP", "N/A"):
+                return hint, summary
+            return ("FALHOU" if is_rooted else "OK"), summary
 
         if check_name == "anti_frida":
             raw_vulnerable = result.get("vulnerable")
@@ -319,6 +329,7 @@ class Reporter:
                 "pinning_suspected": bool(result.get("pinning_suspected")),
                 "pinning_type": result.get("pinning_type"),
                 "bypass_successful": bypass,
+                "tls_observed": bool(result.get("tls_observed")),
                 "intercepted_hosts": list(
                     bypass_details.get("intercepted_hosts") or []
                 )[:8],

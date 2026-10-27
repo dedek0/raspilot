@@ -96,8 +96,10 @@ class TestGenerateJson:
                 "positive_vectors": ["magisk"], "evaluated_vectors": 0,
                 "app_root_detection": {
                     "present": False, "confidence": None, "engine": None,
+                    "dynamic_detected": None,
                 },
-                "coverage_gaps": [],
+                "protection_detected": None, "bypass_successful": None,
+                "bypass_method": None, "coverage_gaps": [],
             },
             "anti_frida": {
                 "status": "FALHOU", "vulnerable": True,
@@ -119,6 +121,7 @@ class TestGenerateJson:
                 "pinning_suspected": False,
                 "pinning_type": "okhttp", "bypass_successful": True,
                 "intercepted_hosts": ["api.x.com"], "evidence_strength": None,
+                "tls_observed": False,
                 "static_engine": None, "coverage_gaps": [],
                 "static_owners": {}, "app_evidence": False,
             },

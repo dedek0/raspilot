@@ -62,6 +62,7 @@ SUBCHECK_ACTIONS: Dict[str, Dict[str, str]] = {
 }
 
 BYPASS_ACTIONS = {
+    "anti_root": "Tentar neutralizar a detecção de root do app",
     "anti_frida": "Tentar sobreviver à instrumentação com evasão anti-Frida",
     "anti_hooking": "Tentar neutralizar as checagens anti-hook do app",
     "anti_emulator": "Tentar ocultar os artefatos decisivos de emulador",
@@ -77,6 +78,7 @@ STATIC_ACTIONS = {
 }
 
 DYNAMIC_ACTIONS = {
+    "anti_root": "Observar as checagens de root do app durante a janela",
     "anti_frida": "Observar a detecção de Frida pelo app durante a janela",
     "anti_hooking": "Observar as checagens anti-hook do app durante a janela",
     "anti_emulator": "Fazer o app enxergar um emulador e observar a reação",
@@ -437,7 +439,8 @@ def _verdict_text(check_name: str, result: dict) -> str:
             f"is_rooted={bool(result.get('is_rooted'))}; "
             f"confiança={result.get('confidence')}; "
             f"vetores positivos={', '.join(map(str, positive)) or 'nenhum'}; "
-            f"app_detecta_root={bool(app_root.get('present'))}"
+            f"app_detecta_root={bool(app_root.get('present'))}; "
+            f"bypass_root={result.get('bypass_successful')}"
         )
     if check_name == "anti_frida":
         app_detection = result.get("app_detection") or {}
@@ -533,6 +536,8 @@ def build_execution_log(
     if check_name == "anti_root":
         _subcheck_entries(trace, check_name, result.get("checks"))
         _static_entry(trace, check_name, result.get("app_root_detection"))
+        _dynamic_entry(trace, check_name, result.get("app_detection"))
+        _bypass_entry(trace, check_name, result)
     elif check_name == "anti_frida":
         _subcheck_entries(trace, check_name, result.get("checks"))
         _static_entry(trace, check_name, result.get("static_detection"))

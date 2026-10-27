@@ -442,3 +442,27 @@ class TestCheckStaticIntegration:
         status, summary = Reporter._status_for("ssl_pinning", result)
         assert status == "SKIP"
         assert summary["pinning_suspected"] is True
+
+    def test_ssl_weak_evidence_runs_probe(self):
+        """Com evidência fraca, o bypass vira probe de tráfego TLS."""
+        profile = _profile("pinning", confidence="low")
+        profile["coverage"]["pinning"]["possible_gaps"] = [
+            "possível checagem nativa/fora da camada Java (indício: boringssl)"
+        ]
+        check = SSLPinningCheck(mock.MagicMock(), mode="bypass")
+        probe = {
+            "success": True,
+            "intercepted_hosts": ["api.example"],
+            "evidence_strength": "host",
+            "app_alive_at_end": True,
+        }
+        with mock.patch.object(check, "attempt_bypass", return_value=probe) as attempt:
+            result = check.run_all("com.example.app", static_profile=profile)
+        attempt.assert_called_once()
+        assert result["tls_observed"] is True
+        assert result["intercepted_hosts"] == ["api.example"]
+        assert result["pinning_detected"] is False
+        assert result["status_hint"] == "SKIP"
+        status, summary = Reporter._status_for("ssl_pinning", result)
+        assert status == "SKIP"
+        assert summary["tls_observed"] is True

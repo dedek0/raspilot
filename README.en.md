@@ -203,6 +203,12 @@ Status semantics:
 > final status follows `bypass_successful`: `True` ⇒ `FALHOU` (RASP
 > bypassed), `False` ⇒ `OK` (protection resisted evasion).
 
+> **Anti-Root:** `is_rooted` remains the **device** verdict and stays in
+> the summary. When the in-app phase runs, `protection_detected` and
+> `bypass_successful` determine the app protection status; if the Java
+> bridge cannot load, the bypass is `SKIP` with the reason, without
+> claiming the app does not detect root.
+
 > **Golden rule:** RASPilot only claims a protection held when there is
 > high-confidence evidence. Generic logcat terms (`root`, `hook`,
 > `detected`, `checksum`), logs from hooking frameworks installed on the
@@ -294,14 +300,22 @@ Multiple independent vectors consolidated into `is_rooted` + `confidence`:
 
 Confidence: `high` (≥2 vectors), `medium` (1), `low` (0).
 
-Besides the device verdict, the check stores `app_root_detection` with
-the root-detection references found in the APK (RootBeer, `su`, Magisk,
-`ro.debuggable`, `File.exists`, `Runtime.exec`, etc.). This field is
-**informational** and does not change `is_rooted`: a clean device stays
-`OK` even when the app can detect root. The coverage of
-`scripts/anti_root_bypass.js` appears in `coverage.possible_gaps`; the
-dynamic execution of that bypass in `anti_root` is not wired into the
-pipeline yet.
+Besides the device verdict, the check measures the **app's root
+detection** and attempts a bypass:
+
+- **Observation**: loads `root_detection.js` natively before resume and
+  Java afterwards; records RootBeer, `File.exists/canRead/canWrite`,
+  `Runtime.exec`/`ProcessBuilder`, `SystemProperties`, `PackageManager`
+  and `su`/Magisk/busybox paths/commands.
+- **Bypass**: when detection exists (static or dynamic), loads
+  `anti_root_bypass.js` and measures exercised/neutralized checks.
+  `bypass_successful=True` ⇒ RASP bypassed (`FALHOU`); `False` ⇒
+  protection resisted (`OK`); `None` ⇒ not exercised (`SKIP`).
+
+`is_rooted` remains the **device** verdict. The report shows
+`protection_detected`, `bypass_successful` and
+`app_root_detection.dynamic_detected` separately, so "rooted device" is
+not confused with "app detects root".
 
 ### 2. Anti-Frida (`checks/anti_frida.py`)
 
@@ -454,7 +468,10 @@ vector the protection actually inspects.
   app usage.
 - **Weak evidence**: if only weak indicators exist (custom TrustManager,
   `networkSecurityConfig` without `pin-set`, BoringSSL) and a plausible
-  native gap, the result is `SKIP`/inconclusive, not `N/A`.
+  native gap, the bypass runs as a **probe**. Without TLS traffic the
+  result is `SKIP`; with intercepted traffic the report records
+  `tls_observed=true` and keeps `pinning_detected=false` (pinning was not
+  confirmed from the APK).
 - **Dynamic bypass**: injects `scripts/ssl_bypass.js` (universal) covering
   TrustManager, HostnameVerifier, OkHttp 3/4, NSC, Conscrypt, Apache
   HttpClient, WebView, BoringSSL/OpenSSL and Flutter. Bypass is only
@@ -674,6 +691,7 @@ raspilot/
 │   ├── ssl_bypass.js           # Universal SSL pinning bypass (Frida)
 │   ├── anti_frida_bypass.js    # Frida detection bypass (Frida)
 │   ├── anti_hooking_bypass.js  # Hooking detection bypass (Frida)
+│   ├── root_detection.js       # App root-check observation
 │   ├── emulator_spoof.js       # Emulator spoof: probe and mask (Frida)
 │   ├── verdict_hook.js         # Neutralises the RASP threat callback
 │   └── anti_root_bypass.js     # Root detection bypass (Frida)
@@ -768,9 +786,10 @@ baseline result) so the run can be reproduced.
 references to checks and points out coverage gaps, but it does not prove
 that the method ran. Native code, packed/encrypted DEX and DEX loaded at
 runtime are not seen by ASC; when that happens the report records the
-limitation and the dynamic verdict remains the source of proof.
-`anti_root` uses the profile for information only: dynamic execution of
-`anti_root_bypass.js` is not integrated into the check yet.
+limitation and the dynamic verdict remains the source of proof. In
+`anti_root`, the bypass depends on the Java layer and on the app staying
+alive during the window; without an exercised check the result is
+`SKIP`, not `OK` or `FALHOU`.
 
 **The Java layer depends on the agent attaching to the app's virtual
 machine.** The Java bridge obtains the `JNIEnv` of the instrumentation

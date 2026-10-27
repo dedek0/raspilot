@@ -611,19 +611,58 @@ class SSLPinningCheck:
                 for gap in gaps
             )
             if weak_static and native_gap:
+                if self.mode == "detect":
+                    probe = {
+                        "success": None,
+                        "skipped_reason": "modo detect: bypass de SSL não executado",
+                    }
+                elif self.no_java:
+                    probe = {
+                        "success": None,
+                        "skipped_reason": "--no-java: hooks Java necessários ao bypass",
+                    }
+                else:
+                    probe = self.attempt_bypass(package_name, window=window)
+                intercepted = list(probe.get("intercepted_hosts") or [])
+                tls_observed = bool(intercepted)
+                blocked = bool(probe.get("blocked"))
+                probe_error = probe.get("error") if not probe.get("success") else None
+                if blocked:
+                    bypass_successful = None
+                    status_hint = "SKIP"
+                    reason = (
+                        "o app bloqueou a auditoria durante o probe de SSL; "
+                        "o pinning não foi confirmado"
+                    )
+                elif tls_observed:
+                    bypass_successful = None
+                    status_hint = "SKIP"
+                    reason = (
+                        "tráfego TLS interceptado no probe, mas o pinning não "
+                        "foi confirmado no APK"
+                    )
+                elif probe_error:
+                    bypass_successful = None
+                    status_hint = "SKIP"
+                    reason = f"probe de SSL: {probe_error}"
+                else:
+                    bypass_successful = None
+                    status_hint = "SKIP"
+                    reason = (
+                        "bypass de SSL não exercitado: nenhuma requisição TLS "
+                        "observada na janela"
+                    )
                 return {
                     "pinning_detected": False,
                     "pinning_suspected": True,
                     "pinning_type": "none",
-                    "bypass_successful": None,
+                    "tls_observed": tls_observed,
+                    "intercepted_hosts": intercepted,
+                    "bypass_successful": bypass_successful,
                     "evidence": [],
-                    "bypass_details": None,
-                    "bypass_skipped_reason": (
-                        "evidência estática fraca e possível pinning nativo; "
-                        "o bypass não foi executado, então o resultado é "
-                        "inconclusivo"
-                    ),
-                    "status_hint": "SKIP",
+                    "bypass_details": probe,
+                    "bypass_skipped_reason": reason,
+                    "status_hint": status_hint,
                     "detection": detection,
                     "static_analysis": static_analysis,
                     "timestamp": _now_iso(),
