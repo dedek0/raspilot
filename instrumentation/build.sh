@@ -13,6 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODULE_DIR="${SCRIPT_DIR}/xposed"
 
 HOOK_MODE="off"
+ROOT_MODE="off"
 EMU_MODE="off"
 TARGET=""
 LABEL="build"
@@ -21,6 +22,7 @@ OUT="${SCRIPT_DIR}/build/raspilot-module.apk"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --hook)   HOOK_MODE="$2"; shift 2 ;;
+    --root)   ROOT_MODE="$2"; shift 2 ;;
     --emu)    EMU_MODE="$2"; shift 2 ;;
     --target) TARGET="$2"; shift 2 ;;
     --label)  LABEL="$2"; shift 2 ;;
@@ -92,6 +94,7 @@ package com.raspilot.module;
 public final class RaspilotBaked {
 
     public static final String HOOK_MODE = "$(java_string "${HOOK_MODE}")";
+    public static final String ROOT_MODE = "$(java_string "${ROOT_MODE}")";
     public static final String EMULATOR_MODE = "$(java_string "${EMU_MODE}")";
     public static final String TARGET_PACKAGE = "$(java_string "${TARGET}")";
     public static final String LABEL = "$(java_string "${LABEL}")";

@@ -17,6 +17,11 @@ public final class RaspilotConfig {
     public static final String HOOK_OBSERVE = "observe";
     public static final String HOOK_BYPASS = "bypass";
 
+    /** Modo da camada de root. */
+    public static final String ROOT_OFF = "off";
+    public static final String ROOT_OBSERVE = "observe";
+    public static final String ROOT_BYPASS = "bypass";
+
     /** Modo da camada de emulador. */
     public static final String EMU_OFF = "off";
     public static final String EMU_OBSERVE = "observe";
@@ -26,14 +31,16 @@ public final class RaspilotConfig {
     private static RaspilotConfig instance;
 
     public final String hookMode;
+    public final String rootMode;
     public final String emulatorMode;
     public final String targetPackage;
     public final String label;
     public final boolean runtimeOverride;
 
-    private RaspilotConfig(String hookMode, String emulatorMode, String targetPackage,
-                            String label, boolean runtimeOverride) {
+    private RaspilotConfig(String hookMode, String rootMode, String emulatorMode,
+                            String targetPackage, String label, boolean runtimeOverride) {
         this.hookMode = hookMode;
+        this.rootMode = rootMode;
         this.emulatorMode = emulatorMode;
         this.targetPackage = targetPackage;
         this.label = label;
@@ -50,6 +57,7 @@ public final class RaspilotConfig {
             return instance;
         }
         String hook = RaspilotBaked.HOOK_MODE;
+        String root = RaspilotBaked.ROOT_MODE;
         String emu = RaspilotBaked.EMULATOR_MODE;
         String target = RaspilotBaked.TARGET_PACKAGE;
         String label = RaspilotBaked.LABEL;
@@ -68,6 +76,9 @@ public final class RaspilotConfig {
                 if ("hook".equals(key)) {
                     hook = value;
                     overridden = true;
+                } else if ("root".equals(key)) {
+                    root = value;
+                    overridden = true;
                 } else if ("emu".equals(key)) {
                     emu = value;
                     overridden = true;
@@ -81,7 +92,7 @@ public final class RaspilotConfig {
             }
         }
 
-        instance = new RaspilotConfig(hook, emu, target, label, overridden);
+        instance = new RaspilotConfig(hook, root, emu, target, label, overridden);
         return instance;
     }
 
@@ -128,6 +139,24 @@ public final class RaspilotConfig {
      */
     public boolean hookBypass() {
         return HOOK_BYPASS.equals(hookMode);
+    }
+
+    /**
+     * Informa se a camada de root deve ser aplicada.
+     *
+     * @return True quando o modo nao e "off".
+     */
+    public boolean rootEnabled() {
+        return !ROOT_OFF.equals(rootMode);
+    }
+
+    /**
+     * Informa se a neutralizacao de root esta ativa.
+     *
+     * @return True no modo bypass.
+     */
+    public boolean rootBypass() {
+        return ROOT_BYPASS.equals(rootMode);
     }
 
     /**

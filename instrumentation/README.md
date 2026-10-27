@@ -1,9 +1,10 @@
 # Módulo de instrumentação
 
 Módulo compatível com a API Xposed (`IXposedHookLoadPackage`) usado pelo
-RASPilot para medir as proteções anti-hook e anti-emulador **sem**
-instrumentação externa: o app é executado com o framework de hooking do
-próprio dispositivo, que é o ambiente que a proteção de fato fiscaliza.
+RASPilot para medir as proteções anti-hook, anti-root e anti-emulador
+**sem** instrumentação externa: o app é executado com o framework de
+hooking do próprio dispositivo, que é o ambiente que a proteção de fato
+fiscaliza.
 
 ## Layout
 
@@ -23,6 +24,7 @@ instrumentation/
         ├── RaspilotConfig.java   # Configuração da execução
         ├── RaspilotBaked.java    # Gerado no build (configuração padrão)
         ├── HookShield.java       # Camada anti-hook
+        ├── RootShield.java       # Camada de detecção de root
         ├── EmulatorShield.java   # Camada de emulador
         ├── Evidence.java         # Emissor de evidência (logcat)
         ├── SilentProcess.java    # Processo sem efeito
@@ -64,11 +66,12 @@ Sem o toolchain o RASPilot continua funcionando: os checks usam o método
 export ANDROID_HOME="$HOME/Android"
 export JAVA_HOME="$ANDROID_HOME/jdk"
 
-./instrumentation/build.sh --hook bypass --emu off --target com.example.app --label bypass
+./instrumentation/build.sh --hook bypass --root bypass --emu off --target com.example.app --label bypass
 ```
 
-Opções: `--hook off|observe|bypass`, `--emu off|observe|probe|mask`,
-`--target PACOTE`, `--label NOME`, `--out CAMINHO_APK`.
+Opções: `--hook off|observe|bypass`, `--root off|observe|bypass`,
+`--emu off|observe|probe|mask`, `--target PACOTE`,
+`--label NOME`, `--out CAMINHO_APK`.
 
 O build usa apenas o SDK do Android (`build-tools` + `platform`) e um JDK.
 As classes da API Xposed em `xposed/api/` servem **apenas** à compilação:
@@ -80,7 +83,7 @@ não são empacotadas no APK.
 O modo da fase é lido de uma propriedade do sistema:
 
 ```
-persist.raspilot.module.config = hook=<modo>;emu=<modo>;target=<pacote>;label=<rótulo>
+persist.raspilot.module.config = hook=<modo>;root=<modo>;emu=<modo>;target=<pacote>;label=<rótulo>
 ```
 
 Ela é lida no início do processo, o que permite trocar de fase sem
@@ -116,6 +119,13 @@ no bypass, devolvidas vazias (stream de `/dev/null`).
 
 A camada de emulador atua sobre `Build`, `SystemProperties.get`,
 `TelephonyManager`, `Settings.Secure` e `File.exists`.
+
+A camada de root observa/neutraliza `File.exists` (e variantes),
+`Runtime.exec`/`ProcessBuilder.start` com `su`/Magisk/busybox,
+`SystemProperties.get` de propriedades de root, `PackageManager.getPackageInfo`
+de apps de root e métodos do RootBeer (`checkForRoot`, `isRooted`,
+`checkSuExists`, etc.). Checks nativos de root são cobertos pela camada
+Frida (`root_detection.js`/`anti_root_bypass.js`).
 
 Durante a janela de observação os checks de `anti_hooking` simulam
 interação do usuário (eventos `monkey` no app alvo): proteções que só

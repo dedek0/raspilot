@@ -102,10 +102,8 @@ class TestFrida17Compat:
                      "proc_filter.js"):
             with open(os.path.join(self.SCRIPTS_DIR, name), encoding="utf-8") as fh:
                 source = fh.read()
-            if name != "anti_root_bypass.js":
-                # anti_root_bypass.js é 100% Java (sem hooks nativos).
-                assert "raspilotFindExport" in source, f"{name} sem raspilotFindExport"
-            if name not in ("anti_root_bypass.js", "proc_filter.js"):
+            assert "raspilotFindExport" in source, f"{name} sem raspilotFindExport"
+            if name != "proc_filter.js":
                 # proc_filter.js é 100% nativo (sem hooks Java).
                 assert ("raspilotPerformJava" in source
                         or "raspilotDeferJava" in source), \

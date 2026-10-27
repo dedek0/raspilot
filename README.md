@@ -297,12 +297,14 @@ Confiança: `high` (≥2 vetores), `medium` (1), `low` (0).
 Além do veredito do dispositivo, o check mede a **detecção de root do
 app** e tenta o bypass:
 
-- **Observação**: carrega `root_detection.js` nativo antes do resume e
-  Java depois; registra RootBeer, `File.exists/canRead/canWrite`,
-  `Runtime.exec`/`ProcessBuilder`, `SystemProperties`, `PackageManager`
-  e paths/comandos de `su`/Magisk/busybox.
-- **Bypass**: se houver detecção (estática ou dinâmica), carrega
-  `anti_root_bypass.js` e mede as checagens exercitadas/neutralizadas.
+- **Módulo (Xposed/LSPosed)**: quando disponível, observa RootBeer,
+  `File`, `Runtime.exec`, `SystemProperties` e `PackageManager` sem Frida
+  externo; o bypass neutraliza essas APIs pelo módulo.
+- **Observação Frida**: carrega `root_detection.js` nativo antes do
+  resume e Java depois; cobre o caso em que o app bloqueia a bridge.
+- **Bypass Frida**: `anti_root_bypass.js` tem camada nativa (paths,
+  `strstr`/`strcmp`, `__system_property_get`) antes do resume e camada
+  Java (RootBeer/File/exec/SystemProperties) depois.
   `bypass_successful=True` ⇒ RASP contornado (`FALHOU`);
   `False` ⇒ proteção resistiu (`OK`); `None` ⇒ não exercitado (`SKIP`).
 
@@ -337,10 +339,11 @@ mostra `protection_detected`, `bypass_successful` e
 - **Bypass (evasão)**: depois da detecção, um novo spawn carrega
   `proc_filter.js` + `anti_frida_bypass.js` antes do resume. Os hooks
   cobrem `strstr`, `strcmp`, `strncmp` e `memcmp` (com fast-path por
-  tamanho/primeiro byte), paths e portas do Frida, nomes de threads e
-  auto-destruição (`raise`/`abort`/`kill`/`exit`). O resultado separa
-  detecção de evasão: `bypass_successful=True` ⇒ o app sobreviveu sem
-  reagir (RASP contornado); `False` ⇒ a proteção resistiu à evasão.
+  tamanho/primeiro byte), paths e portas do Frida, nomes de threads,
+  auto-destruição (`raise`/`abort`/`kill`/`exit`) e `syscall` direta de
+  `exit_group`/`kill`/`tkill`/`tgkill`. O resultado separa detecção de
+  evasão: `bypass_successful=True` ⇒ o app sobreviveu sem reagir (RASP
+  contornado); `False` ⇒ a proteção resistiu à evasão.
 
 `vulnerable=True` ⇒ o app **não** detectou o Frida (falha de RASP).
 Quando o perfil estático está disponível e não encontra nenhuma proteção
@@ -460,8 +463,9 @@ proteção de fato fiscaliza.
   uso pelo app.
 - **Evidência fraca**: se só houver indícios fracos (TrustManager
   customizado, `networkSecurityConfig` sem `pin-set`, BoringSSL) e uma
-  lacuna nativa plausível, o bypass é executado como **probe**. Sem
-  tráfego TLS, o resultado é `SKIP`; com tráfego interceptado, o
+  lacuna nativa plausível, o bypass é executado como **probe** com janela
+  mínima de 20s e interação (`monkey`) para exercitar requisições TLS.
+  Sem tráfego TLS, o resultado é `SKIP`; com tráfego interceptado, o
   relatório registra `tls_observed=true` e mantém `pinning_detected=false`
   (o pinning não foi confirmado no APK).
 - **Bypass dinâmico**: injeta `scripts/ssl_bypass.js` (universal) cobrindo
@@ -703,7 +707,7 @@ raspilot/
 │   ├── build.sh                # Build do APK (aapt2/d8/apksigner, sem Gradle)
 │   ├── setup_toolchain.sh      # Instala SDK do Android + JDK em ~/Android
 │   ├── requirements.txt        # Requisitos do toolchain de build
-│   └── xposed/                 # Fontes do módulo (anti-hook + spoof de emulador)
+│   └── xposed/                 # Fontes do módulo (anti-hook + root + emulador)
 ├── checks/
 │   ├── anti_root.py            # Detecção de root multi-vetor
 │   ├── anti_frida.py           # Presença/detecção/bypass de Frida
@@ -822,8 +826,8 @@ encontra referências a checagens e aponta lacunas de cobertura, mas não
 prova que o método foi executado. Código nativo, DEX empacotado/criptografado
 e DEX carregado em runtime não são vistos pelo ASC; quando isso acontece,
 o relatório registra a limitação e o veredito dinâmico continua sendo a
-fonte de prova. No `anti_root`, o bypass depende da camada Java e de o
-app permanecer vivo durante a janela; sem uma checagem exercitada, o
+fonte de prova. No `anti_root`, o módulo cobre a camada Java e o Frida
+cobre paths/strings nativos; se nenhuma checagem for exercitada, o
 resultado fica `SKIP`, não `OK` nem `FALHOU`.
 
 **A camada Java depende da anexação do agente à máquina virtual do app.**

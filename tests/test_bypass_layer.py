@@ -182,15 +182,19 @@ class TestEvasionHotPath:
         assert "n > 64" in source
         assert "readByteArray" in source
 
-    def test_no_global_syscall_replacement(self):
-        """Substituir syscall() serializa o processo inteiro.
+    def test_syscall_replacement_is_targeted(self):
+        """syscall é substituído apenas para exit/kill/tkill/tgkill.
 
-        Toda chamada de syscall passa pelo gancho; com o agente
-        ocupado, a thread que chamou a syscall fica esperando e o app
-        trava esperando a thread.
+        O gancho global sem filtro serializa o processo; aqui só os
+        números de auto-destruição são neutralizados e o restante é
+        repassado ao original.
         """
         source = _read("anti_frida_bypass.js")
-        assert "'syscall'" not in source
+        assert "function hookSyscall" in source
+        assert "numbers.exitGroup" in source
+        assert "numbers.tgkill" in source
+        assert "isSelfPid" in source
+        assert "syscall exit_group" in source
 
     def test_marker_scan_does_not_build_strings(self):
         """A verificação de marcador não monta string por chamada."""
@@ -287,3 +291,15 @@ class TestVerdictHookScript:
     def test_neutralization_is_reported_as_evidence(self):
         source = _read("verdict_hook.js")
         assert "bypass-evidence" in source
+
+
+class TestRootNativeLayer:
+    """O bypass de root não depende só da bridge Java."""
+
+    def test_native_root_hooks_exist(self):
+        source = _read("anti_root_bypass.js")
+        assert "RASPILOT_JAVA_ONLY" in source
+        assert "hookNativePaths" in source
+        assert "hookNativeStrings" in source
+        assert "__system_property_get" in source
+        assert "retval.replace(-1)" in source

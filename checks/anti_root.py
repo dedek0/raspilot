@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 from checks.static import vector_view
 from checks.stealth import load_stealth, unload_stealth
+from instrumentation import ModuleConfig
 from logcat_analyzer import analyze_since
 from script_loader import load_script_file, safe_detach, safe_unload
 
@@ -106,6 +107,7 @@ class AntiRootCheck:
         dm: "DeviceManager",
         mode: str = "bypass",
         no_java: bool = False,
+        xposed: Optional[object] = None,
     ) -> None:
         """Inicializa o check com o gerenciador de dispositivo.
 
@@ -113,11 +115,15 @@ class AntiRootCheck:
             dm: Instância conectada de ``DeviceManager``.
             mode: ``detect``, ``bypass`` ou ``stealth``. ``detect`` mede
                 a detecção de root do app sem tentar o bypass.
-            no_java: Se True, a observação Java é pulada.
+            no_java: Se True, a observação Java via Frida é pulada.
+            xposed: Gerenciador do módulo de instrumentação (opcional).
+                Quando disponível, a observação/bypass de root usa o
+                módulo antes de partir para o Frida.
         """
         self.dm = dm
         self.mode = mode
         self.no_java = bool(no_java)
+        self.xposed = xposed
 
     # ------------------------------------------------------------------
     # Helpers
@@ -433,6 +439,121 @@ class AntiRootCheck:
             ),
         }
 
+    # ------------------------------------------------------------------
+    # Observação via módulo (Xposed/LSPosed)
+    # ------------------------------------------------------------------
+    def _module_available(self) -> bool:
+        """Informa se o módulo pode ser usado neste dispositivo."""
+        if self.xposed is None:
+            return False
+        try:
+            return bool(self.xposed.detect().get("available"))
+        except Exception:
+            return False
+
+    def _module_observation(self, package_name: str, window: int = 12) -> dict:
+        """Observa checagens de root com o módulo, sem Frida."""
+        manager = self.xposed
+        if manager is None:
+            return {
+                "detected": False,
+                "detection_methods_found": [],
+                "error": "módulo indisponível",
+                "source": "module",
+            }
+        config = ModuleConfig(
+            hook="off",
+            root="observe",
+            emulator="off",
+            target=package_name,
+            label="root-observe",
+        )
+        phase = manager.run_phase(config, window=window, interact=True)
+        run = phase.get("run") or {}
+        observed = [
+            f"{item.get('method')}: {item.get('detail')}".strip(": ")
+            for item in run.get("observed", [])
+        ]
+        result = {
+            "detected": bool(observed),
+            "detection_methods_found": observed,
+            "app_alive_at_end": run.get("app_alive_at_end"),
+            "module_ready": bool(run.get("module_ready")),
+            "effective_config": run.get("effective_config", {}),
+            "details": (
+                f"módulo observou checagens de root: {'; '.join(observed[:4])}"
+                if observed
+                else "módulo não observou checagens de root"
+            ),
+            "source": "module",
+            "error": phase.get("error") or run.get("error"),
+        }
+        return result
+
+    def _attempt_module_bypass(self, package_name: str, window: int = 12) -> dict:
+        """Tenta neutralizar a detecção de root com o módulo."""
+        manager = self.xposed
+        if manager is None:
+            return {
+                "success": None,
+                "method": "module",
+                "skipped_reason": "módulo indisponível",
+                "app_alive_at_end": None,
+                "neutralized": [],
+                "bypass_logs": [],
+                "timestamp": _now_iso(),
+            }
+        observation = self._module_observation(package_name, window=window)
+        logs = [f"[observe] {item}" for item in observation.get("detection_methods_found") or []]
+        config = ModuleConfig(
+            hook="off",
+            root="bypass",
+            emulator="off",
+            target=package_name,
+            label="root-bypass",
+        )
+        phase = manager.run_phase(config, window=window, interact=True)
+        run = phase.get("run") or {}
+        neutralized = [
+            f"{item.get('method')}: {item.get('detail')}".strip(": ")
+            for item in run.get("neutralized", [])
+        ]
+        observed = [
+            f"{item.get('method')}: {item.get('detail')}".strip(": ")
+            for item in run.get("observed", [])
+        ]
+        logs.extend(f"[bypass] {item}" for item in neutralized)
+        app_alive = run.get("app_alive_at_end")
+        if app_alive is False:
+            success = False
+            reason = "app encerrou durante o bypass: a proteção resistiu"
+        elif neutralized:
+            success = True
+            reason = f"checagens de root neutralizadas pelo módulo: {len(neutralized)}"
+        elif observed:
+            success = None
+            reason = "módulo observou checagens, mas não as neutralizou"
+        else:
+            success = None
+            reason = "módulo não exercitou checagens de root"
+        result = {
+            "success": success,
+            "method": "module",
+            "app_alive_at_end": app_alive,
+            "neutralized": neutralized,
+            "observed_checks": observed,
+            "bypass_logs": logs,
+            "phases": [{"phase": "observe", "ok": not observation.get("error")}],
+            "details": reason,
+            "timestamp": _now_iso(),
+        }
+        if success is None:
+            result["skipped_reason"] = reason
+        error = phase.get("error") or run.get("error")
+        if error:
+            result["error"] = str(error)
+        return result
+
     @staticmethod
     def _exercise_message(message: str) -> bool:
         """Distingue instalação de hook de checagem realmente exercitada."""
@@ -594,7 +715,7 @@ class AntiRootCheck:
         bypass_logs: List[str] = []
         errors: List[str] = []
         stealth_loaded: List[tuple] = []
-        script = None
+        loaded_scripts: List[object] = []
         session = None
         pid: Optional[int] = None
         resumed = False
@@ -632,16 +753,42 @@ class AntiRootCheck:
                 )
             except Exception:
                 logger.debug("Stealth indisponível no bypass de root", exc_info=True)
+
+            # Camada nativa antes do resume: cobre checagens que rodam
+            # cedo e não dependem da bridge Java.
+            try:
+                native_script = load_script_file(
+                    session,
+                    ROOT_BYPASS_SCRIPT,
+                    on_message=on_message,
+                    replacements=self._script_replacements(java_only=False),
+                    with_java_bridge=False,
+                    name="raspilot-root-bypass-native",
+                    load_timeout=5.0,
+                )
+                loaded_scripts.append(native_script)
+            except Exception as exc:
+                errors.append(f"camada nativa: {exc}")
+                logger.debug("Bypass nativo de root indisponível", exc_info=True)
+
             self.dm.resume_app()
             resumed = True
-            script = load_script_file(
-                session,
-                ROOT_BYPASS_SCRIPT,
-                on_message=on_message,
-                replacements=self._script_replacements(java_only=False),
-                name="raspilot-root-bypass",
-                load_timeout=ROOT_SCRIPT_TIMEOUT,
-            )
+
+            # Camada Java depois do resume: cobre RootBeer e APIs Java.
+            try:
+                java_script = load_script_file(
+                    session,
+                    ROOT_BYPASS_SCRIPT,
+                    on_message=on_message,
+                    replacements=self._script_replacements(java_only=True),
+                    name="raspilot-root-bypass-java",
+                    load_timeout=ROOT_SCRIPT_TIMEOUT,
+                )
+                loaded_scripts.append(java_script)
+            except Exception as exc:
+                errors.append(f"camada Java: {exc}")
+                logger.warning("Bypass Java de root indisponível", exc_info=True)
+
             for _ in range(max(1, int(window))):
                 time.sleep(ROOT_OBSERVATION_POLL_INTERVAL)
                 if pid is not None and not self.dm.is_app_alive(pid):
@@ -662,7 +809,7 @@ class AntiRootCheck:
                     self.dm.resume_app()
                 except Exception:
                     logger.debug("Falha ao retomar após bypass de root", exc_info=True)
-            if script is not None:
+            for script in loaded_scripts:
                 safe_unload(script)
             unload_stealth(stealth_loaded)
             safe_detach(session)
@@ -675,15 +822,15 @@ class AntiRootCheck:
                 logger.debug("Falha ao correlacionar logcat no bypass de root", exc_info=True)
 
         exercised = [item for item in bypass_logs if self._exercise_message(item)]
-        if errors:
-            success = None
-            reason = f"bypass de root: {'; '.join(errors)}"
-        elif app_alive is False:
+        if app_alive is False:
             success = False
             reason = "app encerrou durante o bypass: a proteção resistiu à evasão"
         elif exercised:
             success = True
             reason = f"checagens de root exercitadas/neutralizadas: {len(exercised)}"
+        elif errors:
+            success = None
+            reason = f"bypass de root: {'; '.join(errors)}"
         else:
             success = None
             reason = "bypass não exercitado: nenhuma checagem de root observada"
@@ -772,6 +919,7 @@ class AntiRootCheck:
         static_present = bool(static_view and static_view.get("present"))
         app_root_detection = None
         app_detection = None
+        module_detection = None
         protection_detected = None
         bypass_details = None
         bypass_successful = None
@@ -791,8 +939,19 @@ class AntiRootCheck:
         # pipeline não tem como distinguir "sem proteção" de "APK não
         # analisado", e um spawn extra só adicionaria ruído.
         if static_view is not None and package_name:
-            app_detection = self._detect_app_root(package_name, window=window)
-            dynamic_detected = bool(app_detection.get("detected"))
+            # O módulo cobre checagens Java cedo (antes da bridge Frida).
+            # Se ele não observar nada, a fase Frida tenta o lado nativo.
+            if self._module_available():
+                module_detection = self._module_observation(
+                    package_name, window=window
+                )
+            if module_detection and module_detection.get("detected"):
+                app_detection = module_detection
+            else:
+                app_detection = self._detect_app_root(package_name, window=window)
+            dynamic_detected = bool(app_detection.get("detected")) or bool(
+                (module_detection or {}).get("detected")
+            )
             protection_detected = static_present or dynamic_detected
             if app_root_detection is None:
                 app_root_detection = {
@@ -801,6 +960,7 @@ class AntiRootCheck:
                     "static_detected": False,
                 }
             app_root_detection["dynamic"] = app_detection
+            app_root_detection["module"] = module_detection
             app_root_detection["dynamic_detected"] = dynamic_detected
             app_root_detection["detected"] = protection_detected
             app_root_detection["details"] = app_detection.get("details") or (
@@ -810,7 +970,14 @@ class AntiRootCheck:
             if self.mode == "detect":
                 bypass_skipped_reason = "modo detect: bypass de root não executado"
             elif protection_detected:
-                bypass_details = self._attempt_bypass(package_name, window=window)
+                if self._module_available():
+                    bypass_details = self._attempt_module_bypass(
+                        package_name, window=window
+                    )
+                else:
+                    bypass_details = self._attempt_bypass(
+                        package_name, window=window
+                    )
                 bypass_method = str(bypass_details.get("method") or "frida")
                 if bypass_details.get("success") is None:
                     bypass_skipped_reason = str(
@@ -846,6 +1013,7 @@ class AntiRootCheck:
             "checks": checks,
             "app_root_detection": app_root_detection,
             "app_detection": app_detection,
+            "module_detection": module_detection,
             "protection_detected": protection_detected,
             "bypass_successful": bypass_successful,
             "bypass_method": bypass_method,

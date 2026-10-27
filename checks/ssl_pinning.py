@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import threading
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -244,7 +245,9 @@ class SSLPinningCheck:
     # ------------------------------------------------------------------
     # Bypass dinâmico
     # ------------------------------------------------------------------
-    def attempt_bypass(self, package_name: str, window: int = 12) -> dict:
+    def attempt_bypass(
+        self, package_name: str, window: int = 12, interact: bool = False
+    ) -> dict:
         """Tenta contornar o SSL pinning injetando o ssl_bypass.js.
 
         Espawna o app com Frida, carrega o script universal de bypass e
@@ -254,6 +257,8 @@ class SSLPinningCheck:
         Args:
             package_name: Package name do app alvo.
             window: Janela de observação em segundos.
+            interact: Dispara eventos de entrada (``monkey``) durante a
+                janela para exercitar telas e requisições TLS.
 
         Returns:
             Dict com ``success`` (bool), ``intercepted_hosts`` (lista),
@@ -352,6 +357,18 @@ class SSLPinningCheck:
                     )
                 except Exception:
                     logger.debug("kill_trace.js indisponível no bypass SSL", exc_info=True)
+            if interact:
+                simulate = getattr(self.dm, "simulate_interaction", None)
+                if callable(simulate):
+                    def _drive() -> None:
+                        try:
+                            simulate(package_name, events=25, timeout=max(30, window * 2))
+                        except Exception:
+                            logger.debug("Interação SSL falhou", exc_info=True)
+
+                    threading.Thread(
+                        target=_drive, name="raspilot-ssl-interact", daemon=True
+                    ).start()
             for elapsed in range(max(1, int(window))):
                 time.sleep(OBSERVATION_POLL_INTERVAL)
                 if pid is not None and not self.dm.is_app_alive(pid):
@@ -622,7 +639,10 @@ class SSLPinningCheck:
                         "skipped_reason": "--no-java: hooks Java necessários ao bypass",
                     }
                 else:
-                    probe = self.attempt_bypass(package_name, window=window)
+                    probe_window = max(int(window), 20)
+                    probe = self.attempt_bypass(
+                        package_name, window=probe_window, interact=True
+                    )
                 intercepted = list(probe.get("intercepted_hosts") or [])
                 tls_observed = bool(intercepted)
                 blocked = bool(probe.get("blocked"))

@@ -733,16 +733,52 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 "error": reason,
             }
 
+    # Módulo de instrumentação: usado por root, hooking e emulador quando
+    # o método escolhido permite. Criado antes do anti-root para que a
+    # camada de root também possa usar a observação Java precoce.
+    hook_method = getattr(args, "hook_method", "auto")
+    emulator_method = getattr(args, "emulator_method", "auto")
+    xposed = None
+    if hook_method != "frida" or emulator_method != "frida":
+        try:
+            xposed = XposedManager(
+                dm,
+                args.package,
+                apk_path=getattr(args, "module_apk", None),
+            )
+            framework = xposed.detect()
+            reporter.run_context["xposed"] = {
+                "framework": framework.get("name"),
+                "version": framework.get("version"),
+                "available": bool(framework.get("available")),
+                "details": framework.get("details"),
+            }
+            if framework.get("available"):
+                console.print(
+                    f"[green]✓[/] Framework de hooking: "
+                    f"{framework.get('name')} {framework.get('version') or ''}"
+                )
+            else:
+                console.print(
+                    "[yellow]![/] Framework de hooking indisponível "
+                    f"({framework.get('details')}) — usando Frida"
+                )
+        except Exception as exc:
+            logger.warning("Módulo de instrumentação indisponível", exc_info=True)
+            xposed = None
+
     session = None
     pid = None
-    xposed: Optional[XposedManager] = None
     try:
         # 4) Anti-Root (não requer app rodando).
         _run_step(
             reporter,
             "anti_root",
             lambda: AntiRootCheck(
-                dm, mode=args.mode, no_java=args.no_java
+                dm,
+                mode=args.mode,
+                no_java=args.no_java,
+                xposed=xposed,
             ).run_all(
                 static_profile=static_profile,
                 package_name=args.package,
@@ -783,34 +819,6 @@ def run_pipeline(args: argparse.Namespace) -> int:
         frida_logcat_mark = dm.logcat_mark()
         frida_detection = None
         hook_detection = None
-        hook_method = getattr(args, "hook_method", "auto")
-        emulator_method = getattr(args, "emulator_method", "auto")
-
-        # Módulo de instrumentação: usado pelos checks de hooking e de
-        # emulador quando o método escolhido é "module" ou "auto".
-        if hook_method != "frida" or emulator_method != "frida":
-            xposed = XposedManager(
-                dm,
-                args.package,
-                apk_path=getattr(args, "module_apk", None),
-            )
-            framework = xposed.detect()
-            reporter.run_context["xposed"] = {
-                "framework": framework.get("name"),
-                "version": framework.get("version"),
-                "available": bool(framework.get("available")),
-                "details": framework.get("details"),
-            }
-            if framework.get("available"):
-                console.print(
-                    f"[green]✓[/] Framework de hooking: "
-                    f"{framework.get('name')} {framework.get('version') or ''}"
-                )
-            else:
-                console.print(
-                    "[yellow]![/] Framework de hooking indisponível "
-                    f"({framework.get('details')}) — usando Frida"
-                )
 
         need_combined = any(
             check not in args.skip for check in ("anti_frida", "anti_hooking")

@@ -303,12 +303,14 @@ Confidence: `high` (≥2 vectors), `medium` (1), `low` (0).
 Besides the device verdict, the check measures the **app's root
 detection** and attempts a bypass:
 
-- **Observation**: loads `root_detection.js` natively before resume and
-  Java afterwards; records RootBeer, `File.exists/canRead/canWrite`,
-  `Runtime.exec`/`ProcessBuilder`, `SystemProperties`, `PackageManager`
-  and `su`/Magisk/busybox paths/commands.
-- **Bypass**: when detection exists (static or dynamic), loads
-  `anti_root_bypass.js` and measures exercised/neutralized checks.
+- **Module (Xposed/LSPosed)**: when available, observes RootBeer, `File`,
+  `Runtime.exec`, `SystemProperties` and `PackageManager` without an
+  external Frida agent; the bypass neutralizes those APIs via the module.
+- **Frida observation**: loads `root_detection.js` natively before resume
+  and Java afterwards; covers the case where the app blocks the bridge.
+- **Frida bypass**: `anti_root_bypass.js` has a native layer (paths,
+  `strstr`/`strcmp`, `__system_property_get`) before resume and a Java
+  layer (RootBeer/File/exec/SystemProperties) afterwards.
   `bypass_successful=True` ⇒ RASP bypassed (`FALHOU`); `False` ⇒
   protection resisted (`OK`); `None` ⇒ not exercised (`SKIP`).
 
@@ -343,8 +345,9 @@ not confused with "app detects root".
 - **Bypass (evasion)**: after detection, a fresh spawn loads
   `proc_filter.js` + `anti_frida_bypass.js` before resume. Hooks cover
   `strstr`, `strcmp`, `strncmp` and `memcmp` (fast-path by size/first
-  byte), Frida paths/ports, thread names and self-termination
-  (`raise`/`abort`/`kill`/`exit`). Detection and evasion are separate
+  byte), Frida paths/ports, thread names, self-termination
+  (`raise`/`abort`/`kill`/`exit`) and direct `syscall` for
+  `exit_group`/`kill`/`tkill`/`tgkill`. Detection and evasion are separate
   results: `bypass_successful=True` ⇒ the app survived without reacting
   (RASP bypassed); `False` ⇒ the protection resisted evasion.
 
@@ -468,7 +471,8 @@ vector the protection actually inspects.
   app usage.
 - **Weak evidence**: if only weak indicators exist (custom TrustManager,
   `networkSecurityConfig` without `pin-set`, BoringSSL) and a plausible
-  native gap, the bypass runs as a **probe**. Without TLS traffic the
+  native gap, the bypass runs as a **probe** with a minimum 20s window and
+  interaction (`monkey`) to exercise TLS requests. Without TLS traffic the
   result is `SKIP`; with intercepted traffic the report records
   `tls_observed=true` and keeps `pinning_detected=false` (pinning was not
   confirmed from the APK).
@@ -672,7 +676,7 @@ raspilot/
 │   ├── build.sh                # APK build (aapt2/d8/apksigner, no Gradle)
 │   ├── setup_toolchain.sh      # Installs Android SDK + JDK in ~/Android
 │   ├── requirements.txt        # Build toolchain requirements
-│   └── xposed/                 # Module sources (anti-hook + emulator spoof)
+│   └── xposed/                 # Module sources (anti-hook + root + emulator)
 ├── checks/
 │   ├── anti_root.py            # Multi-vector root detection
 │   ├── anti_frida.py           # Frida presence/detection
@@ -787,9 +791,9 @@ references to checks and points out coverage gaps, but it does not prove
 that the method ran. Native code, packed/encrypted DEX and DEX loaded at
 runtime are not seen by ASC; when that happens the report records the
 limitation and the dynamic verdict remains the source of proof. In
-`anti_root`, the bypass depends on the Java layer and on the app staying
-alive during the window; without an exercised check the result is
-`SKIP`, not `OK` or `FALHOU`.
+`anti_root`, the module covers the Java layer and Frida covers native
+paths/strings; if no check is exercised the result is `SKIP`, not `OK` or
+`FALHOU`.
 
 **The Java layer depends on the agent attaching to the app's virtual
 machine.** The Java bridge obtains the `JNIEnv` of the instrumentation

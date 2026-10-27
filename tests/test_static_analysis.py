@@ -459,6 +459,8 @@ class TestCheckStaticIntegration:
         with mock.patch.object(check, "attempt_bypass", return_value=probe) as attempt:
             result = check.run_all("com.example.app", static_profile=profile)
         attempt.assert_called_once()
+        assert attempt.call_args.kwargs["window"] >= 20
+        assert attempt.call_args.kwargs.get("interact") is True
         assert result["tls_observed"] is True
         assert result["intercepted_hosts"] == ["api.example"]
         assert result["pinning_detected"] is False

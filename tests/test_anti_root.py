@@ -330,3 +330,56 @@ class TestAppRootDetectionAndBypass:
             result = check._detect_app_root("com.example.app", window=1)
         assert result["detected"] is True
         assert "File.exists" in result["detection_methods_found"][0]
+
+
+class _FakeXposed:
+    """Gerenciador de módulo fake para a camada de root."""
+
+    def detect(self):
+        return {"available": True, "name": "fake"}
+
+    def run_phase(self, config, window=12, interact=False, **kwargs):
+        if getattr(config, "root", "off") == "observe":
+            observed = [{"method": "File.exists", "detail": "/system/xbin/su"}]
+            return {"ok": True, "run": {
+                "observed": observed, "neutralized": [],
+                "app_alive_at_end": True, "module_ready": True,
+            }}
+        neutralized = [{"method": "File.exists", "detail": "-> false"}]
+        return {"ok": True, "run": {
+            "observed": [], "neutralized": neutralized,
+            "app_alive_at_end": True, "module_ready": True,
+        }}
+
+
+class TestRootModuleLayer:
+    """A camada de root usa o módulo quando ele está disponível."""
+
+    def test_module_observes_and_neutralizes(self, clean_dm):
+        check = AntiRootCheck(clean_dm, mode="bypass", xposed=_FakeXposed())
+        result = check.run_all(
+            static_profile=_root_profile(),
+            package_name="com.example.app",
+            window=1,
+        )
+        assert result["module_detection"]["detected"] is True
+        assert result["app_detection"]["source"] == "module"
+        assert result["bypass_successful"] is True
+        assert result["bypass_method"] == "module"
+        assert result["status_hint"] == "FALHOU"
+
+    def test_module_unavailable_falls_back_to_frida(self, clean_dm):
+        check = AntiRootCheck(clean_dm, mode="detect", xposed=None)
+        with mock.patch.object(
+            check,
+            "_detect_app_root",
+            return_value={"detected": False, "detection_methods_found": []},
+        ) as frida:
+            result = check.run_all(
+                static_profile=_root_profile(),
+                package_name="com.example.app",
+                window=1,
+            )
+        frida.assert_called_once()
+        assert result["module_detection"] is None
+        assert result["app_detection"]["detected"] is False
