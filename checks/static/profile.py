@@ -948,9 +948,13 @@ def merge_signature_detection(detection: Optional[dict], view: Optional[dict]) -
         if not merged.get("primary"):
             merged["primary"] = (view.get("findings") or [{}])[0].get("kind") or "asc"
         details = merged.get("details") or ""
+        attribution = "app_evidence=" + (
+            "sim" if view.get("app_evidence") else "não"
+        )
         merged["details"] = (
             (details + "; " if details else "")
-            + f"ASC: {view.get('confidence') or 'n/a'} ({view.get('total') or 0} achado(s))"
+            + f"ASC: {view.get('confidence') or 'n/a'} "
+            + f"({view.get('total') or 0} achado(s)); {attribution}"
         )
     elif view.get("present"):
         # Só indícios genéricos (ex.: getStackTrace): não afirmam que o

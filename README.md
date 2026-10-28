@@ -564,6 +564,28 @@ e as neutraliza. O veredito passa a se apoiar na reação do app ao
 framework de hooking do próprio dispositivo — que é o vetor que a
 proteção de fato fiscaliza.
 
+Além de esperar pelas consultas do app, o módulo executa **sondas
+ativas** dentro do processo:
+
+- **Instalação**: depois de instalar a camada anti-hook, emite
+  `probe-installed`; isso prova que a tentativa de hooking chegou ao
+  processo do app, e não apenas que o módulo carregou.
+- **Visibilidade**: lê `/proc/self/maps` com um marcador interno. Em
+  observação, registra se o mapa contém artefatos de framework; em
+  bypass, `bypass-verified` só é emitido quando o mapa está oculto. Se
+  ainda houver artefatos visíveis, sai `bypass-incomplete`.
+
+O resultado registra `evidence_strength` (`neutralized` quando o app
+executou a checagem, `hook_installed` quando o hook foi instalado e a
+ocultação do mapa foi verificada) e `hook_probes`. Um app que não
+consulta APIs de framework na janela deixa de ficar automaticamente
+"não exercitado": o bypass só vira `SKIP` quando as duas pontas não
+foram provadas. A detecção estática continua separada:
+`app_evidence=false` indica que os achados não foram atribuídos a código
+do app; nesse caso, o veredito de execução depende da sonda ativa.
+Canais nativos que não passam por `/proc` (leitura direta por syscall,
+por exemplo) continuam como lacuna declarada do módulo.
+
 ### 5. SSL Pinning (`checks/ssl_pinning.py`)
 
 - **Detecção estática**: varre o APK (`pm path` + `adb pull`) por
@@ -773,8 +795,12 @@ e `PackageManager`.
 ### Como funciona
 
 1. **Build** — `instrumentation/build.sh` compila o módulo com `aapt2`/`d8`/
-   `apksigner` do SDK do Android (sem Gradle e sem rede). Os fontes ficam em
-   `instrumentation/xposed/`.
+   `apksigner` do SDK do Android (sem Gradle e sem rede). O APK é
+   cacheado por hash dos fontes + `build.sh`; a configuração da fase é
+   aplicada em runtime, então observe/bypass (e root/emu/tamper) usam o
+   **mesmo APK**. Builds antigos são podados automaticamente. Só há um
+   APK específico de fase no fallback, quando a propriedade de runtime
+   não pôde ser aplicada.
 2. **Instalação** — `adb install -r` do APK.
 3. **Habilitação e escopo** — o módulo é habilitado e o escopo é definido
    **apenas para o pacote alvo** (`--package`), pelo cli do framework
@@ -1026,6 +1052,45 @@ sem o bypass e **passe** com ele — o controle negativo é o que prova que
 o bypass é o motivo.
 
 ---
+
+## Fase 3 — Sessão/estado e recursos de relatório (pendente)
+
+**Status: pendente.** Esta fase ainda não foi implementada. Ela vem antes
+da integração MCP e é o que permite tratar cada auditoria como uma
+unidade retomável, em vez de uma execução isolada por comando.
+
+Hoje cada execução reconecta no ADB, reconstrói/relê o perfil estático e
+gera arquivos com timestamp próprio. Não existe um `session_id` comum
+entre `--stage static`, `--stage detect`, `--stage bypass` e
+`--only`, nem um catálogo estável de relatórios para o MCP consultar.
+
+O que está planejado:
+
+- **Sessão persistente** em `~/.raspilot/sessions/<session_id>/`, com
+  `session.json` contendo pacote, device, APK/hash, perfil estático,
+  resultados por check, etapa atual, timestamps, erros/skips e caminhos
+  dos relatórios.
+- **Flags de sessão:** `--session ID`, `--state-dir PATH`, `--list-sessions`,
+  `--show-session ID` e `--stage report` para regenerar JSON/HTML a
+  partir do estado salvo, sem device.
+- **`RaspilotService`:** camada única com `create_session`,
+  `load_session`, `run_static`, `run_detection`, `run_bypass`,
+  `run_full`, `save_state`, `generate_report` e `list_reports`, usada
+  pelo CLI e, depois, pelo MCP.
+- **Validação e invalidação:** impedir `bypass` antes de `detect`,
+  detectar APK/device/versão obsoletos, escrita atômica e lock para
+  execuções concorrentes.
+- **Recursos de relatório:** catálogo estável com
+  `raspilot://sessions`, `raspilot://sessions/{id}/summary.json`,
+  `report.json`, `report.html`, `static.json` e
+  `checks/{check}.json`.
+- **Retenção e organização:** política de limpeza por idade/quantidade e
+  separação entre artefatos persistentes, caches e temporários.
+
+Critérios de conclusão: retomar uma sessão sem repetir o estático,
+conseguir gerar relatório só do estado salvo, invalidar estado
+inconsistente e expor os artefatos por IDs estáveis. O MCP continua
+**depois** desta fase.
 
 ## Integração MCP (próxima fase — planejada)
 

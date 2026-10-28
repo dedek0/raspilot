@@ -79,6 +79,13 @@ Opções: `--hook off|observe|bypass`, `--root off|observe|bypass`,
 modo padrão embutido. O RASPilot usa a configuração em runtime
 (`root=observe`/`root=bypass`) para trocar de fase sem reinstalar o APK.
 
+O RASPilot cacheia o APK por hash dos fontes + `build.sh` e executa o
+build **uma única vez** por versão do módulo. A configuração da fase não
+entra na chave do cache: `observe`, `bypass`, `probe` e `mask` são
+aplicados via propriedade em runtime. Builds antigos são removidos
+automaticamente; um APK específico de fase só é gerado no fallback,
+quando a propriedade de runtime não pôde ser aplicada.
+
 O build usa apenas o SDK do Android (`build-tools` + `platform`) e um JDK.
 As classes da API Xposed em `xposed/api/` servem **apenas** à compilação:
 em tempo de execução elas são fornecidas pelo framework do dispositivo e
@@ -104,9 +111,13 @@ RASPilotModule: EVT|<tipo>|<canal>|<método>|<detalhe>
 ```
 
 Tipos: `observe` (consulta do app), `neutralize` (consulta neutralizada),
-`spoof` (valor aplicado pelo módulo), `ready` (módulo carregado), `context`
-(registro sem sustentação de veredito — leitura de `/proc` tem uso legítimo)
-e `error`.
+`spoof` (valor aplicado pelo módulo), `ready` (módulo carregado), `probe`
+(sonda ativa do módulo: instalação da camada e visibilidade de
+`/proc/self/maps`), `context` (registro sem sustentação de veredito —
+leitura de `/proc` tem uso legítimo) e `error`. A sonda
+`probe-installed` prova que a camada foi instalada no processo do app;
+`bypass-verified` só é emitida quando o mapa está oculto, e
+`bypass-incomplete` quando ainda há artefatos visíveis.
 
 ## Cobertura
 

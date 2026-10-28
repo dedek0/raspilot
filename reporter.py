@@ -586,6 +586,16 @@ class Reporter:
             }
             if result.get("bypass_method"):
                 summary["bypass_method"] = result.get("bypass_method")
+            if result.get("verdict_reason"):
+                summary["verdict_reason"] = result.get("verdict_reason")
+            evidence_strength = (result.get("bypass_details") or {}).get(
+                "evidence_strength"
+            )
+            if evidence_strength:
+                summary["evidence_strength"] = evidence_strength
+            hook_probes = (result.get("bypass_details") or {}).get("hook_probes")
+            if hook_probes:
+                summary["hook_probes"] = list(hook_probes)[:8]
             blocked = bool((result.get("bypass_details") or {}).get("blocked"))
             if blocked:
                 # O app bloqueou a auditoria: a proteção resistiu ao

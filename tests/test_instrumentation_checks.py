@@ -55,7 +55,7 @@ class FakeXposed:
         return []
 
 
-def _run(alive: bool = True, evidence=None, lines=None) -> dict:
+def _run(alive: bool = True, evidence=None, lines=None, probes=None) -> dict:
     """Monta o resultado de uma fase do módulo."""
     return {
         "pid": 4242,
@@ -65,6 +65,7 @@ def _run(alive: bool = True, evidence=None, lines=None) -> dict:
         "lines": lines or [],
         "neutralized": [e for e in (evidence or []) if e["kind"] == "neutralize"],
         "observed": [e for e in (evidence or []) if e["kind"] == "observe"],
+        "probes": probes or [],
         "module_ready": True,
         "effective_config": {"pkg": "com.example.app"},
         "error": None,
@@ -138,6 +139,73 @@ def test_bypass_modulo_com_app_vivo(clean_dm):
     assert result["blocked"] is False
     assert result["method"] == "module"
     assert result["neutralized"]
+
+
+def test_bypass_modulo_com_sondas_ativas(clean_dm):
+    """Hook exercitado + artefatos ocultos: bypass verificado sem consulta do app.
+
+    Cobre o app que não consulta APIs de framework na janela: antes o
+    resultado era sempre "não exercitado" mesmo com o módulo ativo.
+    """
+    manager = FakeXposed(phases={
+        ("observe", "off"): _run(probes=[
+            {"kind": "probe", "channel": "hook", "method": "visibility",
+             "detail": "class=visible;stack=visible;maps=visible"},
+        ]),
+        ("bypass", "off"): _run(probes=[
+            {"kind": "probe", "channel": "hook", "method": "app-lifecycle",
+             "detail": "Instrumentation.callApplicationOnCreate hook executado no app"},
+            {"kind": "probe", "channel": "hook", "method": "visibility",
+             "detail": "class=hidden;stack=hidden;maps=hidden"},
+            {"kind": "probe", "channel": "hook", "method": "bypass-verified",
+             "detail": "artefatos ocultos"},
+        ]),
+    })
+    check = AntiHookingCheck(clean_dm, method="module", xposed=manager)
+    result = check.attempt_module_bypass("com.example.app")
+    assert result["success"] is True
+    assert result["evidence_strength"] == "hook_applied"
+    assert result["hook_applied"] is True
+    assert result["layer_verified"] is True
+    assert "hook ativo" in result["verdict_reason"]
+    assert result["hook_probes"]
+
+
+def test_bypass_modulo_com_sonda_parcial_fica_inconclusivo(clean_dm):
+    """Só o hook de ciclo de vida, sem ocultação verificada => inconclusivo."""
+    manager = FakeXposed(phases={
+        ("observe", "off"): _run(),
+        ("bypass", "off"): _run(probes=[
+            {"kind": "probe", "channel": "hook", "method": "app-lifecycle",
+             "detail": "hook executado"},
+            {"kind": "probe", "channel": "hook", "method": "bypass-incomplete",
+             "detail": "artefatos ainda visíveis"},
+        ]),
+    })
+    check = AntiHookingCheck(clean_dm, method="module", xposed=manager)
+    result = check.attempt_module_bypass("com.example.app")
+    assert result["success"] is None
+    assert "bypass parcial" in result["skipped_reason"]
+
+
+def test_bypass_modulo_com_instalacao_e_ocultacao_verificadas(clean_dm):
+    """Hook instalado + maps ocultos: bypass exercitado sem consulta do app."""
+    manager = FakeXposed(phases={
+        ("observe", "off"): _run(),
+        ("bypass", "off"): _run(probes=[
+            {"kind": "probe", "channel": "hook", "method": "probe-installed",
+             "detail": "camada anti-hook instalada (mode=bypass)"},
+            {"kind": "probe", "channel": "hook", "method": "visibility",
+             "detail": "maps=hidden"},
+            {"kind": "probe", "channel": "hook", "method": "bypass-verified",
+             "detail": "maps=hidden"},
+        ]),
+    })
+    check = AntiHookingCheck(clean_dm, method="module", xposed=manager)
+    result = check.attempt_module_bypass("com.example.app")
+    assert result["success"] is True
+    assert result["evidence_strength"] == "hook_installed"
+    assert "hook instalado" in result["verdict_reason"]
 
 
 def test_bypass_modulo_com_app_morto(clean_dm):

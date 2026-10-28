@@ -568,6 +568,28 @@ records the app's anti-hook queries and neutralises them. The verdict then
 rests on the app's reaction to the device's own hooking framework — the
 vector the protection actually inspects.
 
+Besides waiting for the app's queries, the module runs **active probes**
+inside the process:
+
+- **Installation**: after installing the anti-hook layer it emits
+  `probe-installed`; this proves the hooking attempt reached the app
+  process, not merely that the module loaded.
+- **Visibility**: reads `/proc/self/maps` with an internal marker. In
+  observation mode it records whether the map contains framework
+  artifacts; in bypass mode `bypass-verified` is only emitted when the
+  map is hidden. If artifacts remain visible, it emits
+  `bypass-incomplete`.
+
+The result records `evidence_strength` (`neutralized` when the app ran
+the check, `hook_installed` when the hook was installed and map hiding
+was verified) and `hook_probes`. An app that does not query framework
+APIs within the window is no longer automatically "not exercised": the
+bypass is only `SKIP` when neither side was proven. Static detection
+stays separate: `app_evidence=false` means the findings were not
+attributed to app code; in that case the execution verdict relies on the
+active probe. Native channels that bypass `/proc` (direct syscalls, for
+example) remain a declared limitation of the module.
+
 ### 5. SSL Pinning (`checks/ssl_pinning.py`)
 
 - **Static detection**: scans the APK (`pm path` + `adb pull`) for OkHttp
@@ -733,8 +755,12 @@ and `PackageManager`.
 ### How it works
 
 1. **Build** — `instrumentation/build.sh` compiles the module with the
-   Android SDK's `aapt2`/`d8`/`apksigner` (no Gradle, no network). Sources
-   live in `instrumentation/xposed/`.
+   Android SDK's `aapt2`/`d8`/`apksigner` (no Gradle, no network). The APK
+   is cached by a hash of the sources + `build.sh`; phase configuration is
+   applied at runtime, so observe/bypass (and root/emu/tamper) reuse the
+   **same APK**. Old builds are pruned automatically. A phase-specific APK
+   is only produced as a fallback when the runtime property could not be
+   applied.
 2. **Install** — `adb install -r` of the APK.
 3. **Enable and scope** — the module is enabled and its scope is set to the
    **target package only** (`--package`), through the framework's cli
@@ -987,6 +1013,44 @@ makes a request through the app's JVM. The test requires the request to
 control is what proves the bypass is the reason.
 
 ---
+
+## Phase 3 — Session/state and report resources (pending)
+
+**Status: pending.** This phase has not been implemented yet. It comes
+before MCP integration and turns each audit into a resumable unit instead
+of an isolated command run.
+
+Today every run reconnects ADB, rebuilds/reloads the static profile and
+writes files with its own timestamp. There is no shared `session_id`
+across `--stage static`, `--stage detect`, `--stage bypass` and `--only`,
+nor a stable report catalogue for MCP to query.
+
+Planned scope:
+
+- **Persistent session** in `~/.raspilot/sessions/<session_id>/`, with
+  `session.json` holding package, device, APK/hash, static profile,
+  per-check results, current stage, timestamps, errors/skips and report
+  paths.
+- **Session flags:** `--session ID`, `--state-dir PATH`, `--list-sessions`,
+  `--show-session ID` and `--stage report` to regenerate JSON/HTML from
+  saved state without a device.
+- **`RaspilotService`:** a single layer with `create_session`,
+  `load_session`, `run_static`, `run_detection`, `run_bypass`,
+  `run_full`, `save_state`, `generate_report` and `list_reports`, shared
+  by the CLI and, later, MCP.
+- **Validation and invalidation:** block `bypass` before `detect`, detect
+  stale APK/device/version state, atomic writes and locking for
+  concurrent runs.
+- **Report resources:** stable catalogue with `raspilot://sessions`,
+  `raspilot://sessions/{id}/summary.json`, `report.json`, `report.html`,
+  `static.json` and `checks/{check}.json`.
+- **Retention and layout:** cleanup by age/count and separation between
+  persistent artifacts, caches and temporary files.
+
+Completion criteria: resume a session without repeating static analysis,
+generate a report from saved state alone, invalidate inconsistent state
+and expose artifacts through stable IDs. MCP remains **after** this
+phase.
 
 ## MCP integration (next phase — planned)
 

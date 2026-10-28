@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Dict, Union
 
 from instrumentation.manager import (
@@ -14,6 +15,7 @@ from instrumentation.manager import (
     _parse_status,
     parse_evidence,
     partition_evidence,
+    probe_evidence,
 )
 
 ShellResponse = Union[str, Dict[str, object]]
@@ -140,6 +142,63 @@ def test_source_digest_invalida_build_antigo(tmp_path, monkeypatch):
     assert first != second
 
 
+def test_build_reutiliza_apk_entre_fases(tmp_path, monkeypatch):
+    """O mesmo APK atende observe/bypass; a fase é aplicada em runtime.
+
+    Antes o cache era indexado pela configuração da fase
+    (hook/root/tamper/emu/label), então cada fase recompilava e
+    reinstalava o módulo mesmo com os mesmos fontes.
+    """
+    import instrumentation.manager as manager_mod
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "Module.java").write_text("class Module { }", encoding="utf-8")
+    script = tmp_path / "build.sh"
+    script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    build_dir = tmp_path / "build"
+    build_dir.mkdir()
+    old = build_dir / "aaaaaaaaaaaa"
+    old.mkdir()
+    (old / "raspilot-module.apk").write_text("old", encoding="utf-8")
+
+    monkeypatch.setattr(manager_mod, "MODULE_SRC_DIR", str(src))
+    monkeypatch.setattr(manager_mod, "BUILD_SCRIPT", str(script))
+    monkeypatch.setattr(manager_mod, "BUILD_DIR", str(build_dir))
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        out = cmd[cmd.index("--out") + 1]
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "wb") as handle:
+            handle.write(b"apk")
+
+        class Proc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return Proc()
+
+    monkeypatch.setattr(manager_mod.subprocess, "run", fake_run)
+
+    manager = XposedManager(FakeDM({}), "com.example.app")
+    observe = manager.build(ModuleConfig(
+        hook="observe", target="com.example.app", label="hook-observe"
+    ))
+    bypass = manager.build(ModuleConfig(
+        hook="bypass", target="com.example.app", label="hook-bypass"
+    ))
+
+    assert observe["ok"] is True
+    assert bypass["ok"] is True
+    assert observe["apk"] == bypass["apk"]
+    assert len(calls) == 1
+    assert not old.exists()  # a poda removeu o build antigo
+
+
 def test_mask_spoofs_secondary_and_hides_decisive():
     """O modo mask mantém os canais secundários expostos.
 
@@ -156,6 +215,25 @@ def test_mask_spoofs_secondary_and_hides_decisive():
     assert "hookTelephony(probe || mask)" in source
     assert "hookAndroidId(probe || mask)" in source
     assert "if (!probe && !mask)" in source
+
+
+def test_hookshield_tem_sondas_ativas_e_cobertura():
+    """A camada anti-hook inclui sonda de ciclo de vida e de visibilidade."""
+    from instrumentation.manager import MODULE_SRC_DIR
+
+    source = open(
+        f"{MODULE_SRC_DIR}/src/com/raspilot/module/HookShield.java",
+        encoding="utf-8",
+    ).read()
+    for marker in (
+        "probe-installed",
+        "bypass-verified",
+        "bypass-incomplete",
+        "runVisibilityProbe",
+        "mapsContainsFramework",
+        "probing",
+    ):
+        assert marker in source, f"sonda/hook ausente: {marker}"
 
 
 # ----------------------------------------------------------------------
@@ -377,6 +455,20 @@ class TestPartitionEvidence:
         assert [i["method"] for i in applied] == ["File.exists"]
         assert [i["method"] for i in observed] == ["File.exists"]
         assert [i["detail"] for i in contexts] == ["/proc/self/maps"]
+
+    def test_sondas_ativas_ficam_separadas_das_consultas_do_app(self):
+        """Eventos ``probe`` são do módulo, não checagens do app."""
+        events = [
+            {"kind": "probe", "channel": "hook", "method": "visibility",
+             "detail": "class=hidden;stack=hidden;maps=hidden"},
+            {"kind": "observe", "channel": "hook", "method": "File.exists",
+             "detail": "/data/adb/lspd"},
+        ]
+        applied, observed, contexts = partition_evidence(events)
+        assert applied == []
+        assert len(observed) == 1  # a sonda não vira consulta do app
+        probes = probe_evidence(events)
+        assert [item["method"] for item in probes] == ["visibility"]
 
     def test_evento_interno_nao_evidencia(self):
         """Eventos do canal interno do módulo são ignorados em todos."""

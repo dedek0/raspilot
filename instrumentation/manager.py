@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -496,11 +497,87 @@ class XposedManager:
     # ------------------------------------------------------------------
     # Build e instalação
     # ------------------------------------------------------------------
-    def build(self, config: ModuleConfig) -> dict:
-        """Compila o módulo para a configuração informada.
+    @staticmethod
+    def _build_script_digest() -> str:
+        """Hash do script de build, para invalidar o cache quando ele muda.
+
+        O APK depende tanto dos fontes Java quanto do ``build.sh``
+        (assinatura, manifesto, dex). O digest do script entra na chave
+        de cache para que uma mudança no empacotamento não reutilize um
+        APK gerado por regras antigas.
+
+        Returns:
+            SHA-256 (primeiros 12 hex) do ``build.sh`` ou ``"noscript"``.
+        """
+        try:
+            with open(BUILD_SCRIPT, "rb") as handle:
+                return hashlib.sha256(handle.read()).hexdigest()[:12] or "noscript"
+        except OSError:
+            return "noscript"
+
+    @classmethod
+    def _build_cache_digest(cls) -> str:
+        """Identificador do APK independente da fase.
+
+        A configuração da fase (hook/root/tamper/emu/label) é aplicada
+        em runtime pela propriedade ``persist.raspilot.module.config``.
+        Indexar o cache por ela fazia o pipeline recompilar e reinstalar
+        o módulo a cada fase, embora o binário fosse o mesmo.
+
+        Returns:
+            SHA-256 (primeiros 12 hex) dos fontes + script de build.
+        """
+        key = f"{cls._source_digest()}:{cls._build_script_digest()}"
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12] or "nobuild"
+
+    @staticmethod
+    def _prune_build_cache(keep: Optional[str] = None) -> None:
+        """Remove builds antigos, preservando o APK em uso.
+
+        Cada execução antiga deixava um diretório
+        ``<config>-<fonte>/raspilot-module.apk`` em
+        ``instrumentation/build``. A poda mantém apenas o diretório
+        atual (e o ``work``/keystore usados pelo script de build).
+
+        Args:
+            keep: Caminho do diretório do build atual. ``None`` remove
+                todos os diretórios de cache gerados.
+        """
+        try:
+            entries = os.listdir(BUILD_DIR)
+        except OSError:
+            return
+        keep_path = os.path.abspath(keep) if keep else None
+        for name in entries:
+            if name in ("work", "debug.keystore"):
+                continue
+            # Só remove diretórios de cache no formato gerado pelo
+            # RASPilot: 12 hex, opcionalmente seguidos de "-<12 hex>".
+            if not re.fullmatch(r"[0-9a-f]{12}(?:-[0-9a-f]{12})?", name):
+                continue
+            path = os.path.join(BUILD_DIR, name)
+            if not os.path.isdir(path):
+                continue
+            if keep_path and os.path.abspath(path) == keep_path:
+                continue
+            try:
+                shutil.rmtree(path)
+                logger.debug("Build antigo removido: %s", path)
+            except OSError:
+                logger.debug("Não foi possível remover build antigo: %s", path,
+                             exc_info=True)
+
+    def build(self, config: ModuleConfig, baked: bool = False) -> dict:
+        """Compila o módulo uma única vez por versão dos fontes.
+
+        A configuração da fase é aplicada em runtime; ``baked=True``
+        gera um APK com a configuração compilada e só é usado como
+        fallback quando a propriedade de runtime não pôde ser aplicada.
 
         Args:
             config: Configuração desejada.
+            baked: Se True, inclui a configuração na chave do cache
+                (fallback sem propriedade de runtime).
 
         Returns:
             Dict ``{'ok', 'apk', 'detail'}``.
@@ -516,16 +593,16 @@ class XposedManager:
             return {"ok": False, "apk": None,
                     "detail": f"fontes do módulo ausentes: {MODULE_SRC_DIR}"}
 
-        # A configuração identifica o comportamento; o hash dos fontes
-        # garante que uma mudança no módulo gere um APK novo em vez de
-        # reutilizar silenciosamente o build anterior.
-        source_digest = self._source_digest()
-        out_dir = os.path.join(
-            BUILD_DIR, f"{config.fingerprint()}-{source_digest}"
-        )
+        # O hash dos fontes + build.sh identifica o binário. A
+        # configuração da fase fica fora da chave: o mesmo APK atende
+        # observe/bypass (e root/emu/tamper) via setprop.
+        digest = self._build_cache_digest()
+        name = digest if not baked else f"{digest}-{config.fingerprint()}"
+        out_dir = os.path.join(BUILD_DIR, name)
         apk = os.path.join(out_dir, "raspilot-module.apk")
         if os.path.exists(apk):
             self.apk_built = apk
+            self._prune_build_cache(out_dir)
             return {"ok": True, "apk": apk, "detail": "build reaproveitado"}
 
         env = dict(os.environ)
@@ -549,6 +626,7 @@ class XposedManager:
             return {"ok": False, "apk": None, "detail": f"build falhou: {tail}"}
 
         self.apk_built = apk
+        self._prune_build_cache(out_dir)
         logger.info("Módulo compilado: %s", apk)
         return {"ok": True, "apk": apk, "detail": "build concluído"}
 
@@ -689,12 +767,9 @@ class XposedManager:
         steps.append({"step": "config", "ok": runtime["ok"], "detail": runtime["detail"]})
         if not runtime["ok"]:
             # Sem override em execução, o comportamento do módulo é o
-            # compilado no APK: só é equivalente se coincidir.
-            fallback = self.build(ModuleConfig(
-                hook=config.hook, root=config.root, tamper=config.tamper,
-                emulator=config.emulator,
-                target=config.target, label=config.label,
-            ))
+            # compilado no APK. Este é o único caminho que exige um APK
+            # específico da fase; o build normal é compartilhado.
+            fallback = self.build(config, baked=True)
             steps.append({"step": "config_fallback", "ok": fallback["ok"],
                           "detail": fallback["detail"]})
             if fallback["ok"]:
@@ -722,7 +797,8 @@ class XposedManager:
         Returns:
             Dict com ``pid``, ``app_alive_at_end``, ``died_after``,
             ``evidence``, ``neutralized``, ``observed``, ``contexts``,
-            ``module_ready``, ``effective_config`` e ``error``.
+            ``probes``, ``module_ready``, ``effective_config`` e
+            ``error``.
         """
         mark = self.dm.logcat_mark()
         self.dm.run_shell(f"am force-stop {self.package_name}", timeout=20)
@@ -753,6 +829,7 @@ class XposedManager:
         ready = [item for item in evidence if item["kind"] == "ready"]
         effective = _parse_ready(ready[-1]["detail"]) if ready else {}
         neutralized, observed, contexts = partition_evidence(evidence)
+        probes = probe_evidence(evidence)
 
         alive = died_after is None
         result = {
@@ -764,6 +841,7 @@ class XposedManager:
             "neutralized": neutralized,
             "observed": observed,
             "contexts": contexts,
+            "probes": probes,
             "module_ready": bool(ready),
             "effective_config": effective,
             "launch_output": (launch.get("stdout") or "")[:400],
@@ -1018,6 +1096,26 @@ def partition_evidence(
         elif kind == "context":
             contexts.append(item)
     return applied, observed, contexts
+
+
+def probe_evidence(
+    events: List[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    """Extrai as sondas ativas emitidas pelo próprio módulo.
+
+    Diferente de ``observe``/``neutralize`` (consultas feitas pelo app),
+    ``probe`` registra uma verificação feita pelo módulo dentro do
+    processo: a sonda de ciclo de vida prova que um hook foi executado
+    no fluxo do app, e a sonda de visibilidade mostra se os artefatos
+    do framework continuam alcançáveis.
+
+    Args:
+        events: Eventos de :func:`parse_evidence`.
+
+    Returns:
+        Lista de eventos com ``kind == "probe"``.
+    """
+    return [item for item in events if item.get("kind") == "probe"]
 
 
 def _parse_ready(detail: str) -> Dict[str, str]:

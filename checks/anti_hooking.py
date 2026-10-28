@@ -18,6 +18,10 @@ Fluxo (todos os vetores são independentes e consolidados em ``run_all``):
    neutraliza as checagens observadas; o sucesso exige evidência real
    (e o app permanecendo vivo — morte durante o bypass significa que o
    RASP reagiu por outro vetor).
+5. Sondas ativas via módulo: confirmação de instalação dos hooks no
+   processo e verificação de visibilidade de ``/proc/self/maps``, para
+   exercitar o bypass mesmo quando o app não consulta APIs de framework
+   na janela.
 
 Marca: RASPilot — Piloto Automático de Auditoria RASP para Android.
 """
@@ -1690,6 +1694,7 @@ class AntiHookingCheck:
             "observed": True,
             "detection_methods_found": observed,
             "contexts": contexts,
+            "probes": list(run.get("probes") or []),
             "app_alive_at_end": run.get("app_alive_at_end"),
             "module_ready": bool(run.get("module_ready")),
             "effective_config": run.get("effective_config", {}),
@@ -1738,6 +1743,7 @@ class AntiHookingCheck:
         # Fase 1 — observação: quais checagens o app executa.
         observation = self.observe_with_module(package_name, window=window)
         observed: List[str] = list(observation.get("detection_methods_found") or [])
+        observation_probes = list(observation.get("probes") or [])
         logs.extend(f"[observe] {item}" for item in observed)
         if observation.get("module_ready") is False:
             logs.append("[observe] módulo não carregado no processo alvo")
@@ -1785,6 +1791,31 @@ class AntiHookingCheck:
                 f"[contexto] {item['method']} {item['detail']}".strip()
             )
 
+        # Sondas ativas do módulo: confirmam que a camada foi instalada
+        # no processo do app (probe-installed) e que os artefatos do
+        # framework ficaram ocultos (bypass-verified). Sem elas, um app
+        # que não consulta APIs de framework na janela ficava sempre
+        # "não exercitado" — mesmo com o módulo ativo no processo.
+        probes = list(run.get("probes") or [])
+        hook_probes = [
+            f"{item.get('method')}: {item.get('detail')}".strip()
+            for item in probes
+        ]
+        hook_installed = any(
+            item.get("method") == "probe-installed" for item in probes
+        )
+        hook_applied = any(
+            item.get("method") == "app-lifecycle" for item in probes
+        )
+        layer_verified = any(
+            item.get("method") == "bypass-verified" for item in probes
+        )
+        layer_incomplete = any(
+            item.get("method") == "bypass-incomplete" for item in probes
+        )
+        for item in hook_probes:
+            logs.append(f"[probe] {item}")
+
         alive = bool(run.get("app_alive_at_end"))
         pid = run.get("pid")
         artifacts = manager.framework_artifacts(pid)
@@ -1824,34 +1855,74 @@ class AntiHookingCheck:
         else:
             is_rasp = False
 
-        # Evidência real (mesmo rigor do caminho Frida, que exige logs de
-        # neutralização + app vivo): o bypass só "venceu" quando houve
-        # sinal de que as checagens anti-hook foram exercitadas — o app
-        # consultou artefatos de framework (observe) e/ou o módulo
-        # neutralizou consultas (bypass). Vivo sem nenhum sinal não é
-        # sucesso: é inconclusivo (a ausência de logs pode significar
-        # janela curta, checks nativos opacos ou kill assíncrono tardio).
-        exercised = bool(neutralized) or bool(observed)
+        # Evidência real: a checagem do app foi exercitada (consulta
+        # observada/neutralizada) ou o módulo provou que conseguiu hookar
+        # o fluxo do app e esconder os artefatos do framework. Vivo sem
+        # nenhum sinal continua inconclusivo.
+        exercised = bool(neutralized) or bool(observed) or (
+            (hook_applied or hook_installed) and layer_verified
+        )
+        evidence_strength = "none"
+        if bool(neutralized) or bool(observed):
+            evidence_strength = "neutralized"
+        elif hook_applied and layer_verified:
+            evidence_strength = "hook_applied"
+        elif hook_installed and layer_verified:
+            evidence_strength = "hook_installed"
         success: Optional[bool] = False
         blocked = False
         error: Optional[str] = None
         skipped_reason: Optional[str] = None
+        verdict_reason: Optional[str] = None
         if alive:
             if exercised:
                 # O app continuou vivo com o framework de hooking presente
                 # e as checagens anti-hook exercitadas: a proteção não
                 # interrompeu a auditoria.
                 success = True
-                if not neutralized:
-                    logs.append(
-                        "[bypass] checagens observadas sem neutralização em Java "
-                        "na janela de bypass"
+                if evidence_strength == "hook_applied":
+                    verdict_reason = (
+                        "hook ativo no app e artefatos do framework ocultos; "
+                        "o app não interrompeu a auditoria"
                     )
+                    logs.append(f"[bypass] {verdict_reason}")
+                elif evidence_strength == "hook_installed":
+                    verdict_reason = (
+                        "hook instalado no app e artefatos do framework ocultos; "
+                        "o app não interrompeu a auditoria"
+                    )
+                    logs.append(f"[bypass] {verdict_reason}")
+                elif not neutralized:
+                    verdict_reason = (
+                        "checagens anti-hook observadas sem neutralização "
+                        "em Java na janela de bypass"
+                    )
+                    logs.append(f"[bypass] {verdict_reason}")
+                else:
+                    verdict_reason = "checagens anti-hook neutralizadas; app vivo"
+            elif hook_installed or hook_applied or layer_verified:
+                success = None
+                parts = []
+                if hook_applied:
+                    parts.append("hook executado no fluxo do app")
+                elif hook_installed:
+                    parts.append("hook instalado no app")
+                if layer_verified:
+                    parts.append("artefatos ocultos verificados")
+                if layer_incomplete:
+                    parts.append("artefatos do framework ainda visíveis")
+                skipped_reason = (
+                    "bypass parcial: " + "; ".join(parts)
+                    + " — falta a outra ponta da prova (hook exercitado + "
+                    "artefatos ocultos) para concluir"
+                )
+                logs.append(f"[bypass] {skipped_reason}")
             else:
                 success = None
                 skipped_reason = (
                     "bypass não exercitado: nenhuma checagem anti-hook "
-                    "observada ou neutralizada durante a janela"
+                    "observada ou neutralizada e nenhuma sonda ativa "
+                    "confirmou o hook na janela"
                 )
                 logs.append(f"[bypass] {skipped_reason}")
         elif is_rasp:
@@ -1878,6 +1949,14 @@ class AntiHookingCheck:
             "death_cause": death_cause,
             "death_classification": death_classification,
             "skipped_reason": skipped_reason,
+            "verdict_reason": verdict_reason,
+            "evidence_strength": evidence_strength,
+            "hook_probes": hook_probes,
+            "hook_installed": hook_installed,
+            "hook_applied": hook_applied,
+            "layer_verified": layer_verified,
+            "observation": observation,
+            "observation_probes": observation_probes,
             "observed_checks": observed,
             "neutralized": [
                 f"{item['method']}: {item['detail']}" for item in neutralized
@@ -2072,6 +2151,7 @@ class AntiHookingCheck:
         bypass_details: Optional[dict] = None
         bypass_successful: Optional[bool] = None
         bypass_skipped_reason: Optional[str] = None
+        bypass_verdict_reason: Optional[str] = None
         bypass_method = "frida"
         if self.mode == "detect":
             bypass_skipped_reason = "modo detect: bypass não executado"
@@ -2090,6 +2170,9 @@ class AntiHookingCheck:
                 # O app bloqueou o bypass: a proteção resistiu. Isso é uma
                 # conclusão sobre a proteção, não uma etapa que não rodou.
                 bypass_successful = False
+                bypass_verdict_reason = str(
+                    bypass_details.get("error") or "o app bloqueou o bypass"
+                )
             elif bypass_details.get("error"):
                 # A proteção foi detectada, mas o bypass não pôde ser
                 # avaliado. Isso é uma etapa que não rodou, não uma
@@ -2106,6 +2189,19 @@ class AntiHookingCheck:
                 )
             else:
                 bypass_successful = bool(bypass_details.get("success"))
+                bypass_verdict_reason = str(
+                    bypass_details.get("verdict_reason")
+                    or bypass_details.get("error")
+                    or ""
+                ) or None
+
+        # A observação usada pelo bypass de módulo também é útil no
+        # topo do resultado (antes ela só existia quando não havia
+        # nenhuma evidência estática).
+        if module_detection is None and bypass_details:
+            observation = bypass_details.get("observation")
+            if isinstance(observation, dict):
+                module_detection = observation
 
         result: dict = {
             "protection_detected": protection_detected,
@@ -2134,6 +2230,7 @@ class AntiHookingCheck:
             "app_detection": app_detection,
             "bypass_details": bypass_details,
             "bypass_skipped_reason": bypass_skipped_reason,
+            "verdict_reason": bypass_verdict_reason,
             "timestamp": _now_iso(),
         }
         if phase_errors:

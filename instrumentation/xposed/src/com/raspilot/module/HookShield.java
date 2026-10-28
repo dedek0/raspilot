@@ -4,8 +4,10 @@ import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.InputStreamReader;
 import java.io.RandomAccessFile;
 import java.util.ArrayList;
 import java.util.List;
@@ -34,6 +36,13 @@ public final class HookShield {
             "com.topjohnwu.magisk.module",
     };
 
+    /**
+     * Marcador de sonda interna: enquanto verdadeiro, a leitura de
+     * /proc feita pelo próprio módulo é emitida como ``probe`` e não
+     * como consulta/neutralização do app.
+     */
+    private static volatile boolean probing = false;
+
     private HookShield() {
     }
 
@@ -59,6 +68,69 @@ public final class HookShield {
         hookPackageManager(bypass, classLoader);
         hookPackageManagerListing(bypass, classLoader);
         hookRunningProcesses(bypass);
+
+        // Sonda ativa de instalação: prova que a tentativa de hooking
+        // chegou ao processo do app (não apenas que o módulo carregou).
+        Evidence.emit("probe", "hook", "probe-installed",
+                "camada anti-hook instalada (mode="
+                        + (bypass ? "bypass" : "observe") + ")");
+        runVisibilityProbe(bypass);
+    }
+
+    /**
+     * Mede se os artefatos do framework continuam visíveis para o app.
+     *
+     * A sonda lê ``/proc/self/maps`` com o marcador ``probing`` ativo
+     * (para não virar consulta do app). No bypass, a camada de proc
+     * substitui o conteúdo por ``/dev/null``; se o mapa ainda contiver
+     * artefatos do framework, o relatório registra
+     * ``bypass-incomplete`` em vez de declarar vitória.
+     *
+     * @param bypass True no modo bypass.
+     */
+    private static void runVisibilityProbe(final boolean bypass) {
+        boolean mapsVisible = false;
+        probing = true;
+        try {
+            mapsVisible = mapsContainsFramework();
+        } catch (Throwable ignored) {
+            mapsVisible = false;
+        } finally {
+            probing = false;
+        }
+        String detail = "maps=" + (mapsVisible ? "visible" : "hidden");
+        Evidence.emit("probe", "hook", "visibility", detail);
+        if (bypass) {
+            if (!mapsVisible) {
+                Evidence.emit("probe", "hook", "bypass-verified", detail);
+            } else {
+                Evidence.emit("probe", "hook", "bypass-incomplete", detail);
+            }
+        }
+    }
+
+    private static boolean mapsContainsFramework() {
+        BufferedReader reader = null;
+        try {
+            reader = new BufferedReader(new InputStreamReader(
+                    new FileInputStream("/proc/self/maps")));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (isFrameworkName(line)) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {
+            return false;
+        } finally {
+            if (reader != null) {
+                try {
+                    reader.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return false;
     }
 
     private static void hookClassForName(final boolean bypass) {
@@ -304,8 +376,12 @@ public final class HookShield {
         if (path == null || !isProcessArtifactPath(path)) {
             return;
         }
-        Evidence.emit(bypass ? "neutralize" : "context", "hook",
-                method, path);
+        if (probing) {
+            Evidence.emit("probe", "hook", method, path);
+        } else {
+            Evidence.emit(bypass ? "neutralize" : "context", "hook",
+                    method, path);
+        }
         if (bypass) {
             String empty = "/dev/null";
             if (method.startsWith("FileInputStream")) {
