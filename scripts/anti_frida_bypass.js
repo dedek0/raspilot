@@ -621,58 +621,11 @@ var RASPILOT_JAVA_ONLY = (typeof __RASPILOT_JAVA_ONLY__ !== 'undefined')
     ? __RASPILOT_JAVA_ONLY__
     : false;
 
-function hookSyscall() {
-    if (Process.arch !== 'arm64' && Process.arch !== 'x86_64') {
-        return;
-    }
-    var numbers = Process.arch === 'arm64'
-        ? { exit: 93, exitGroup: 94, kill: 129, tkill: 130, tgkill: 131 }
-        : { exit: 60, exitGroup: 231, kill: 62, tkill: 200, tgkill: 234 };
-    var reported = {};
-    function note(key, message) {
-        if (reported[key]) { return; }
-        reported[key] = true;
-        reportNeutralized(message);
-    }
-    try {
-        var addr = raspilotFindExport('libc.so', 'syscall');
-        if (addr === null) { return; }
-        var orig = new NativeFunction(addr, 'long',
-            ['long', 'long', 'long', 'long', 'long', 'long', 'long']);
-        Interceptor.replace(addr, new NativeCallback(function (nr, a1, a2, a3, a4, a5, a6) {
-            var number = (nr && typeof nr.toInt32 === 'function')
-                ? nr.toInt32()
-                : nr;
-            if (number === numbers.exit || number === numbers.exitGroup) {
-                note('exit', 'auto-destruição neutralizada: syscall exit_group');
-                return 0;
-            }
-            if (number === numbers.kill && isSelfPid(a1)) {
-                note('kill', 'auto-destruição neutralizada: syscall kill');
-                return 0;
-            }
-            if (number === numbers.tkill && isSelfPid(a1)) {
-                note('tkill', 'auto-destruição neutralizada: syscall tkill');
-                return 0;
-            }
-            if (number === numbers.tgkill && isSelfPid(a1)) {
-                note('tgkill', 'auto-destruição neutralizada: syscall tgkill');
-                return 0;
-            }
-            return orig(nr, a1, a2, a3, a4, a5, a6);
-        }, 'long', ['long', 'long', 'long', 'long', 'long', 'long', 'long']));
-        report('libc.syscall substituído (exit/kill/tkill/tgkill)');
-    } catch (e) {
-        report('falha ao substituir syscall: ' + e);
-    }
-}
-
 function main() {
     initMarkerTables();
     hookLibcStringHooks();
     hookConnectPorts();
     hookSelfTermination();
-    hookSyscall();
 
     if (RASPILOT_JAVA_ONLY) {
         report('anti_frida_bypass.js carregado (somente nativo)');

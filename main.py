@@ -1206,7 +1206,10 @@ def run_pipeline(args: argparse.Namespace) -> int:
         _run_step(
             reporter,
             "ssl_pinning",
-            lambda: SSLPinningCheck(dm, mode=args.mode, no_java=args.no_java).run_all(
+            lambda: SSLPinningCheck(
+                dm, mode=args.mode, no_java=args.no_java,
+                java_timeout=args.java_timeout,
+            ).run_all(
                 args.package, window=args.window,
                 apk_path=getattr(args, "apk", None),
                 precomputed_bypass=ssl_bypass,

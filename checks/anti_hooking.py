@@ -1882,8 +1882,10 @@ class AntiHookingCheck:
         # sem anti-hook ativo ou simplesmente não exercitado na janela.
         exercised = bool(neutralized) or bool(observed)
         evidence_strength = "none"
-        if exercised:
+        if neutralized:
             evidence_strength = "neutralized"
+        elif observed:
+            evidence_strength = "observed"
         elif hook_applied and layer_verified:
             evidence_strength = "hook_applied"
         elif hook_installed and layer_verified:

@@ -182,19 +182,15 @@ class TestEvasionHotPath:
         assert "n > 64" in source
         assert "readByteArray" in source
 
-    def test_syscall_replacement_is_targeted(self):
-        """syscall é substituído apenas para exit/kill/tkill/tgkill.
+    def test_no_global_syscall_replacement(self):
+        """Substituir syscall() trava a sessão.
 
-        O gancho global sem filtro serializa o processo; aqui só os
-        números de auto-destruição são neutralizados e o restante é
-        repassado ao original.
+        Toda chamada de syscall do processo passaria pelo gancho —
+        inclusive as que o próprio carregamento da camada Java faz —, e
+        o agente ocupado não responde: a sessão para sem erro nenhum.
         """
         source = _read("anti_frida_bypass.js")
-        assert "function hookSyscall" in source
-        assert "numbers.exitGroup" in source
-        assert "numbers.tgkill" in source
-        assert "isSelfPid" in source
-        assert "syscall exit_group" in source
+        assert "'syscall'" not in source
 
     def test_marker_scan_does_not_build_strings(self):
         """A verificação de marcador não monta string por chamada."""

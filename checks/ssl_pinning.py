@@ -118,7 +118,11 @@ class SSLPinningCheck:
     """Detecta SSL pinning no APK e tenta bypass via Frida."""
 
     def __init__(
-        self, dm: "DeviceManager", mode: str = "bypass", no_java: bool = False
+        self,
+        dm: "DeviceManager",
+        mode: str = "bypass",
+        no_java: bool = False,
+        java_timeout: float = 30.0,
     ) -> None:
         """Inicializa o check com o gerenciador de dispositivo.
 
@@ -126,10 +130,16 @@ class SSLPinningCheck:
             dm: Instância conectada de ``DeviceManager``.
             mode: ``detect``, ``bypass`` ou ``stealth``.
             no_java: Se True, não tenta carregar hooks Java.
+            java_timeout: Tempo máximo de carga dos hooks Java de SSL,
+                em segundos. O script cobre várias camadas (TrustManager,
+                OkHttp, NetworkSecurityConfig, Conscrypt, WebView) e em
+                apps com muitos classloaders a varredura pode levar mais
+                que o padrão usado pelos demais checks.
         """
         self.dm = dm
         self.mode = mode
         self.no_java = no_java
+        self.java_timeout = java_timeout
 
     # ------------------------------------------------------------------
     # Helpers
@@ -346,7 +356,7 @@ class SSLPinningCheck:
                         session, SSL_BYPASS_SCRIPT, on_message=on_message,
                         replacements=self._script_replacements(java_only=True),
                         with_java_bridge=True,
-                        load_timeout=20.0,
+                        load_timeout=self.java_timeout,
                     )
                 except Exception as exc:
                     java_load_error = str(exc)
