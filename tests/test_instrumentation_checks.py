@@ -141,11 +141,14 @@ def test_bypass_modulo_com_app_vivo(clean_dm):
     assert result["neutralized"]
 
 
-def test_bypass_modulo_com_sondas_ativas(clean_dm):
-    """Hook exercitado + artefatos ocultos: bypass verificado sem consulta do app.
+def test_bypass_modulo_com_sondas_ativas_sem_consulta_do_app_fica_inconclusivo(clean_dm):
+    """Hook exercitado + artefatos ocultos, mas sem consulta do app, é inconclusivo.
 
-    Cobre o app que não consulta APIs de framework na janela: antes o
-    resultado era sempre "não exercitado" mesmo com o módulo ativo.
+    As sondas ``app-lifecycle``/``bypass-verified`` são o próprio módulo se
+    verificando (ver HookShield.java, flag ``probing``); sem nenhuma
+    consulta observada/neutralizada do app, não há prova de que o app
+    tentou detectar o framework — logo não pode ser contado como bypass
+    vencedor.
     """
     manager = FakeXposed(phases={
         ("observe", "off"): _run(probes=[
@@ -163,11 +166,11 @@ def test_bypass_modulo_com_sondas_ativas(clean_dm):
     })
     check = AntiHookingCheck(clean_dm, method="module", xposed=manager)
     result = check.attempt_module_bypass("com.example.app")
-    assert result["success"] is True
+    assert result["success"] is None
     assert result["evidence_strength"] == "hook_applied"
     assert result["hook_applied"] is True
     assert result["layer_verified"] is True
-    assert "hook ativo" in result["verdict_reason"]
+    assert "bypass não exercitado" in result["skipped_reason"]
     assert result["hook_probes"]
 
 
@@ -185,11 +188,16 @@ def test_bypass_modulo_com_sonda_parcial_fica_inconclusivo(clean_dm):
     check = AntiHookingCheck(clean_dm, method="module", xposed=manager)
     result = check.attempt_module_bypass("com.example.app")
     assert result["success"] is None
-    assert "bypass parcial" in result["skipped_reason"]
+    assert "bypass não exercitado" in result["skipped_reason"]
 
 
-def test_bypass_modulo_com_instalacao_e_ocultacao_verificadas(clean_dm):
-    """Hook instalado + maps ocultos: bypass exercitado sem consulta do app."""
+def test_bypass_modulo_com_instalacao_e_ocultacao_verificadas_sem_consulta_do_app(clean_dm):
+    """Hook instalado + maps ocultos, mas sem consulta do app, fica inconclusivo.
+
+    A camada só provou que se instalou e se autoverificou (sondas internas
+    do módulo); sem evidência de que o app chegou a consultar algo, não há
+    bypass para declarar vitória.
+    """
     manager = FakeXposed(phases={
         ("observe", "off"): _run(),
         ("bypass", "off"): _run(probes=[
@@ -203,9 +211,9 @@ def test_bypass_modulo_com_instalacao_e_ocultacao_verificadas(clean_dm):
     })
     check = AntiHookingCheck(clean_dm, method="module", xposed=manager)
     result = check.attempt_module_bypass("com.example.app")
-    assert result["success"] is True
+    assert result["success"] is None
     assert result["evidence_strength"] == "hook_installed"
-    assert "hook instalado" in result["verdict_reason"]
+    assert "bypass não exercitado" in result["skipped_reason"]
 
 
 def test_bypass_modulo_com_app_morto(clean_dm):

@@ -1856,14 +1856,15 @@ class AntiHookingCheck:
             is_rasp = False
 
         # Evidência real: a checagem do app foi exercitada (consulta
-        # observada/neutralizada) ou o módulo provou que conseguiu hookar
-        # o fluxo do app e esconder os artefatos do framework. Vivo sem
-        # nenhum sinal continua inconclusivo.
-        exercised = bool(neutralized) or bool(observed) or (
-            (hook_applied or hook_installed) and layer_verified
-        )
+        # observada/neutralizada). hook_installed/hook_applied/layer_verified
+        # são sondas internas do próprio módulo (lidas com probing=true em
+        # HookShield.install/runVisibilityProbe) — provam que a camada está
+        # ativa e ocultando artefatos, não que o app chegou a consultá-los.
+        # Tratá-las como prova de bypass gera "FALHOU" para qualquer app
+        # sem anti-hook ativo ou simplesmente não exercitado na janela.
+        exercised = bool(neutralized) or bool(observed)
         evidence_strength = "none"
-        if bool(neutralized) or bool(observed):
+        if exercised:
             evidence_strength = "neutralized"
         elif hook_applied and layer_verified:
             evidence_strength = "hook_applied"
@@ -1880,19 +1881,7 @@ class AntiHookingCheck:
                 # e as checagens anti-hook exercitadas: a proteção não
                 # interrompeu a auditoria.
                 success = True
-                if evidence_strength == "hook_applied":
-                    verdict_reason = (
-                        "hook ativo no app e artefatos do framework ocultos; "
-                        "o app não interrompeu a auditoria"
-                    )
-                    logs.append(f"[bypass] {verdict_reason}")
-                elif evidence_strength == "hook_installed":
-                    verdict_reason = (
-                        "hook instalado no app e artefatos do framework ocultos; "
-                        "o app não interrompeu a auditoria"
-                    )
-                    logs.append(f"[bypass] {verdict_reason}")
-                elif not neutralized:
+                if not neutralized:
                     verdict_reason = (
                         "checagens anti-hook observadas sem neutralização "
                         "em Java na janela de bypass"
@@ -1908,13 +1897,14 @@ class AntiHookingCheck:
                 elif hook_installed:
                     parts.append("hook instalado no app")
                 if layer_verified:
-                    parts.append("artefatos ocultos verificados")
+                    parts.append("artefatos ocultos verificados pelo próprio módulo")
                 if layer_incomplete:
                     parts.append("artefatos do framework ainda visíveis")
                 skipped_reason = (
-                    "bypass parcial: " + "; ".join(parts)
-                    + " — falta a outra ponta da prova (hook exercitado + "
-                    "artefatos ocultos) para concluir"
+                    "bypass não exercitado: " + "; ".join(parts)
+                    + " — mas nenhuma consulta do app foi observada ou "
+                    "neutralizada na janela (sonda interna do módulo não "
+                    "prova que o app tentou detectar o framework)"
                 )
                 logs.append(f"[bypass] {skipped_reason}")
             else:

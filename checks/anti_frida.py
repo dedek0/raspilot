@@ -1011,11 +1011,19 @@ class AntiFridaCheck:
                         "(possível crash da instrumentação)"
                     )
             else:
-                # Sem logcat/baseline disponíveis: mantém o comportamento
-                # conservador de tratar a morte como possível reação.
+                # Sem logcat/baseline disponíveis para atribuir a causa: a
+                # morte não pode ser confirmada como reação de RASP nem como
+                # crash comum. Tratá-la como detecção infla "app detectou
+                # Frida" sem nenhuma evidência de segurança — o resultado
+                # correto aqui é inconclusivo, não uma suposição otimista.
                 death_classification = "unclassified_death"
+                observation_status = "inconclusive"
+                error = (
+                    "app encerrou sem logcat/baseline disponível para atribuir "
+                    "a causa; resultado inconclusivo"
+                )
 
-            if death_classification in ("rasp_kill", "rasp_reaction", "unclassified_death"):
+            if death_classification in ("rasp_kill", "rasp_reaction"):
                 found.append(
                     f"app_terminated: processo encerrou ~{died_after}s após resume "
                     f"({death_classification})"
@@ -1028,7 +1036,9 @@ class AntiFridaCheck:
 
         vulnerable = (
             None
-            if observation_status in ("crashed", "baseline_death", "error", "native_only")
+            if observation_status in (
+                "crashed", "baseline_death", "error", "native_only", "inconclusive",
+            )
             else (not found)
         )
         result = {

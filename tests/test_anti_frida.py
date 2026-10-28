@@ -269,17 +269,17 @@ class TestAppDetection:
         assert res["vulnerable"] is True
         assert res["detection_methods_found"] == []
 
-    def test_app_death_during_observation_is_not_vulnerable(self):
-        """App que se encerra na janela => reação do RASP, vulnerable=False."""
+    def test_app_death_during_observation_without_evidence_is_inconclusive(self):
+        """Morte na janela sem logcat/baseline => inconclusivo, não RASP confirmado."""
         dm = mock.MagicMock()
         dm.is_app_alive.return_value = False
         check = AntiFridaCheck(dm)
         session = FakeSession(messages=[])
         with mock.patch("checks.anti_frida.OBSERVATION_POLL_INTERVAL", 0.0):
             res = check.check_frida_detection_in_app(session, window=3, pid=99)
-        assert res["vulnerable"] is False
+        assert res["vulnerable"] is None
         assert res["app_alive_at_end"] is False
-        assert any("app_terminated" in m for m in res["detection_methods_found"])
+        assert res["observation_status"] == "inconclusive"
 
     def test_app_alive_reports_app_alive_at_end(self):
         """App vivo ao fim da janela => app_alive_at_end=True."""
