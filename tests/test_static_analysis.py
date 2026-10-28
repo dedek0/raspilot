@@ -17,6 +17,7 @@ from checks.anti_hooking import AntiHookingCheck
 from checks.anti_root import AntiRootCheck
 from checks.ssl_pinning import SSLPinningCheck
 from checks.static import (
+    app_owned_targets,
     build_static_profile,
     merge_pinning_detection,
     merge_signature_detection,
@@ -314,6 +315,82 @@ class TestHelpers:
         )
         assert merged["pinning_detected"] is False
         assert merged["asc_weak_only"] is True
+
+    def test_app_owned_targets_none_when_unavailable(self):
+        assert app_owned_targets(None) == []
+
+    def test_app_owned_targets_extrai_classe_e_metodo_do_app(self):
+        findings = [
+            {
+                "vector": "hooking", "source": "asc", "kind": "method_ref",
+                "value": "getStackTrace", "evidence": "x", "confidence": "low",
+                "class": "Lcom/example/app/Foo;", "method": "checkHook",
+                "label": "inspeção de stack trace", "owner": "app",
+            },
+        ]
+        view = vector_view(_profile("hooking", findings=findings), "hooking")
+        targets = app_owned_targets(view)
+        assert targets == [("Lcom/example/app/Foo;", "checkHook")]
+
+    def test_app_owned_targets_ignora_biblioteca_e_sdk_terceiro(self):
+        findings = [
+            {
+                "vector": "hooking", "source": "asc", "kind": "method_ref",
+                "value": "getStackTrace", "evidence": "x", "confidence": "high",
+                "class": "Lokhttp3/internal/connection/RealCall;",
+                "method": "callStart", "label": "lib", "owner": "library",
+            },
+            {
+                "vector": "hooking", "source": "asc", "kind": "method_ref",
+                "value": "getStackTrace", "evidence": "x", "confidence": "high",
+                "class": "Lorg/koin/core/instance/InstanceFactory;",
+                "method": "create", "label": "sdk", "owner": "third_party_sdk",
+            },
+        ]
+        view = vector_view(_profile("hooking", findings=findings), "hooking")
+        assert app_owned_targets(view) == []
+
+    def test_app_owned_targets_inclui_unknown_ofuscado_com_confianca_baixa(self):
+        """Classe ofuscada (owner=unknown) com confiança baixa ainda conta.
+
+        A atribuição de owner já filtra biblioteca/SDK conhecido; exigir
+        confiança alta aqui descartaria justamente os achados em código
+        ofuscado do próprio app, que é o caso mais comum em apps reais.
+        """
+        findings = [
+            {
+                "vector": "hooking", "source": "asc", "kind": "method_ref",
+                "value": "getStackTrace", "evidence": "x", "confidence": "low",
+                "class": "Lab3Xy9/q8Hjk2;", "method": "a", "label": "stack",
+                "owner": "unknown",
+            },
+        ]
+        view = vector_view(_profile("hooking", findings=findings), "hooking")
+        assert app_owned_targets(view) == [("Lab3Xy9/q8Hjk2;", "a")]
+
+    def test_app_owned_targets_ignora_achados_sem_metodo(self):
+        findings = [
+            {
+                "vector": "hooking", "source": "apk_bytes", "kind": "signature",
+                "value": "xposed", "evidence": "x", "confidence": "high",
+                "class": "", "method": "", "label": "xposed", "owner": "apk",
+            },
+        ]
+        view = vector_view(_profile("hooking", findings=findings), "hooking")
+        assert app_owned_targets(view) == []
+
+    def test_app_owned_targets_dedup_e_limite(self):
+        findings = [
+            {
+                "vector": "hooking", "source": "asc", "kind": "method_ref",
+                "value": "v", "evidence": "x", "confidence": "low",
+                "class": "Lcom/app/Foo;", "method": "check",
+                "label": "x", "owner": "app",
+            }
+        ] * 3
+        view = vector_view(_profile("hooking", findings=findings), "hooking")
+        targets = app_owned_targets(view, limit=1)
+        assert targets == [("Lcom/app/Foo;", "check")]
 
 
 class TestAntiFridaStaticVerdict:

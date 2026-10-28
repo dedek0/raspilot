@@ -18,6 +18,7 @@ Marca: RASPilot — Piloto Automático de Auditoria RASP para Android.
 from __future__ import annotations
 
 from checks.static.profile import (
+    app_owned_targets,
     build_static_profile,
     merge_pinning_detection,
     merge_signature_detection,
@@ -25,6 +26,7 @@ from checks.static.profile import (
 )
 
 __all__ = [
+    "app_owned_targets",
     "build_static_profile",
     "merge_pinning_detection",
     "merge_signature_detection",

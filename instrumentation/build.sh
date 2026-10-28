@@ -7,6 +7,11 @@
 # Uso:
 #   ./build.sh [--hook off|observe|bypass] [--emu off|observe|probe|mask]
 #              [--target PACOTE] [--label NOME] [--out CAMINHO_APK]
+#              [--hook-targets ARQUIVO_JSON]
+#
+# ARQUIVO_JSON (--hook-targets): lista de [classe_dalvik, metodo]
+# descoberta pela analise estatica do APK alvo (ver checks/static).
+# Especifica do app sob auditoria; nao compilada por padrao.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,6 +24,7 @@ EMU_MODE="off"
 TARGET=""
 LABEL="build"
 OUT="${SCRIPT_DIR}/build/raspilot-module.apk"
+HOOK_TARGETS_FILE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -29,6 +35,7 @@ while [[ $# -gt 0 ]]; do
     --target) TARGET="$2"; shift 2 ;;
     --label)  LABEL="$2"; shift 2 ;;
     --out)    OUT="$2"; shift 2 ;;
+    --hook-targets) HOOK_TARGETS_FILE="$2"; shift 2 ;;
     *) echo "argumento desconhecido: $1" >&2; exit 2 ;;
   esac
 done
@@ -89,6 +96,36 @@ java_string() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\$/\\$/g'
 }
 
+# Alvos de hook direcionado (classe/metodo do app, descobertos pela
+# analise estatica). Gerados como array Java estatico: a lista e
+# especifica do app sob auditoria e nao cabe na propriedade de runtime.
+HOOK_TARGETS_JAVA=""
+if [[ -n "${HOOK_TARGETS_FILE}" && -f "${HOOK_TARGETS_FILE}" ]]; then
+  HOOK_TARGETS_JAVA="$(python3 - "${HOOK_TARGETS_FILE}" <<'PY'
+import json
+import sys
+
+def escape(value):
+    # Escapa apenas o que uma string literal Java exige: barra invertida
+    # e aspas duplas. "$" nao e caractere de escape em Java (classes
+    # internas usam "$" no nome, ex: "Foo$Bar") e nomes de metodo podem
+    # trazer "<init>"/"<clinit>" sem precisar de tratamento especial.
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as handle:
+    pairs = json.load(handle)
+
+rows = []
+for cls, method in pairs:
+    rows.append(
+        '        { "%s", "%s" },' % (escape(str(cls)), escape(str(method)))
+    )
+print("\n".join(rows))
+PY
+)"
+fi
+
 cat > "${WORK}/gen/com/raspilot/module/RaspilotBaked.java" <<EOF
 package com.raspilot.module;
 
@@ -101,6 +138,16 @@ public final class RaspilotBaked {
     public static final String EMULATOR_MODE = "$(java_string "${EMU_MODE}")";
     public static final String TARGET_PACKAGE = "$(java_string "${TARGET}")";
     public static final String LABEL = "$(java_string "${LABEL}")";
+
+    /**
+     * Alvos de hook direcionado: {classe_dalvik, metodo} achados pela
+     * analise estatica do APK do app sob auditoria. Generico por
+     * definicao — preenchido em tempo de build a partir do app atual,
+     * nunca com nomes fixos de um app especifico.
+     */
+    public static final String[][] HOOK_TARGETS = {
+${HOOK_TARGETS_JAVA}
+    };
 
     private RaspilotBaked() {
     }

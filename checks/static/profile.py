@@ -910,6 +910,61 @@ def vector_view(profile: Optional[dict], name: str) -> Optional[dict]:
     return view
 
 
+def app_owned_targets(
+    view: Optional[dict], min_confidence: str = "low", limit: int = 40
+) -> List[Tuple[str, str]]:
+    """Extrai métodos do próprio app achados pelo ASC em um vetor.
+
+    O módulo de instrumentação é genérico: ele não conhece de antemão
+    nenhuma classe do app auditado. Esta função é a ponte entre a
+    análise estática (que acha código do app relacionado ao vetor) e o
+    hook direcionado — a classe/método descoberto aqui é embutido no
+    próximo build do módulo e hookado por nome exato, para qualquer app.
+
+    O default de confiança é ``"low"``: a atribuição de ``owner`` já
+    filtra biblioteca/SDK conhecido (só passam ``app``/``rasp_sdk``/
+    ``unknown``), então o filtro de confiança aqui é redundante com
+    esse filtro — e algumas das consultas mais relevantes do vetor
+    hooking (ex: inspeção de stack trace) são deliberadamente marcadas
+    como confiança baixa por serem um sinal fraco isoladamente, não
+    porque a referência seja questionável. Hookar essa observação é
+    seguro: o pior caso é não ver nenhuma chamada na janela.
+
+    Args:
+        view: Visão de vetor de :func:`vector_view` (ex: ``"hooking"``).
+        min_confidence: Confiança mínima do achado (``"low"``,
+            ``"medium"`` ou ``"high"``).
+        limit: Máximo de alvos retornados (evita builds gigantes).
+
+    Returns:
+        Lista de tuplas ``(classe_dalvik, método)`` únicas, só com
+        achados cujo ``owner`` é o próprio app e que têm método (achados
+        só de classe não dão um ponto de hook específico).
+    """
+    if not isinstance(view, dict):
+        return []
+    threshold = _CONFIDENCE_ORDER.get(min_confidence, 1)
+    seen: set = set()
+    targets: List[Tuple[str, str]] = []
+    for item in view.get("findings") or []:
+        if not is_app_evidence(item.get("owner")):
+            continue
+        if _CONFIDENCE_ORDER.get(item.get("confidence"), 0) < threshold:
+            continue
+        cls = str(item.get("class") or "").strip()
+        method = str(item.get("method") or "").strip()
+        if not cls or not method:
+            continue
+        key = (cls, method)
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append(key)
+        if len(targets) >= limit:
+            break
+    return targets
+
+
 def merge_signature_detection(detection: Optional[dict], view: Optional[dict]) -> dict:
     """Combina a detecção por assinaturas com a visão ASC.
 

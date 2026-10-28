@@ -106,6 +106,12 @@ class ModuleConfig:
             ``probe``, ``mask``).
         target: Pacote alvo (vazio = qualquer pacote no escopo).
         label: Rótulo da execução, usado na correlação de evidência.
+        hook_targets: Métodos do próprio app achados pela análise
+            estática (``(classe_dalvik, método)``) a observar
+            diretamente. Compilados no APK do módulo — diferente das
+            demais opções, que são resolvidas em runtime — porque a
+            lista é específica do app sob auditoria e pode ultrapassar
+            o limite de propriedade do sistema (~92 bytes).
     """
 
     hook: str = "off"
@@ -114,6 +120,7 @@ class ModuleConfig:
     emulator: str = "off"
     target: str = ""
     label: str = ""
+    hook_targets: Tuple[Tuple[str, str], ...] = ()
 
     def as_property(self) -> str:
         """Serializa a configuração para a propriedade do sistema.
@@ -152,7 +159,10 @@ class ModuleConfig:
         Returns:
             Hash hexadecimal da configuração.
         """
-        return hashlib.sha256(self.as_property().encode("utf-8")).hexdigest()[:12]
+        digest = hashlib.sha256(self.as_property().encode("utf-8"))
+        for cls, method in self.hook_targets:
+            digest.update(f"{cls}->{method}".encode("utf-8"))
+        return digest.hexdigest()[:12]
 
 
 class XposedManager:
@@ -595,9 +605,12 @@ class XposedManager:
 
         # O hash dos fontes + build.sh identifica o binário. A
         # configuração da fase fica fora da chave: o mesmo APK atende
-        # observe/bypass (e root/emu/tamper) via setprop.
+        # observe/bypass (e root/emu/tamper) via setprop. hook_targets é
+        # diferente: é específico do app sob auditoria e só existe
+        # compilado no APK (sem override em runtime), então sempre entra
+        # na chave de cache quando presente — independente de ``baked``.
         digest = self._build_cache_digest()
-        name = digest if not baked else f"{digest}-{config.fingerprint()}"
+        name = digest if not (baked or config.hook_targets) else f"{digest}-{config.fingerprint()}"
         out_dir = os.path.join(BUILD_DIR, name)
         apk = os.path.join(out_dir, "raspilot-module.apk")
         if os.path.exists(apk):
@@ -613,6 +626,13 @@ class XposedManager:
             env["PATH"] = f"{os.path.join(self.java_home, 'bin')}:{env.get('PATH', '')}"
 
         cmd = ["bash", BUILD_SCRIPT] + config.as_build_args() + ["--out", apk]
+        hook_targets_path: Optional[str] = None
+        if config.hook_targets:
+            os.makedirs(out_dir, exist_ok=True)
+            hook_targets_path = os.path.join(out_dir, "hook_targets.json")
+            with open(hook_targets_path, "w", encoding="utf-8") as handle:
+                json.dump(list(config.hook_targets), handle)
+            cmd += ["--hook-targets", hook_targets_path]
         try:
             proc = subprocess.run(
                 cmd, env=env, capture_output=True, text=True, timeout=600, check=False

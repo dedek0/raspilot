@@ -37,7 +37,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from checks.apk_utils import pull_apk, scan_apk
-from checks.static import merge_signature_detection, vector_view
+from checks.static import app_owned_targets, merge_signature_detection, vector_view
 from checks.stealth import PROC_FILTER_SCRIPT, load_stealth, unload_stealth
 from rasp_vendors import VENDORS
 from logcat_analyzer import (
@@ -621,6 +621,22 @@ class AntiHookingCheck:
         self.method = method or "auto"
         self.xposed = xposed
         self._module_observation: Optional[dict] = None
+        self._hook_targets: Tuple[Tuple[str, str], ...] = ()
+
+    def set_hook_targets(self, targets: List[Tuple[str, str]]) -> None:
+        """Define métodos do próprio app a observar via módulo.
+
+        A lista vem da análise estática (ASC) do APK sob auditoria —
+        achados de ``owner="app"`` no vetor ``hooking`` — e é embutida
+        no próximo build do módulo (ver :class:`ModuleConfig.hook_targets`).
+        Genérico por construção: funciona com qualquer app, pois os
+        alvos são descobertos em tempo de execução a partir do perfil
+        estático daquele app específico.
+
+        Args:
+            targets: Lista de ``(classe_dalvik, método)``.
+        """
+        self._hook_targets = tuple(targets)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1679,6 +1695,7 @@ class AntiHookingCheck:
             emulator="off",
             target=package_name,
             label="hook-observe",
+            hook_targets=self._hook_targets,
         )
         phase = manager.run_phase(config, window=window, interact=True)
         run = phase.get("run") or {}
@@ -1754,6 +1771,7 @@ class AntiHookingCheck:
             emulator="off",
             target=package_name,
             label="hook-bypass",
+            hook_targets=self._hook_targets,
         )
         phase = manager.run_phase(bypass_config, window=window, interact=True)
         phases.append({"phase": "bypass", "ok": phase.get("ok"),
@@ -2050,6 +2068,14 @@ class AntiHookingCheck:
             static["details"] = static.get("details") or "análise estática do perfil do APK"
         else:
             static = self.detect_static(package_name, apk_path=apk_path)
+
+        # Métodos do próprio app achados pela análise estática: o
+        # módulo os observa diretamente (hook por nome exato), em vez
+        # de só vigiar APIs genéricas do Android. É a ponte que torna
+        # o bypass via módulo exercitável mesmo sem o app consultar um
+        # artefato conhecido de framework — sem depender de sondas
+        # internas do módulo como prova (ver attempt_module_bypass).
+        self.set_hook_targets(app_owned_targets(static_view))
 
         # Fase dinâmica: usa a observação combinada quando fornecida;
         # caso contrário, cria um spawn próprio (uso standalone).

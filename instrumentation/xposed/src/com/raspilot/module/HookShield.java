@@ -9,6 +9,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStreamReader;
 import java.io.RandomAccessFile;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -68,6 +69,7 @@ public final class HookShield {
         hookPackageManager(bypass, classLoader);
         hookPackageManagerListing(bypass, classLoader);
         hookRunningProcesses(bypass);
+        hookAppTargets(config.hookTargets, classLoader);
 
         // Sonda ativa de instalação: prova que a tentativa de hooking
         // chegou ao processo do app (não apenas que o módulo carregou).
@@ -75,6 +77,106 @@ public final class HookShield {
                 "camada anti-hook instalada (mode="
                         + (bypass ? "bypass" : "observe") + ")");
         runVisibilityProbe(bypass);
+    }
+
+    /**
+     * Observa métodos do próprio app achados pela análise estática.
+     *
+     * Diferente das demais camadas (que hookam APIs genéricas do
+     * Android), aqui o alvo é código do app sob auditoria — a lista
+     * compilada no APK a partir do perfil estático (ASC) daquele app
+     * especificamente (ver {@link RaspilotConfig#hookTargets}).
+     *
+     * O hook é **só observação**: nunca invoca o método por reflexão
+     * (poderia crashar o app com argumentos incorretos) nem altera seu
+     * retorno. A evidência só conta quando o próprio app chama o
+     * método durante a janela — é a prova mais direta de que o app
+     * exercitou uma checagem de hooking em código seu, não apenas em
+     * uma API de framework genérica.
+     *
+     * @param targets Alvos ``{classe_dalvik, método}`` do app atual.
+     * @param classLoader Class loader do processo alvo.
+     */
+    private static void hookAppTargets(String[][] targets, ClassLoader classLoader) {
+        if (targets == null || targets.length == 0) {
+            return;
+        }
+        for (String[] target : targets) {
+            if (target == null || target.length != 2) {
+                continue;
+            }
+            final String className = dottedName(target[0]);
+            final String methodName = target[1];
+            if (className == null || className.length() == 0
+                    || methodName == null || methodName.length() == 0) {
+                continue;
+            }
+            try {
+                Class<?> clazz = XposedHelpers.findClassIfExists(className, classLoader);
+                if (clazz == null) {
+                    continue;
+                }
+                boolean hookedAny = false;
+                XC_MethodHook callback = new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        Evidence.emit("observe", "hook-app-target",
+                                className + "->" + methodName,
+                                "método do app achado pela análise estática foi chamado");
+                    }
+                };
+                if ("<init>".equals(methodName)) {
+                    // Construtor: nao aparece em getDeclaredMethods().
+                    for (java.lang.reflect.Constructor<?> ctor
+                            : clazz.getDeclaredConstructors()) {
+                        try {
+                            XposedBridge.hookMethod(ctor, callback);
+                            hookedAny = true;
+                        } catch (Throwable error) {
+                            Evidence.error("hookAppTargets.<init>", error);
+                        }
+                    }
+                } else {
+                    for (Method candidate : clazz.getDeclaredMethods()) {
+                        if (!methodName.equals(candidate.getName())) {
+                            continue;
+                        }
+                        try {
+                            XposedBridge.hookMethod(candidate, callback);
+                            hookedAny = true;
+                        } catch (Throwable error) {
+                            Evidence.error("hookAppTargets." + methodName, error);
+                        }
+                    }
+                }
+                if (hookedAny) {
+                    Evidence.emit("probe", "hook-app-target", "target-hooked",
+                            className + "->" + methodName);
+                }
+            } catch (Throwable error) {
+                Evidence.error("hookAppTargets", error);
+            }
+        }
+    }
+
+    /**
+     * Converte um descritor Dalvik (``Lcom/app/Foo;``) em nome pontilhado.
+     *
+     * @param dalvikName Descritor no formato Dalvik ou já pontilhado.
+     * @return Nome de classe pontilhado, ou null se vazio.
+     */
+    private static String dottedName(String dalvikName) {
+        if (dalvikName == null) {
+            return null;
+        }
+        String text = dalvikName.trim();
+        if (text.startsWith("L")) {
+            text = text.substring(1);
+        }
+        if (text.endsWith(";")) {
+            text = text.substring(0, text.length() - 1);
+        }
+        return text.replace('/', '.');
     }
 
     /**

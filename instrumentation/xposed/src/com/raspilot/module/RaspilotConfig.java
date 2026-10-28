@@ -42,10 +42,17 @@ public final class RaspilotConfig {
     public final String targetPackage;
     public final String label;
     public final boolean runtimeOverride;
+    /**
+     * Metodos do proprio app (classe_dalvik, metodo) achados pela
+     * analise estatica do APK sob auditoria. Compilados no APK do
+     * modulo — nao ha override em runtime, pois a lista e especifica
+     * do build atual (ver build.sh --hook-targets).
+     */
+    public final String[][] hookTargets;
 
     private RaspilotConfig(String hookMode, String rootMode, String tamperMode,
                             String emulatorMode, String targetPackage, String label,
-                            boolean runtimeOverride) {
+                            boolean runtimeOverride, String[][] hookTargets) {
         this.hookMode = hookMode;
         this.rootMode = rootMode;
         this.tamperMode = tamperMode;
@@ -53,6 +60,7 @@ public final class RaspilotConfig {
         this.targetPackage = targetPackage;
         this.label = label;
         this.runtimeOverride = runtimeOverride;
+        this.hookTargets = hookTargets;
     }
 
     /**
@@ -105,7 +113,8 @@ public final class RaspilotConfig {
         }
 
         instance = new RaspilotConfig(
-                hook, root, tamper, emu, target, label, overridden);
+                hook, root, tamper, emu, target, label, overridden,
+                RaspilotBaked.HOOK_TARGETS);
         return instance;
     }
 
