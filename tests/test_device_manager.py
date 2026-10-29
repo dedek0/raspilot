@@ -425,11 +425,22 @@ class TestFridaHelpers:
                 dm._local_frida_version()
 
     def test_remove_frida_server_never_raises(self):
-        """Cleanup não propaga exceção."""
+        """Cleanup não propaga exceção e não toca em adb real.
+
+        O teste precisa mockar ``run_shell``/``kill_frida_server``: são
+        eles que executam ``rm``/``pkill`` no dispositivo. Mockar apenas
+        ``_run_adb`` deixava o teste rodar contra o adb do host e, com
+        um aparelho conectado, apagar o frida-server dele.
+        """
         dm = DeviceManager()
-        with mock.patch.object(
-            dm, "_run_adb", side_effect=DeviceConnectionError("offline")
-        ):
+        offline = DeviceConnectionError("offline")
+        with mock.patch.object(dm, "kill_frida_server"), \
+             mock.patch.object(
+                 dm,
+                 "run_shell",
+                 return_value={"ok": False, "rc": -1, "stdout": "", "stderr": "offline"},
+             ), \
+             mock.patch.object(dm, "_run_adb", side_effect=offline):
             dm.remove_frida_server()  # não deve levantar
 
     def test_get_app_pid_falls_back_to_last_spawn(self):

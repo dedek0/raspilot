@@ -29,6 +29,7 @@ import zipfile
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import paths
 from checks.apk_utils import pull_apk
 from logcat_analyzer import analyze_since
 
@@ -343,7 +344,7 @@ def _run(
 
 def _keystore(path: Optional[str] = None) -> Tuple[Optional[str], str]:
     """Garante um keystore de debug e devolve ``(caminho, erro)``."""
-    target = path or os.path.expanduser("~/.raspilot/keys/raspilot-debug.jks")
+    target = path or str(paths.keys_dir() / "raspilot-debug.jks")
     if os.path.isfile(target):
         return target, ""
     os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -618,7 +619,7 @@ def _resolve_gadget(path: Optional[str], abi: str) -> Tuple[Optional[str], str]:
     candidate = path
     if not candidate:
         matches = sorted(glob.glob(os.path.expanduser(
-            f"~/.raspilot/gadgets/*{arch}*.so*"
+            f"{paths.gadgets_dir()}/*{arch}*.so*"
         )))
         if matches:
             candidate = matches[-1]
@@ -718,7 +719,7 @@ class RepackTester:
         self.dm = dm
         self.package_name = package_name
         self.apk_path = apk_path
-        self.output_dir = output_dir or os.path.expanduser("~/.raspilot/repack")
+        self.output_dir = output_dir or str(paths.repack_dir())
         self.window = max(1, int(window))
         requested = list(variants)
         if "all" in requested:

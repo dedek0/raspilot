@@ -10,4 +10,7 @@ Marca: RASPilot — Piloto Automático de Auditoria RASP para Android.
 
 from __future__ import annotations
 
-__all__ = ["anti_root", "anti_frida", "anti_emulator", "anti_hooking", "ssl_pinning"]
+__all__ = [
+    "anti_root", "anti_frida", "anti_emulator", "anti_hooking",
+    "anti_proxy", "ssl_pinning",
+]

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-PROFILE_VERSION = 4
+PROFILE_VERSION = 6
 
 VECTORS: Tuple[str, ...] = (
     "frida",
@@ -20,6 +20,7 @@ VECTORS: Tuple[str, ...] = (
     "emulator",
     "pinning",
     "tamper",
+    "proxy",
 )
 
 VECTOR_LABELS: Dict[str, str] = {
@@ -29,6 +30,7 @@ VECTOR_LABELS: Dict[str, str] = {
     "emulator": "Anti-Emulador",
     "pinning": "SSL Pinning",
     "tamper": "Anti-Tampering",
+    "proxy": "Proxy/VPN (detecção do app)",
 }
 
 # Assinaturas de bytes adicionais para vetores que ainda não tinham
@@ -235,6 +237,77 @@ ASC_QUERIES: List[dict] = [
         "value": "networkSecurityConfig",
         "label": "network security config",
     },
+    {
+        "vector": "proxy",
+        "kind": "type",
+        "value": "java.net.ProxySelector",
+        "label": "referência a ProxySelector",
+    },
+    {
+        "vector": "proxy",
+        "kind": "type",
+        "value": "android.net.ProxyInfo",
+        "label": "referência a ProxyInfo",
+    },
+    {
+        "vector": "proxy",
+        "kind": "method",
+        "value": "getHttpProxy",
+        "class_name": "android.net.LinkProperties",
+        "label": "leitura de proxy em LinkProperties",
+    },
+    {
+        "vector": "proxy",
+        "kind": "method",
+        "value": "getDefaultProxy",
+        "class_name": "android.net.Proxy",
+        "label": "leitura do proxy padrão",
+    },
+    {
+        "vector": "proxy",
+        "kind": "type",
+        "value": "android.net.VpnService",
+        "label": "referência a VpnService",
+    },
+    {
+        "vector": "proxy",
+        "kind": "method",
+        "value": "hasTransport",
+        "class_name": "android.net.NetworkCapabilities",
+        "label": "consulta de transporte de rede (pode incluir VPN)",
+        "confidence": "low",
+    },
+    {
+        "vector": "proxy",
+        "kind": "string",
+        "value": "http.proxyHost",
+        "label": "propriedade http.proxyHost",
+    },
+    {
+        "vector": "proxy",
+        "kind": "string",
+        "value": "https.proxyHost",
+        "label": "propriedade https.proxyHost",
+    },
+    {
+        "vector": "proxy",
+        "kind": "string",
+        "value": "socksProxyHost",
+        "label": "propriedade socksProxyHost",
+    },
+    {
+        "vector": "proxy",
+        "kind": "string",
+        "value": "http_proxy",
+        "label": "chave http_proxy",
+    },
+    {
+        "vector": "proxy",
+        "kind": "string",
+        "value": "VPNService",
+        "display": "VPNService",
+        "label": "string VPNService",
+    },
 ]
 
 # Hooks que os scripts de bypass do RASPilot instalam hoje. A lista é
@@ -284,6 +357,16 @@ BYPASS_HOOKS: Dict[str, List[str]] = {
         "HttpsURLConnection",
         "Apache AbstractVerifier",
     ],
+    "proxy": [
+        "System.getProperty (proxy.*)",
+        "ProxySelector.select/getDefault",
+        "android.net.Proxy.getDefaultHost/Port",
+        "LinkProperties.getHttpProxy",
+        "NetworkCapabilities.hasTransport(TRANSPORT_VPN)",
+        "Settings.Global/Secure (http_proxy)",
+        "NetworkInterface.getNetworkInterfaces (tun/ppp/tap)",
+        "VpnService.prepare",
+    ],
 }
 
 # Termos que sugerem uma checagem fora do alcance dos hooks Java. Não
@@ -295,6 +378,10 @@ NATIVE_HINTS: Dict[str, Tuple[str, ...]] = {
     "pinning": ("ssl_ctx", "boringssl", "libconscrypt_jni", "publickeypinner"),
     "hooking": ("strstr", "native", "ptrace"),
     "tamper": ("signature", "integrity", "tamper", "checksum"),
+    "proxy": (
+        "/proc/net/route", "getifaddrs", "if_nameindex", "tun0", "ppp0",
+        "native",
+    ),
 }
 
 __all__ = [

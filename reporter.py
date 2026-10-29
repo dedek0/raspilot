@@ -39,6 +39,7 @@ REPORT_ORDER = (
     "anti_frida",
     "anti_hooking",
     "ssl_pinning",
+    "anti_proxy",
 )
 
 # Diretório dos templates Jinja2 (relativo a este arquivo).
@@ -61,6 +62,8 @@ class Reporter:
         package_name: str,
         output_dir: str = "reports/",
         run_context: Optional[dict] = None,
+        timestamp: Optional[datetime] = None,
+        static_profile: Optional[dict] = None,
     ) -> None:
         """Inicializa o relatório com metadados do dispositivo e alvo.
 
@@ -71,13 +74,24 @@ class Reporter:
             run_context: Metadados da execução (argumentos da CLI, versão
                 do Frida, hashes dos scripts, pid alvo, resultado do
                 baseline). Tornam a execução reproduzível por terceiros.
+            timestamp: Timestamp do relatório. Permite reconstruir um
+                relatório a partir do estado salvo sem alterar a data.
+            static_profile: Perfil estático completo do APK. Quando
+                presente, entra no JSON como ``static_profile`` (recurso
+                estável para MCP e para retomada de sessão).
         """
         self.device_info = dict(device_info or {})
         self.package_name = package_name
         self.output_dir = output_dir
-        self.timestamp = datetime.now(timezone.utc)
+        self.timestamp = timestamp or datetime.now(timezone.utc)
         self.run_context: Dict[str, Any] = dict(run_context or {})
+        self.static_profile: Optional[dict] = static_profile
         self._results: Dict[str, dict] = {}
+
+    @property
+    def results(self) -> Dict[str, dict]:
+        """Resultados coletados, por check (cópia rasa)."""
+        return dict(self._results)
 
     # ------------------------------------------------------------------
     # Coleta
@@ -256,7 +270,7 @@ class Reporter:
             )
             return detection, bypass
 
-        if check_name in ("anti_hooking", "anti_emulator"):
+        if check_name in ("anti_hooking", "anti_emulator", "anti_proxy"):
             app = result.get("app_detection") or {}
             static = result.get("static_detection") or {}
             static_present = bool(static.get("static_detected"))
@@ -524,7 +538,7 @@ class Reporter:
             vulnerable = bool(raw_vulnerable)
             return ("FALHOU" if vulnerable else "OK"), summary
 
-        if check_name == "anti_emulator":
+        if check_name in ("anti_emulator", "anti_proxy"):
             # Semântica igual à do anti_hooking: o que interessa é a
             # proteção do APP, e não o tipo de máquina da auditoria.
             # O contexto do dispositivo vai no resumo como informação.
@@ -533,7 +547,6 @@ class Reporter:
             summary = {
                 "protection_detected": protected,
                 "bypass_successful": bypass,
-                "device_is_emulator": bool(result.get("device_is_emulator")),
                 "protection_sources": Reporter._protection_sources(result),
                 "static_engine": (result.get("static_analysis") or {}).get("engine"),
                 "static_owners": (result.get("static_analysis") or {}).get("owners") or {},
@@ -543,6 +556,18 @@ class Reporter:
                     .get("possible_gaps", [])
                 ),
             }
+            if check_name == "anti_emulator":
+                summary["device_is_emulator"] = bool(
+                    result.get("device_is_emulator")
+                )
+            else:
+                summary["proxy_detected"] = bool(
+                    result.get("proxy_detected")
+                )
+                summary["vpn_detected"] = bool(result.get("vpn_detected"))
+                summary["channels"] = (result.get("app_detection") or {}).get(
+                    "channels"
+                ) or {}
             if result.get("probe_method"):
                 summary["probe_method"] = result.get("probe_method")
             if result.get("bypass_method"):
@@ -553,7 +578,7 @@ class Reporter:
                     "o app bloqueou a auditoria durante o bypass"
                 )
             if not protected:
-                status = "FALHOU"  # app sem proteção anti-emulador
+                status = "FALHOU"  # app sem proteção
             elif bypass is True:
                 status = "FALHOU"  # proteção existe, mas o bypass venceu
             elif bypass is False:
@@ -738,6 +763,11 @@ class Reporter:
             "summary": summary,
             "execution_log": execution_log,
             "details": self._results,
+            **(
+                {"static_profile": self.static_profile}
+                if self.static_profile is not None
+                else {}
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -793,6 +823,15 @@ class Reporter:
         """
         return re.sub(r"[^a-zA-Z0-9._-]+", "_", value).strip("_") or "app"
 
+    def _base_name(self) -> str:
+        """Nome-base do relatório, único mesmo em execuções no mesmo segundo.
+
+        Returns:
+            ``<slug>_<YYYYmmdd_HHMMSS_ffffff>``.
+        """
+        stamp = self.timestamp.strftime("%Y%m%d_%H%M%S_%f")
+        return f"{self._slug(self.package_name)}_{stamp}"
+
     def save(self, write_html: bool = True) -> Tuple[str, str]:
         """Salva os relatórios JSON e HTML no diretório de saída.
 
@@ -808,8 +847,7 @@ class Reporter:
             OSError: em falha de escrita.
         """
         os.makedirs(self.output_dir, exist_ok=True)
-        stamp = self.timestamp.strftime("%Y%m%d_%H%M%S")
-        base = f"{self._slug(self.package_name)}_{stamp}"
+        base = self._base_name()
 
         json_path = os.path.abspath(os.path.join(self.output_dir, base + ".json"))
         html_path = os.path.abspath(os.path.join(self.output_dir, base + ".html"))

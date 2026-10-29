@@ -5,6 +5,7 @@
 **RASPilot — Automatic RASP Auditing Pilot for Android.**
 
 Orchestrates Anti-Root, Anti-Frida, Anti-Tampering, Anti-Emulator,
+Anti-Proxy/VPN,
 Anti-Hooking and SSL Pinning checks against Android apps, producing structured reports ready for
 LLM consumption via MCP.
 
@@ -146,11 +147,15 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 
 | Argument | Required | Description |
 |---|---|---|
-| `--package` | yes | Target app package name (e.g. `com.example.app`) |
+| `--package` | yes* | Target app package name (e.g. `com.example.app`). *Optional when resuming with `--session` |
 | `--device-id` | no | ADB serial (e.g. `emulator-5554`) |
 | `--wifi HOST:PORT` | no | Address for `adb connect` |
 | `--output-dir` | no | Reports directory (default `reports/`) |
-| `--stage STAGE` | no | `full` (default), `static` (APK only, no Frida), `detect` (detection only, no bypass) or `bypass` (detection + bypass) |
+| `--stage STAGE` | no | `full` (default), `static` (APK only, no Frida), `detect` (detection only, no bypass), `bypass` (requires `detect` in the same session) or `report` (regenerate from saved state, no device) |
+| `--session ID` | no | Resume the given session; without it, every run creates a new session |
+| `--state-dir PATH` | no | Session directory (default `$RASPILOT_STATE_DIR` or `~/.raspilot/sessions`) |
+| `--list-sessions` | no | List saved sessions (no audit) |
+| `--show-session ID` | no | Print a session's state and resources as JSON (no audit) |
 | `--only CHECK` | no | Run only the given check; repeatable. E.g. `--only anti_frida --only anti_root` |
 | `--apk PATH` | no | Local target APK (skips `adb pull`); required for `--stage static` without a device |
 | `--json-only` | no | Write only JSON, no HTML (automation/MCP) |
@@ -162,12 +167,13 @@ python main.py --package com.example.app --skip anti_emulator ssl_pinning
 | `--java-timeout SEC` | no | Maximum time to load the Java scripts (default `30`). Bridge loading is dominated by the Java runtime initialisation in the target and by classloader enumeration |
 | `--hook-method METHOD` | no | Anti-hook bypass: `frida` (injected agent), `module` (hooking APK on the device, scoped to the target package) or `auto` (default: uses the module when a framework is available) |
 | `--emulator-method METHOD` | no | Anti-emulator probe/bypass: `frida`, `module` or `auto` (default) |
+| `--proxy-method METHOD` | no | Proxy/VPN probe/bypass: `frida`, `module` or `auto` (default) |
 | `--module-apk PATH` | no | Pre-built instrumentation module APK (skips the build, which requires the Android SDK) |
 | `--static-engine ENGINE` | no | APK static analysis: `auto` (default; ASC when installed, otherwise byte scan), `asc` (require Droid ASC), `builtin` (byte scan only) or `off` |
 | `--static-timeout SEC` | no | Timeout per Droid ASC query (default `60`) |
 | `--js-runtime RUNTIME` | no | Frida JavaScript runtime: `qjs` (default) or `v8` |
 | `--verbose` | no | DEBUG-level logging |
-| `--skip CHECK...` | no | Checks to skip (`anti_root`, `anti_frida`, `anti_tampering`, `anti_emulator`, `anti_hooking`, `ssl_pinning`) |
+| `--skip CHECK...` | no | Checks to skip (`anti_root`, `anti_frida`, `anti_tampering`, `anti_emulator`, `anti_hooking`, `anti_proxy`, `ssl_pinning`) |
 | `--tamper-method METHOD` | no | `auto` (default; static + module/Frida probe), `static` (APK only), `frida` (in-memory probe only) or `repack` (destructive) |
 | `--tamper-allow-reinstall` | no | Confirms repack may uninstall/reinstall the app; data is lost |
 | `--tamper-variant VARIANT` | no | `asset`, `dex`, `resource`, `manifest`, `gadget` or `all`; repeatable. Default: `asset` and `dex`; `all` includes gadget (skipped when no binary) |
@@ -194,9 +200,9 @@ Without explicit flags RASPilot runs with:
 
 - `--mode bypass` — observe and attempt evasion;
 - `--static-engine auto` — ASC when installed, otherwise byte scan;
-- `--hook-method auto` / `--emulator-method auto` — module when a
-  framework is available, otherwise Frida; anti-root follows the same
-  preference (module first, Frida fallback);
+- `--hook-method auto` / `--emulator-method auto` / `--proxy-method auto`
+  — module when a framework is available, otherwise Frida; anti-root
+  follows the same preference (module first, Frida fallback);
 - `--window 15` — observation window;
 - `--static-timeout 60` — per-ASC-query timeout.
 
@@ -225,12 +231,31 @@ python main.py --package com.example.app --stage detect --only anti_frida
 
 # 5) automation/MCP: JSON only, no HTML
 python main.py --package com.example.app --json-only
+
+# 6) resumable session: static → detect → bypass → report
+python main.py --package com.example.app --apk ./app.apk --stage static
+# (the session ID is printed; use it in the next stages)
+python main.py --session <ID> --stage detect
+python main.py --session <ID> --stage bypass   # requires detect first
+python main.py --session <ID> --stage report   # no device
+
+# 7) session catalogue
+python main.py --list-sessions
+python main.py --show-session <ID>
 ```
 
-`--stage static` writes its own JSON (`..._static.json`) with `metadata`
-and `static_profile`. `--stage detect` forces `--mode detect`. `--only`
-is an allow-list; the other checks appear as `SKIP`. Persistent
-session/state across stages belongs to the next roadmap phase.
+`--stage static` writes `<package>_<timestamp>_static.json`: the **pure
+profile** (same format as the session `static.json` resource), including
+`apk.sha256` for invalidation. `--stage detect` forces `--mode detect`.
+`--only` is an allow-list; the other checks appear as `SKIP`.
+
+Every run creates a session under `~/.raspilot/sessions/<ID>/` (or
+`--state-dir`), with `session.json`, `static.json`, `report.json`,
+`summary.json`, `report.html` and `checks/<check>.json`. `bypass` only
+runs after a completed `detect` in the same session; a different APK or
+device invalidates the state. Retention keeps the **15 most recent
+sessions** (`RASPILOT_SESSIONS_KEEP` overrides). Use `$RASPILOT_HOME` to
+isolate state and caches.
 
 ### Output
 
@@ -266,7 +291,7 @@ beat the protection", while also flagging gaps in bypass-hook coverage.
 It does **not** replace dynamic observation: presence in the APK is not
 proof of execution.
 
-Anti-Frida + anti-hooking observation runs in a **single session**, and anti-hooking/SSL bypasses share another spawn. Anti-tampering runs a control phase and a second phase with an in-memory package signature change, preferably through the module (`TamperShield`) with Frida fallback. Anti-Frida detection and bypass use separate spawns: first the app reaction is measured; then native evasion is loaded before resume. The anti-emulator check runs **last**, with its own spawns: the probe makes the app see an emulator, and a shared spawn would contaminate the other checks. The APK cache lives in `~/.raspilot/cache/apk` (disable with `RASPILOT_APK_CACHE=0`); the static profile cache lives in `~/.raspilot/cache/static` (disable with `RASPILOT_STATIC_CACHE=0`).
+Anti-Frida + anti-hooking observation runs in a **single session**, and anti-hooking/SSL bypasses share another spawn. Anti-tampering runs a control phase and a second phase with an in-memory package signature change, preferably through the module (`TamperShield`) with Frida fallback. Anti-proxy uses its own spawn: the probe makes the app see proxy/VPN and the bypass hides those channels, preferring the module (`ProxyShield`) and falling back to `proxy_bypass.js` under Frida. Anti-Frida detection and bypass use separate spawns: first the app reaction is measured; then native evasion is loaded before resume. The anti-emulator check runs **last**, with its own spawns: the probe makes the app see an emulator, and a shared spawn would contaminate the other checks. The APK cache lives in `~/.raspilot/cache/apk` (disable with `RASPILOT_APK_CACHE=0`); the static profile cache lives in `~/.raspilot/cache/static` (disable with `RASPILOT_STATIC_CACHE=0`).
 
 Status semantics:
 
@@ -352,7 +377,7 @@ consumers should use the `status` values.
 
 ### 0. Static APK analysis (`checks/static/`)
 
-The static profile is built once per run and shared by all six checks.
+The static profile is built once per run and shared by all seven checks.
 It has two layers:
 
 1. **Byte scan (always available)** — reads `AndroidManifest.xml`,
@@ -607,6 +632,10 @@ example) remain a declared limitation of the module.
   the result is `SKIP`; with intercepted traffic the report records
   `tls_observed=true` and keeps `pinning_detected=false` (pinning was not
   confirmed from the APK).
+- **Proxy ≠ pinning**: blocking a proxy/VPN or showing a blocking screen
+  may be proxy detection, not certificate pinning. The check does not use
+  that reaction as proof of pinning; if the app terminates during the
+  probe, the result is `SKIP` with a reason, never "no pinning" (N/A).
 - **Dynamic bypass**: injects `scripts/ssl_bypass.js` (universal) covering
   TrustManager, HostnameVerifier, OkHttp 3/4, NSC, Conscrypt, Apache
   HttpClient, WebView, BoringSSL/OpenSSL and Flutter. Bypass is only
@@ -727,6 +756,36 @@ the report exposes `gadget.script_ran`. The marker check uses `run-as`
 > repack must require explicit two-step confirmation before uninstalling/
 > reinstalling anything.
 
+### 6.2. Proxy/VPN (`checks/anti_proxy.py`)
+
+- **Static detection**: looks for proxy/VPN APIs and strings in the APK
+  (`ProxySelector`, `ProxyInfo`, `LinkProperties.getHttpProxy`,
+  `Proxy.getDefaultProxy`, `VpnService`, `TRANSPORT_VPN`,
+  `http.proxyHost`, `http_proxy`, `NetworkInterface` and
+  `tun`/`ppp`/`tap` names). Library references stay as context; ASC
+  attributes classes/methods.
+- **Dynamic probe**: makes the app see an HTTP proxy and a VPN. The
+  preferred path is the **module** (Java hooks installed before app
+  code runs); without a framework it uses `scripts/proxy_bypass.js`
+  through Frida. The check records which channels were queried
+  (`proxy`, `vpn`, `network`) and the reaction (blocking screen, threat
+  log, death).
+- **Bypass**: hides proxy/VPN from the app — `System.getProperty`,
+  `ProxySelector.select`, `Proxy.getDefaultHost/Port`,
+  `LinkProperties.getHttpProxy`, `NetworkCapabilities.hasTransport`,
+  `Settings.Global/Secure`, `NetworkInterface` and `VpnService.prepare`.
+- **Semantics**: `detected` requires a strong query (`proxy`/`vpn`) or
+  an observed reaction. Without a query, bypass is `SKIP`, not
+  “resisted”. A death caused by the instrumentation agent (anti-Frida)
+  is not treated as proxy protection resistance.
+- **Limitation**: `getifaddrs`/`/proc/net/route` and native checks are
+  not covered by the module/script; the report records this in
+  `device_coverage.not_covered`.
+
+> Proxy/VPN detection is **not** certificate pinning. An app may block
+> proxies without pinning certificates; the SSL Pinning check remains
+> separate.
+
 ## Instrumentation module (hooking APK) — optional
 
 Everything in this section is **optional**: without a hooking framework on
@@ -748,7 +807,8 @@ anti-root checks to run without instrumentation: the app sees an
 emulator/root environment while running normally.
 
 The module has four configurable layers: `hook` (anti-hook), `root`
-(anti-root), `tamper` (integrity/signature) and `emu` (anti-emulator). Anti-root uses `RootShield` to
+(anti-root), `tamper` (integrity/signature), `emu` (anti-emulator) and `proxy`
+(proxy/VPN). Anti-root uses `RootShield` to
 observe/neutralise RootBeer, `File`, `Runtime.exec`, `SystemProperties`
 and `PackageManager`.
 
@@ -943,7 +1003,7 @@ raspilot/
 │   ├── build.sh                # APK build (aapt2/d8/apksigner, no Gradle)
 │   ├── setup_toolchain.sh      # Installs Android SDK + JDK in ~/Android
 │   ├── requirements.txt        # Build toolchain requirements
-│   └── xposed/                 # Module sources (anti-hook + root + emulator)
+│   └── xposed/                 # Module sources (anti-hook + root + emulator + proxy/VPN)
 ├── checks/
 │   ├── anti_root.py            # Multi-vector root detection
 │   ├── anti_frida.py           # Frida presence/detection
@@ -951,6 +1011,7 @@ raspilot/
 │   ├── tamper_repack.py        # Destructive repack with controls + restore
 │   ├── anti_emulator.py        # Anti-emulator detection + bypass
 │   ├── anti_hooking.py         # Anti-hooking detection + bypass
+│   ├── anti_proxy.py           # Proxy/VPN detection + bypass
 │   ├── combined.py             # Single-session observation/bypass
 │   ├── stealth.py              # Native bootstrap before resume
 │   ├── apk_utils.py            # Shared APK helpers + APK cache
@@ -968,7 +1029,8 @@ raspilot/
 │   ├── root_detection.js       # App root-check observation
 │   ├── emulator_spoof.js       # Emulator spoof: probe and mask (Frida)
 │   ├── verdict_hook.js         # Neutralises the RASP threat callback
-│   └── anti_root_bypass.js     # Root detection bypass (Frida)
+│   ├── anti_root_bypass.js     # Root detection bypass (Frida)
+│   └── proxy_bypass.js         # Proxy/VPN probe/mask (Frida)
 ├── rasp_vendors.py             # Catalogue of known RASP SDKs
 ├── templates/report.html.j2    # HTML report template
 ├── reports/                    # Report output
@@ -1014,45 +1076,55 @@ control is what proves the bypass is the reason.
 
 ---
 
-## Phase 3 — Session/state and report resources (pending)
+## Phase 3 — Session/state and report resources (implemented)
 
-**Status: pending.** This phase has not been implemented yet. It comes
-before MCP integration and turns each audit into a resumable unit instead
-of an isolated command run.
+**Status: implemented.** Every audit is a resumable session under
+`~/.raspilot/sessions/<session_id>/` (or `--state-dir`). The CLI and
+`RaspilotService` share the same headless layer; MCP remains **after**
+this phase.
 
-Today every run reconnects ADB, rebuilds/reloads the static profile and
-writes files with its own timestamp. There is no shared `session_id`
-across `--stage static`, `--stage detect`, `--stage bypass` and `--only`,
-nor a stable report catalogue for MCP to query.
+What exists:
 
-Planned scope:
-
-- **Persistent session** in `~/.raspilot/sessions/<session_id>/`, with
-  `session.json` holding package, device, APK/hash, static profile,
-  per-check results, current stage, timestamps, errors/skips and report
-  paths.
+- **Persistent session:** `session.json` stores package, device,
+  APK/hash, static profile, per-check results, stage, timestamps,
+  errors/skips, invalidations, progress and report paths. Writes are
+  atomic (`tmp` + `os.replace`) and a per-device lock allows one run per
+  device at a time.
 - **Session flags:** `--session ID`, `--state-dir PATH`, `--list-sessions`,
-  `--show-session ID` and `--stage report` to regenerate JSON/HTML from
-  saved state without a device.
-- **`RaspilotService`:** a single layer with `create_session`,
-  `load_session`, `run_static`, `run_detection`, `run_bypass`,
-  `run_full`, `save_state`, `generate_report` and `list_reports`, shared
-  by the CLI and, later, MCP.
-- **Validation and invalidation:** block `bypass` before `detect`, detect
-  stale APK/device/version state, atomic writes and locking for
-  concurrent runs.
-- **Report resources:** stable catalogue with `raspilot://sessions`,
-  `raspilot://sessions/{id}/summary.json`, `report.json`, `report.html`,
-  `static.json` and `checks/{check}.json`.
-- **Retention and layout:** cleanup by age/count and separation between
-  persistent artifacts, caches and temporary files.
+  `--show-session ID` and `--stage report`. Without `--session`, every run
+  creates a new session and prints its ID.
+- **`RaspilotService`:** `create`/`resume`, `run_static`, `run_detection`,
+  `run_bypass`, `run_full`, `run_dynamic`, `save_state`,
+  `generate_report`, `list_reports`, `resources` and `run_async`. No
+  service method writes to stdout; the CLI supplies a `ConsoleProgress`
+  backed by `rich`.
+- **Validation/invalidation:** `bypass` requires a completed `detect` in
+  the same session; a different device raises an error; a changed APK
+  (sha256) invalidates the static profile and dynamic results; resume
+  reuses the saved `static` when the APK matches.
+- **Stable resources:** `raspilot://sessions`,
+  `raspilot://sessions/{id}/session.json`, `summary.json`, `report.json`,
+  `report.html`, `static.json` and `checks/{check}.json`.
+- **Retention/layout:** keeps the 15 most recent sessions
+  (`RASPILOT_SESSIONS_KEEP`), separating `sessions/`, `cache/` and
+  temporary files. Repack artifacts live in `<session>/artifacts/`.
+- **Async:** `RaspilotService.run_async()` returns a `Future` and updates
+  `session.json`/`progress` while running; the lock prevents two runs on
+  the same device. This is the base for the MCP tools.
 
-Completion criteria: resume a session without repeating static analysis,
+Completion criteria met: resume without repeating static analysis,
 generate a report from saved state alone, invalidate inconsistent state
 and expose artifacts through stable IDs. MCP remains **after** this
 phase.
 
 ## MCP integration (next phase — planned)
+
+The foundation is ready: MCP tools should operate on a `session_id`
+(created by `--session`/`RaspilotService.create`) rather than an isolated
+run. Long-running tools should use `RaspilotService.run_async()` and poll
+`session.json`/`progress` (or the
+`raspilot://sessions/{id}/session.json` resource) until the state leaves
+`running`; the per-device lock guarantees one run per device.
 
 Every check's `run_all()` is a pure function: it receives an injected
 `DeviceManager` and returns a `dict`, with no global side effects — ready to
@@ -1068,6 +1140,7 @@ be wrapped as MCP tools with `FastMCP`:
 | `raspilot_check_anti_emulator(device_id, package_name) -> dict` | `AntiEmulatorCheck(dm).run_all(package)` |
 | `raspilot_check_anti_hooking(device_id, package_name) -> dict` | `AntiHookingCheck(dm).run_all(package)` |
 | `raspilot_bypass_ssl_pinning(device_id, package_name) -> dict` | `SSLPinningCheck(dm).run_all(package)` |
+| `raspilot_verificar_proxy_vpn(device_id, package_name) -> dict` | `AntiProxyCheck(dm).run_all(package)` |
 | `raspilot_get_report() -> dict` | `Reporter.generate_json()` |
 
 The JSON emitted by RASPilot already follows a stable schema

@@ -396,6 +396,49 @@ def test_anti_frida_inconclusive_is_error():
     assert summary["error"]
 
 
+def test_static_profile_is_embedded():
+    """O perfil estático completo entra no JSON quando disponível."""
+    profile = {"available": True, "apk": {"sha256": "abc"}}
+    rep = Reporter(
+        device_info=DEVICE, package_name="com.example.app",
+        static_profile=profile,
+    )
+    assert rep.generate_json()["static_profile"] == profile
+
+
+def test_ssl_pinning_suspected_blocked_is_not_reported_as_absent():
+    """Suspeita + probe bloqueado não pode virar "não aplicável"."""
+    rep = Reporter(device_info=DEVICE, package_name="com.example.app")
+    rep.collect("ssl_pinning", {
+        "pinning_detected": False,
+        "pinning_suspected": True,
+        "pinning_type": "none",
+        "bypass_successful": None,
+        "evidence": [],
+        "bypass_skipped_reason": (
+            "o app bloqueou a auditoria durante o probe de SSL; "
+            "o pinning não foi confirmado"
+        ),
+        "detection": {
+            "pinning_detected": False,
+            "asc_weak_only": True,
+            "asc_weak_evidence": ["indício fraco de pinning"],
+        },
+        "bypass_details": {
+            "blocked": True,
+            "success": False,
+            "intercepted_hosts": [],
+            "bypass_logs": ["probe instalado", "app encerrou"],
+        },
+    })
+    log = rep.generate_json()["execution_log"]
+    phases = {step["phase"]: step for step in log}
+    assert phases["static"]["outcome"] == "suspected"
+    assert phases["bypass"]["outcome"] == "blocked"
+    assert "bloqueou" in phases["bypass"]["details"]
+    assert "suspeita=sim" in phases["verdict"]["details"]
+
+
 def test_save_json_only(tmp_path):
     """--json-only grava somente o JSON."""
     rep = Reporter(device_info=DEVICE, package_name="com.example.app",

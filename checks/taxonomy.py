@@ -79,6 +79,27 @@ EMULATOR_MARKERS = (
     "qemu_pipe",
 )
 
+PROXY_MARKERS = (
+    "proxyselector",
+    "proxyinfo",
+    "proxydetector",
+    "proxycheck",
+    "antiproxy",
+    "httpproxy",
+    "http.proxyhost",
+    "https.proxyhost",
+    "socksproxyhost",
+    "getdefaultproxy",
+    "usesystemproxies",
+    "vpndetector",
+    "vpncheck",
+    "vpnservice",
+    "transport_vpn",
+    "tun0",
+    "ppp0",
+    "tap0",
+)
+
 PINNING_MARKERS = (
     "certificatepinner",
     "trustkit",
@@ -173,6 +194,7 @@ def classify_marker(text: str) -> Optional[str]:
         ("root", ROOT_MARKERS),
         ("emulator", EMULATOR_MARKERS),
         ("pinning", PINNING_MARKERS),
+        ("proxy", PROXY_MARKERS),
     ):
         for marker in markers:
             if token_match(text, marker):
@@ -229,6 +251,7 @@ __all__ = [
     "FRIDA_MARKERS",
     "HOOK_MARKERS",
     "PINNING_MARKERS",
+    "PROXY_MARKERS",
     "ROOT_MARKERS",
     "classify_marker",
     "is_app_evidence",

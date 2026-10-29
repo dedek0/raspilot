@@ -21,44 +21,30 @@ import logging
 import os
 import signal
 import sys
-import time
 from datetime import datetime, timezone
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
 from avd_manager import AvdConfig, AvdConfigError, AvdError, AvdManager
-from checks.anti_emulator import AntiEmulatorCheck
-from checks.anti_frida import AntiFridaCheck
-from checks.anti_hooking import AntiHookingCheck
-from checks.anti_root import AntiRootCheck
-from checks.anti_tampering import AntiTamperingCheck
-from checks.combined import run_combined_bypass, run_combined_observation
-from checks.ssl_pinning import SSLPinningCheck
-from checks.static import build_static_profile
 from device_manager import (
     TOOL_NAME,
     TOOL_VERSION,
     DeviceConnectionError,
-    DeviceManager,
     FridaSetupError,
 )
-from reporter import Reporter, SCHEMA_VERSION
-from script_loader import safe_detach, set_js_runtime
-from instrumentation import XposedManager
+from reporter import Reporter
+from script_loader import set_js_runtime
+from service import KNOWN_CHECKS, ProgressSink, RaspilotService, RunConfig
+from sessions import SessionError, SessionState, SessionStore
 
 # Console rich global — único ponto de saída visual do CLI.
 console = Console()
 
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] %(message)s"
 
-# Checks conhecidos — usado para validar --skip e nomear o relatório.
-KNOWN_CHECKS = (
-    "anti_root", "anti_frida", "anti_tampering", "anti_emulator",
-    "anti_hooking", "ssl_pinning",
-)
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -96,8 +82,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--package",
-        required=True,
-        help="Package name do app alvo (ex: com.example.app)",
+        required=False,
+        help=(
+            "Package name do app alvo (ex: com.example.app). Pode ser "
+            "omitido ao retomar uma sessão com --session."
+        ),
     )
     parser.add_argument(
         "--device-id",
@@ -117,12 +106,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--stage",
-        choices=("full", "static", "detect", "bypass"),
+        choices=("full", "static", "detect", "bypass", "report"),
         default="full",
         help=(
             "Etapa da análise: full=completo (default); static=só perfil "
             "do APK, sem Frida/spawn; detect=só detecção, sem bypass; "
-            "bypass=detecção+bypass"
+            "bypass=detecção+bypass (exige detect na mesma sessão); "
+            "report=regenera JSON/HTML do estado salvo, sem device"
         ),
     )
     parser.add_argument(
@@ -148,6 +138,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--json-only",
         action="store_true",
         help="Gera apenas o JSON (sem HTML), útil para automação/MCP",
+    )
+    parser.add_argument(
+        "--session",
+        default=None,
+        metavar="ID",
+        help=(
+            "Retoma a sessão informada. Sem esta flag, cada execução cria "
+            "uma sessão nova em --state-dir."
+        ),
+    )
+    parser.add_argument(
+        "--state-dir",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Diretório das sessões (default: $RASPILOT_STATE_DIR ou "
+            "~/.raspilot/sessions)"
+        ),
+    )
+    parser.add_argument(
+        "--list-sessions",
+        action="store_true",
+        help="Lista as sessões salvas e sai (não executa auditoria)",
+    )
+    parser.add_argument(
+        "--show-session",
+        default=None,
+        metavar="ID",
+        help="Mostra o estado e os recursos de uma sessão e sai",
     )
     parser.add_argument(
         "--tamper-method",
@@ -318,6 +337,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--proxy-method",
+        choices=("frida", "module", "auto"),
+        default="auto",
+        help=(
+            "Método do probe/bypass de proxy/VPN: frida=agente injetado; "
+            "module=módulo (APK) de hooking no dispositivo; "
+            "auto=usa o módulo quando há framework disponível"
+        ),
+    )
+    parser.add_argument(
         "--module-apk",
         default=None,
         metavar="PATH",
@@ -415,6 +444,25 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if not (
+        args.list_sessions
+        or args.show_session
+        or args.avd_check
+        or args.session
+        or args.package
+    ):
+        parser.error(
+            "--package é obrigatório (exceto com --session, "
+            "--list-sessions, --show-session ou --avd-check)"
+        )
+    if args.stage == "report" and not args.session:
+        parser.error("--stage report exige --session ID")
+    if args.stage == "bypass" and not args.session:
+        parser.error(
+            "--stage bypass exige --session ID: rode --stage detect "
+            "primeiro (ou use --stage full)"
+        )
+
     unknown = [c for c in args.skip if c not in KNOWN_CHECKS]
     if unknown:
         parser.error(
@@ -424,7 +472,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     if (
         args.tamper_method == "repack"
         and not args.tamper_allow_reinstall
-        and args.stage not in ("static", "detect")
+        and args.stage not in ("static", "detect", "report")
         and args.mode != "detect"
         and "anti_tampering" not in args.skip
     ):
@@ -442,46 +490,6 @@ def print_banner() -> None:
         f"[bold cyan]{TOOL_NAME}[/] [dim]v{TOOL_VERSION}[/] "
         "— Piloto Automático de Auditoria RASP para Android"
     )
-
-
-def _run_step(
-    reporter: Reporter,
-    check_name: str,
-    step: Callable[[], dict],
-    skipped: bool = False,
-) -> Optional[dict]:
-    """Executa um passo do pipeline com isolamento de falhas.
-
-    Falha em um check **não aborta** o pipeline: o erro é registrado no
-    relatório como ``ERROR`` e a execução segue.
-
-    Args:
-        reporter: Instância do relatório para ``collect``.
-        check_name: Nome do check no relatório.
-        step: Callable que retorna o resultado do ``run_all()``.
-        skipped: Se True, registra o check como pulado.
-
-    Returns:
-        O resultado do check ou ``None`` se pulado/erro.
-    """
-    logger = logging.getLogger("raspilot")
-    if skipped:
-        logger.info("Check %s pulado (--skip)", check_name)
-        reporter.collect(check_name, {"skipped": True})
-        return None
-
-    with console.status(f"[cyan]Executando {check_name}...[/]"):
-        try:
-            result = step()
-        except Exception as exc:  # isolamento total entre fases
-            logger.warning("Check %s falhou: %s", check_name, exc, exc_info=True)
-            reporter.collect(check_name, {"error": str(exc)})
-            console.print(f"[yellow]![/] {check_name}: [red]ERROR[/] ({exc})")
-            return None
-
-    reporter.collect(check_name, result)
-    console.print(f"[green]✓[/] {check_name} concluído")
-    return result
 
 
 def _format_summary_value(value) -> str:
@@ -606,6 +614,7 @@ def print_execution_log(reporter: Reporter) -> None:
         "success": "red",
         "failed": "red",
         "detected": "yellow",
+        "suspected": "yellow",
         "blocked": "green",
         "resisted": "green",
         "not_detected": "green",
@@ -637,112 +646,6 @@ def print_execution_log(reporter: Reporter) -> None:
 
     console.print()
     console.print(table)
-
-
-def _script_hashes() -> dict:
-    """Calcula o sha256 de cada script de injeção.
-
-    Os scripts JS definem a superfície de ataque efetiva da ferramenta:
-    um resultado só é reproduzível se os hooks aplicados forem os mesmos.
-
-    Returns:
-        Mapa ``nome do arquivo -> sha256``.
-    """
-    import hashlib
-
-    scripts_dir = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "scripts"
-    )
-    hashes: dict = {}
-    try:
-        names = sorted(os.listdir(scripts_dir))
-    except OSError:
-        return hashes
-    for name in names:
-        if not name.endswith(".js"):
-            continue
-        path = os.path.join(scripts_dir, name)
-        try:
-            with open(path, "rb") as fh:
-                hashes[name] = hashlib.sha256(fh.read()).hexdigest()
-        except OSError:
-            continue
-    return hashes
-
-
-def _build_run_context(args: argparse.Namespace, dm: "DeviceManager") -> dict:
-    """Monta os metadados que permitem reproduzir a execução.
-
-    Args:
-        args: Argumentos já parseados.
-        dm: Gerenciador do dispositivo.
-
-    Returns:
-        Dict com os metadados da execução.
-    """
-    try:
-        import frida
-
-        frida_version = frida.__version__
-    except Exception:
-        frida_version = None
-
-    baseline = getattr(dm, "baseline", None)
-    return {
-        "cli_args": {
-            "mode": args.mode,
-            "no_java": bool(args.no_java),
-            "window": args.window,
-            "baseline_window": args.baseline_window,
-            "java_timeout": args.java_timeout,
-            "js_runtime": args.js_runtime,
-            "skip": list(args.skip or []),
-            "device_id": args.device_id,
-            "wifi": args.wifi,
-            "hook_method": getattr(args, "hook_method", "auto"),
-            "emulator_method": getattr(args, "emulator_method", "auto"),
-            "module_apk": getattr(args, "module_apk", None),
-            "static_engine": getattr(args, "static_engine", "auto"),
-            "static_timeout": getattr(args, "static_timeout", 60.0),
-            "tamper_method": getattr(args, "tamper_method", "auto"),
-            "tamper_variants": list(getattr(args, "tamper_variant", None) or []),
-            "tamper_allow_reinstall": bool(
-                getattr(args, "tamper_allow_reinstall", False)
-            ),
-            "tamper_installer": getattr(args, "tamper_installer", None),
-            "tamper_no_restore": bool(
-                getattr(args, "tamper_no_restore", False)
-            ),
-            "tamper_keep_artifacts": bool(
-                getattr(args, "tamper_keep_artifacts", False)
-            ),
-            "tamper_timeout": int(getattr(args, "tamper_timeout", 600)),
-            "tamper_gadget": getattr(args, "tamper_gadget", None),
-            "tamper_gadget_port": int(
-                getattr(args, "tamper_gadget_port", 27043)
-            ),
-            "tamper_gadget_mode": getattr(args, "tamper_gadget_mode", "listen"),
-            "tamper_gadget_script": getattr(args, "tamper_gadget_script", None),
-            "tamper_key": getattr(args, "tamper_key", None),
-            "tamper_key_alias": getattr(args, "tamper_key_alias", "raspilot"),
-            "stage": getattr(args, "stage", "full"),
-            "only": list(getattr(args, "only", None) or []),
-            "apk": getattr(args, "apk", None),
-            "json_only": bool(getattr(args, "json_only", False)),
-            "avd": {
-                "enabled": bool(getattr(args, "avd", False)),
-                "config_path": getattr(args, "avd_config", None),
-                "avd_name": getattr(args, "avd_name", None),
-            },
-        },
-        "frida_client_version": frida_version,
-        "frida_port": getattr(dm, "frida_port", None),
-        "script_sha256": _script_hashes(),
-        "baseline": baseline if isinstance(baseline, dict) else None,
-        "logcat_capture": {
-            "available": bool(getattr(dm, "_logcat_available", False)),
-        },
-    }
 
 
 def _load_avd_config(args: argparse.Namespace) -> AvdConfig:
@@ -797,26 +700,118 @@ def run_avd_check(args: argparse.Namespace) -> int:
     return 1
 
 
-def _activate_avd(args: argparse.Namespace) -> Optional[AvdManager]:
-    """Ativa o ambiente emulado configurado.
+class ConsoleProgress(ProgressSink):
+    """Progresso com ``rich`` — única saída visual do CLI.
 
-    Sobe o AVD, espera o boot completo e devolve o gerenciador (que
-    encerra o emulador no final da auditoria).
-
-    Args:
-        args: Argumentos já parseados.
-
-    Returns:
-        Gerenciador do AVD, ou None se ``--avd`` não foi informado.
+    O serviço é headless; esta classe traduz os eventos de progresso
+    para o terminal sem acoplar o pipeline ao ``rich``.
     """
-    if not args.avd:
-        return None
-    config = _load_avd_config(args)
-    manager = AvdManager(config)
-    with console.status(f"[cyan]Iniciando AVD {config.avd_name}...[/]"):
-        serial = manager.start()
-    console.print(f"[green]✓[/] AVD online: {serial}")
-    return manager
+
+    def __init__(self, rich_console: Console) -> None:
+        self.console = rich_console
+
+    def status(self, message: str):
+        return self.console.status(f"[cyan]{escape(message)}...[/]")
+
+    def info(self, message: str) -> None:
+        self.console.print(escape(message))
+
+    def success(self, message: str) -> None:
+        self.console.print(f"[green]✓[/] {escape(message)}")
+
+    def warning(self, message: str) -> None:
+        self.console.print(f"[yellow]![/] {escape(message)}")
+
+    def check_done(self, check_name: str, result: dict) -> None:
+        self.console.print(f"[green]✓[/] {escape(check_name)} concluído")
+
+    def check_skipped(self, check_name: str, reason: str) -> None:
+        self.console.print(
+            f"[dim]–[/] {escape(check_name)}: {escape(reason)}"
+        )
+
+
+def _open_service(
+    config: RunConfig,
+    args: argparse.Namespace,
+    store: SessionStore,
+) -> RaspilotService:
+    """Cria ou retoma o serviço ligado a uma sessão."""
+    progress = ConsoleProgress(console)
+    if config.session_id:
+        service = RaspilotService.resume(
+            config, store=store, progress=progress
+        )
+    else:
+        service = RaspilotService.create(
+            config, store=store, progress=progress
+        )
+    return service
+
+
+def _print_session(state: Optional[SessionState]) -> None:
+    """Exibe a sessão usada, sem poluir o JSON."""
+    if state is None:
+        return
+    console.print(
+        f"[dim]Sessão:[/] [bold]{state.session_id}[/] "
+        f"[dim]({state.directory})[/]"
+    )
+
+
+def run_list_sessions(args: argparse.Namespace) -> int:
+    """Lista as sessões salvas em ``--state-dir``."""
+    store = SessionStore(getattr(args, "state_dir", None))
+    states = store.list()
+    if not states:
+        console.print("[dim]Nenhuma sessão salva.[/]")
+        return 0
+    table = Table(title="RASPilot — Sessões", header_style="bold")
+    table.add_column("Sessão", style="bold")
+    table.add_column("Pacote")
+    table.add_column("Etapa", justify="center")
+    table.add_column("Status", justify="center")
+    table.add_column("Device")
+    table.add_column("Atualizada")
+    for state in states:
+        table.add_row(
+            state.session_id,
+            state.package,
+            state.stage,
+            state.status,
+            str((state.device or {}).get("serial") or "—"),
+            state.updated_at,
+        )
+    console.print(table)
+    return 0
+
+
+def run_show_session(args: argparse.Namespace) -> int:
+    """Mostra o estado completo e os recursos de uma sessão."""
+    store = SessionStore(getattr(args, "state_dir", None))
+    state = store.load(args.show_session)
+    doc = state.to_dict()
+    doc["resources"] = store.resources(state)
+    print(json.dumps(doc, ensure_ascii=False, indent=2))
+    return 0
+
+
+def run_report_stage(args: argparse.Namespace) -> int:
+    """Regenera JSON/HTML a partir do estado salvo, sem device."""
+    store = SessionStore(getattr(args, "state_dir", None))
+    config = RunConfig.from_args(args)
+    config.stage = "report"
+    service = RaspilotService.resume(
+        config, store=store, progress=ConsoleProgress(console)
+    )
+    result = service.generate_report(write_html=not args.json_only)
+    print_summary_table(result.reporter)
+    print_execution_log(result.reporter)
+    _print_session(service.state)
+    console.print(f"[green]✓[/] Relatório JSON: [bold]{result.json_path}[/]")
+    if result.html_path:
+        console.print(f"[green]✓[/] Relatório HTML: [bold]{result.html_path}[/]")
+    return 0
 
 
 def run_static_stage(args: argparse.Namespace) -> int:
@@ -832,50 +827,22 @@ def run_static_stage(args: argparse.Namespace) -> int:
         0 quando o perfil foi gerado; 1 quando o APK não pôde ser obtido.
     """
     logger = logging.getLogger("raspilot")
-    dm = None
-    info = {}
-    if not args.apk:
-        dm = DeviceManager(
-            device_id=args.device_id,
-            wifi_target=args.wifi,
-            verbose=args.verbose,
-        )
-        dm.connect_adb()
-        info = dm.get_device_info()
-        console.print("[green]✓[/] Dispositivo conectado para obter o APK")
+    store = SessionStore(getattr(args, "state_dir", None))
+    config = RunConfig.from_args(args)
+    service = _open_service(config, args, store)
+    static = service.run_static()
+    profile = static.profile
+    package = service.config.package
 
-    with console.status("[cyan]Analisando o APK (estático)...[/]"):
-        profile = build_static_profile(
-            dm,
-            args.package,
-            apk_path=args.apk,
-            engine=getattr(args, "static_engine", "auto"),
-            timeout=getattr(args, "static_timeout", 60.0),
-        )
-
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     os.makedirs(args.output_dir, exist_ok=True)
-    base = f"{Reporter._slug(args.package)}_{stamp}_static"
+    base = f"{Reporter._slug(package)}_{stamp}_static"
     path = os.path.abspath(os.path.join(args.output_dir, base + ".json"))
-    document = {
-        "metadata": {
-            "schema_version": SCHEMA_VERSION,
-            "tool_name": TOOL_NAME,
-            "tool_version": TOOL_VERSION,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "device": info,
-            "package": args.package,
-            "run": {
-                "stage": "static",
-                "static_engine": getattr(args, "static_engine", "auto"),
-                "static_timeout": getattr(args, "static_timeout", 60.0),
-                "apk": args.apk,
-            },
-        },
-        "static_profile": profile,
-    }
+    # ``static.json`` é sempre o perfil puro: o mesmo formato exposto
+    # como recurso da sessão para o MCP. O invólucro antigo (metadata +
+    # static_profile) foi removido para não haver dois schemas.
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump(document, fh, ensure_ascii=False, indent=2)
+        json.dump(profile, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
 
     summary = profile.get("summary") or {}
@@ -899,6 +866,7 @@ def run_static_stage(args: argparse.Namespace) -> int:
         f"cached={bool(profile.get('cached'))}"
     )
     console.print(f"[green]✓[/] Perfil JSON: [bold]{path}[/]")
+    _print_session(service.state)
     logger.info("Perfil estático salvo em %s", path)
     return 0 if profile.get("available") else 1
 
@@ -906,17 +874,9 @@ def run_static_stage(args: argparse.Namespace) -> int:
 def run_pipeline(args: argparse.Namespace) -> int:
     """Executa o pipeline completo de auditoria RASP.
 
-    Fluxo: conexão ADB → info do dispositivo → frida-server →
-    anti_root → baseline → spawn do app → anti_frida → bypass combinado
-    → anti_hooking → ssl_pinning → anti_tampering → anti_emulador
-    (probe + bypass) → relatórios → tabela final → cleanup.
-
-    O anti-emulador roda por último e com spawns próprios: o probe faz o
-    app enxergar um emulador, o que contaminaria a observação dos demais
-    checks.
-
-    Com ``--avd``, o alvo é o emulador configurado em vez do device
-    físico: ele é iniciado antes da conexão ADB e encerrado no cleanup.
+    Toda a orquestração fica em :class:`service.RaspilotService`; esta
+    função apenas converte a configuração, dispara a execução e imprime
+    o resumo. O ``--stage static`` tem fluxo próprio.
 
     Args:
         args: Argumentos já parseados.
@@ -925,407 +885,26 @@ def run_pipeline(args: argparse.Namespace) -> int:
         Código de saída do processo (0 = sucesso parcial/total; o
         pipeline sempre tenta terminar).
     """
-    logger = logging.getLogger("raspilot")
-
     if getattr(args, "stage", "full") == "static":
         return run_static_stage(args)
 
-    if getattr(args, "stage", "full") == "detect":
-        args.mode = "detect"
-
-    only = [item for item in (getattr(args, "only", None) or []) if item in KNOWN_CHECKS]
-    if only:
-        args.skip = sorted(set(args.skip or []) | (set(KNOWN_CHECKS) - set(only)))
-
-    # 0) Ambiente emulado (opcional): o alvo passa a ser o AVD.
-    avd_manager = None
-    try:
-        avd_manager = _activate_avd(args)
-        if avd_manager is not None:
-            args.device_id = avd_manager.serial
-    except Exception:
-        if avd_manager is not None:
-            avd_manager.stop()
-        raise
-
-    # 1) Conexão ADB (USB ou Wi-Fi).
-    logger.info("Conectando ao dispositivo...")
-    try:
-        dm = DeviceManager(
-            device_id=args.device_id,
-            wifi_target=args.wifi,
-            verbose=args.verbose,
-        )
-        dm.connect_adb()
-    except Exception:
-        # O emulador subiu antes da conexão: sem este cuidado ele
-        # ficaria rodando sem ninguém para encerrá-lo.
-        if avd_manager is not None:
-            avd_manager.stop()
-        raise
-
-    info = dm.get_device_info()
-    console.print("[green]✓[/] Dispositivo conectado:")
-    for key, value in info.items():
-        console.print(f"    [dim]{key}:[/] {value}")
-
-    # 2) Frida server.
-    dm.setup_frida_server()
-    console.print("[green]✓[/] frida-server instalado, iniciado e validado")
-
-    # Captura contínua de logcat: fonte independente de evidência para
-    # correlação de mortes, crashes e mensagens de segurança.
-    if dm.start_logcat_capture():
-        logger.info("Captura de logcat ativa")
-    else:
-        logger.warning("Captura de logcat indisponível (seguindo sem ela)")
-
-    # 3) Relatório.
-    reporter = Reporter(
-        device_info=info,
-        package_name=args.package,
-        output_dir=args.output_dir,
-        run_context=_build_run_context(args, dm),
+    service = _open_service(
+        RunConfig.from_args(args),
+        args,
+        SessionStore(getattr(args, "state_dir", None)),
     )
+    result = service.run_dynamic()
 
-    # 3.1) Perfil estático do APK (uma única vez, compartilhado pelos
-    #      checks). Roda antes de qualquer spawn: não depende do app vivo.
-    static_profile = None
-    if getattr(args, "static_engine", "auto") != "off":
-        with console.status("[cyan]Analisando o APK (estático)...[/]"):
-            try:
-                static_profile = build_static_profile(
-                    dm,
-                    args.package,
-                    apk_path=getattr(args, "apk", None),
-                    engine=getattr(args, "static_engine", "auto"),
-                    timeout=getattr(args, "static_timeout", 60.0),
-                )
-            except Exception as exc:  # o ASC não pode derrubar o pipeline
-                logger.warning("Análise estática falhou", exc_info=True)
-                static_profile = None
-                console.print(
-                    f"[yellow]![/] Estático indisponível: {escape(str(exc))}"
-                )
-        if static_profile and static_profile.get("available"):
-            summary = static_profile.get("summary") or {}
-            present = summary.get("vectors_present") or []
-            engine = summary.get("engine") or "?"
-            console.print(
-                f"[green]✓[/] Estático ({engine}): "
-                f"{len(present)} vetor(es) com indícios"
-                + (f" — {', '.join(present)}" if present else "")
-            )
-            reporter.run_context["static"] = {
-                "available": True,
-                "engine": summary.get("engine"),
-                "version": static_profile.get("version"),
-                "vectors_present": present,
-                "rasp_sdks": summary.get("rasp_sdks") or [],
-                "classes_count": static_profile.get("classes_count"),
-                "cached": bool(static_profile.get("cached")),
-            }
-        elif static_profile:
-            reason = (static_profile.get("summary") or {}).get("error") or "indisponível"
-            console.print(f"[yellow]![/] Estático: {escape(str(reason))}")
-            reporter.run_context["static"] = {
-                "available": False,
-                "engine": static_profile.get("engine"),
-                "error": reason,
-            }
-
-    # Módulo de instrumentação: usado por root, hooking e emulador quando
-    # o método escolhido permite. Criado antes do anti-root para que a
-    # camada de root também possa usar a observação Java precoce.
-    hook_method = getattr(args, "hook_method", "auto")
-    emulator_method = getattr(args, "emulator_method", "auto")
-    xposed = None
-    if hook_method != "frida" or emulator_method != "frida":
-        try:
-            xposed = XposedManager(
-                dm,
-                args.package,
-                apk_path=getattr(args, "module_apk", None),
-            )
-            framework = xposed.detect()
-            reporter.run_context["xposed"] = {
-                "framework": framework.get("name"),
-                "version": framework.get("version"),
-                "available": bool(framework.get("available")),
-                "details": framework.get("details"),
-            }
-            if framework.get("available"):
-                console.print(
-                    f"[green]✓[/] Framework de hooking: "
-                    f"{framework.get('name')} {framework.get('version') or ''}"
-                )
-            else:
-                console.print(
-                    "[yellow]![/] Framework de hooking indisponível "
-                    f"({framework.get('details')}) — usando Frida"
-                )
-        except Exception as exc:
-            logger.warning("Módulo de instrumentação indisponível", exc_info=True)
-            xposed = None
-
-    session = None
-    pid = None
-    try:
-        # 4) Anti-Root (não requer app rodando).
-        _run_step(
-            reporter,
-            "anti_root",
-            lambda: AntiRootCheck(
-                dm,
-                mode=args.mode,
-                no_java=args.no_java,
-                xposed=xposed,
-            ).run_all(
-                static_profile=static_profile,
-                package_name=args.package,
-                window=args.window,
-            ),
-            skipped="anti_root" in args.skip,
-        )
-
-        # 5) Baseline sem instrumentação (antes de qualquer spawn Frida):
-        #    estabelece se o app já morre sozinho, evitando classificar
-        #    crash/lifecycle normal como reação do RASP.
-        dynamic = any(
-            check not in args.skip
-            for check in (
-                "anti_frida", "anti_hooking", "ssl_pinning", "anti_emulator",
-            )
-        )
-        if dynamic and not args.no_baseline:
-            with console.status("[cyan]Executando baseline sem instrumentação...[/]"):
-                dm.baseline = dm.run_app_baseline(
-                    args.package, window=max(1, args.baseline_window)
-                )
-            if dm.baseline.get("available"):
-                console.print(
-                    f"[green]✓[/] Baseline: pid={dm.baseline.get('pid')} "
-                    f"vivo={dm.baseline.get('alive_at_end')} "
-                    f"morte={dm.baseline.get('death_cause', {}).get('summary') if dm.baseline.get('death_cause') else 'não'}"
-                )
-            else:
-                console.print(
-                    "[yellow]![/] Baseline indisponível "
-                    f"({dm.baseline.get('reason', 'sem pid')})"
-                )
-
-        # 7) Spawn único para observação combinada (anti-Frida + anti-hooking).
-        #    Spawn SUSPENSO: os hooks nativos são instalados antes do
-        #    código do app rodar; o resume acontece após essa instalação.
-        frida_logcat_mark = dm.logcat_mark()
-        frida_detection = None
-        hook_detection = None
-
-        need_combined = any(
-            check not in args.skip for check in ("anti_frida", "anti_hooking")
-        )
-        if need_combined:
-            with console.status(f"[cyan]Spawning {args.package}...[/]"):
-                session = dm.spawn_app(args.package, resume=False)
-            pid = dm.get_app_pid(args.package)
-            console.print(f"[green]✓[/] App spawnado suspenso (pid={pid})")
-            reporter.run_context["target_pid"] = pid
-            if pid is not None:
-                with console.status("[cyan]Observando camadas em sessão única...[/]"):
-                    frida_detection, hook_detection = run_combined_observation(
-                        dm,
-                        session,
-                        pid,
-                        args.package,
-                        args.window,
-                        frida_logcat_mark,
-                        dm.resume_app,
-                        mode=args.mode,
-                        no_java=args.no_java,
-                        java_timeout=args.java_timeout,
-                    )
-
-        # 8) Anti-Frida (usa a detecção combinada; vetores de dispositivo
-        #    rodam em seguida, com o app já retomado).
-        if "anti_frida" not in args.skip:
-            if pid is not None and frida_detection is not None:
-                _run_step(
-                    reporter,
-                    "anti_frida",
-                    lambda: AntiFridaCheck(
-                        dm, mode=args.mode, no_java=args.no_java
-                    ).run_all(
-                        session, pid,
-                        window=args.window,
-                        package_name=args.package,
-                        logcat_mark=frida_logcat_mark,
-                        app_detection=frida_detection,
-                        static_profile=static_profile,
-                    ),
-                )
-            else:
-                reporter.collect("anti_frida", {"error": "app não pôde ser spawnado"})
-                console.print("[yellow]![/] anti_frida: [red]ERROR[/] (app não spawnado)")
-
-        # 9) Bypass combinado (anti-hooking + SSL) em um único spawn.
-        hooking_bypass = None
-        ssl_bypass = None
-        if (
-            "anti_hooking" not in args.skip
-            and "ssl_pinning" not in args.skip
-            and args.mode != "detect"
-            and not args.no_java
-            and hook_method == "frida"
-        ):
-            with console.status("[cyan]Executando bypass combinado...[/]"):
-                hooking_bypass, ssl_bypass = run_combined_bypass(
-                    dm, args.package, args.window,
-                    mode=args.mode, no_java=args.no_java,
-                    java_timeout=args.java_timeout,
-                )
-
-        # 10) Anti-Hooking (usa detecção e bypass combinados quando houver).
-        _run_step(
-            reporter,
-            "anti_hooking",
-            lambda: AntiHookingCheck(
-                dm, mode=args.mode, no_java=args.no_java,
-                method=hook_method, xposed=xposed,
-            ).run_all(
-                args.package,
-                window=args.window,
-                apk_path=getattr(args, "apk", None),
-                precomputed_detection=hook_detection,
-                precomputed_bypass=hooking_bypass,
-                static_profile=static_profile,
-            ),
-            skipped="anti_hooking" in args.skip,
-        )
-
-        # 11) SSL Pinning (usa bypass combinado quando houver).
-        _run_step(
-            reporter,
-            "ssl_pinning",
-            lambda: SSLPinningCheck(
-                dm, mode=args.mode, no_java=args.no_java,
-                java_timeout=args.java_timeout,
-            ).run_all(
-                args.package, window=args.window,
-                apk_path=getattr(args, "apk", None),
-                precomputed_bypass=ssl_bypass,
-                static_profile=static_profile,
-            ),
-            skipped="ssl_pinning" in args.skip,
-        )
-
-        # 11.5) Anti-Tampering (estático + sonda em memória).
-        _run_step(
-            reporter,
-            "anti_tampering",
-            lambda: AntiTamperingCheck(
-                dm,
-                mode=args.mode,
-                no_java=args.no_java,
-                method=getattr(args, "tamper_method", "auto"),
-                xposed=xposed,
-                repack_variants=(
-                    getattr(args, "tamper_variant", None) or ("asset", "dex")
-                ),
-                allow_reinstall=bool(
-                    getattr(args, "tamper_allow_reinstall", False)
-                ),
-                installer=getattr(args, "tamper_installer", None),
-                restore=not bool(getattr(args, "tamper_no_restore", False)),
-                keep_artifacts=bool(
-                    getattr(args, "tamper_keep_artifacts", False)
-                ),
-                output_dir=args.output_dir,
-                repack_timeout=int(getattr(args, "tamper_timeout", 600)),
-                gadget_path=getattr(args, "tamper_gadget", None),
-                gadget_port=int(getattr(args, "tamper_gadget_port", 27043)),
-                gadget_mode=getattr(args, "tamper_gadget_mode", "listen"),
-                gadget_script=getattr(args, "tamper_gadget_script", None),
-                key_path=getattr(args, "tamper_key", None),
-                key_alias=getattr(args, "tamper_key_alias", "raspilot"),
-                key_pass=getattr(args, "tamper_key_pass", "android"),
-                store_pass=getattr(args, "tamper_store_pass", "android"),
-            ).run_all(
-                static_profile=static_profile,
-                package_name=args.package,
-                window=args.window,
-                apk_path=getattr(args, "apk", None),
-            ),
-            skipped="anti_tampering" in args.skip,
-        )
-
-        # 12) Anti-Emulador (detecção + bypass).
-        #
-        # Roda por último e com spawns próprios: o probe faz o app
-        # enxergar um emulador, e o bypass oculta os artefatos decisivos.
-        # Um spawn compartilhado com a observação combinada contaminaria
-        # os outros checks — o app reagiria ao ambiente emulado, não à
-        # instrumentação.
-        _run_step(
-            reporter,
-            "anti_emulator",
-            lambda: AntiEmulatorCheck(
-                dm, mode=args.mode, no_java=args.no_java,
-                java_timeout=args.java_timeout,
-                method=emulator_method, xposed=xposed,
-            ).run_all(
-                args.package,
-                window=args.window,
-                apk_path=getattr(args, "apk", None),
-                static_profile=static_profile,
-            ),
-            skipped="anti_emulator" in args.skip,
-        )
-    finally:
-        # 13) Cleanup — nunca deixar resíduos no dispositivo.
-        try:
-            dm.stop_logcat_capture()
-        except Exception:
-            logger.debug("Falha ao encerrar captura de logcat", exc_info=True)
-        try:
-            dm.resume_app()  # idempotente: destrava spawn suspenso, se houver
-            safe_detach(session)
-        except Exception:
-            logger.debug("Falha ao detach da sessão final", exc_info=True)
-        if xposed is not None:
-            try:
-                for action in xposed.finish():
-                    logger.info(
-                        "Cleanup do módulo (%s): ok=%s %s",
-                        action.get("step"), action.get("ok"), action.get("detail"),
-                    )
-            except Exception:
-                logger.warning("Falha no cleanup do módulo", exc_info=True)
-        try:
-            dm.remove_frida_server()
-            dm.run_shell(f"am force-stop {args.package}", timeout=10)
-            # Alguns apps reiniciam um processo logo após o force-stop;
-            # uma segunda passada garante o encerramento.
-            time.sleep(1)
-            dm.run_shell(f"am force-stop {args.package}", timeout=10)
-        except Exception:
-            logger.warning("Falha no cleanup final do dispositivo", exc_info=True)
-        if avd_manager is not None:
-            # O emulador que esta execução subiu é encerrado aqui; um
-            # AVD que já estava rodando antes é preservado.
-            try:
-                avd_manager.stop()
-            except Exception:
-                logger.warning("Falha ao encerrar o AVD", exc_info=True)
-
-    # 14) Relatórios.
-    json_path, html_path = reporter.save(
-        write_html=not getattr(args, "json_only", False)
+    print_summary_table(result.reporter)
+    print_execution_log(result.reporter)
+    _print_session(service.state)
+    console.print(
+        f"\n[green]✓[/] Relatório JSON: [bold]{result.json_path}[/]"
     )
-    print_summary_table(reporter)
-    print_execution_log(reporter)
-    console.print(f"\n[green]✓[/] Relatório JSON: [bold]{json_path}[/]")
-    if html_path:
-        console.print(f"[green]✓[/] Relatório HTML: [bold]{html_path}[/]")
+    if result.html_path:
+        console.print(
+            f"[green]✓[/] Relatório HTML: [bold]{result.html_path}[/]"
+        )
     return 0
 
 
@@ -1340,7 +919,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     """
     args = parse_args(argv)
     setup_logging(verbose=args.verbose)
-    print_banner()
+    if not (args.list_sessions or args.show_session):
+        print_banner()
 
     logger = logging.getLogger("raspilot")
     logger.debug("Args: %s", args)
@@ -1359,10 +939,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         if args.avd_check:
             return run_avd_check(args)
+        if args.list_sessions:
+            return run_list_sessions(args)
+        if args.show_session:
+            return run_show_session(args)
+        if args.stage == "report":
+            return run_report_stage(args)
         return run_pipeline(args)
     except (DeviceConnectionError, FridaSetupError) as exc:
         console.print(f"[bold red]✗ Erro:[/] {exc}")
         logger.debug("Detalhes do erro:", exc_info=True)
+        return 1
+    except SessionError as exc:
+        console.print(f"[bold red]✗ Sessão:[/] {exc}")
+        logger.debug("Detalhes do erro de sessão:", exc_info=True)
         return 1
     except (AvdConfigError, AvdError) as exc:
         console.print(f"[bold red]✗ Ambiente emulado:[/] {exc}")

@@ -26,12 +26,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+import paths
+
 logger = logging.getLogger("raspilot.avd")
 
 # Caminho padrão da configuração do ambiente emulado.
-DEFAULT_CONFIG_PATH = os.path.join(
-    os.path.expanduser("~"), ".raspilot", "avd.json"
-)
+DEFAULT_CONFIG_PATH = str(paths.avd_config_path())
 
 # Variável de ambiente que aponta para outra configuração.
 CONFIG_ENV_VAR = "RASPILOT_AVD_CONFIG"
@@ -86,7 +86,7 @@ class AvdConfig:
         Returns:
             Caminho absoluto do arquivo de configuração.
         """
-        return os.environ.get(CONFIG_ENV_VAR) or DEFAULT_CONFIG_PATH
+        return os.environ.get(CONFIG_ENV_VAR) or str(paths.avd_config_path())
 
     @classmethod
     def load(cls, path: Optional[str] = None) -> "AvdConfig":

@@ -1,8 +1,8 @@
 # Módulo de instrumentação
 
 Módulo compatível com a API Xposed (`IXposedHookLoadPackage`) usado pelo
-RASPilot para medir as proteções anti-hook, anti-root, anti-tampering e
-anti-emulador
+RASPilot para medir as proteções anti-hook, anti-root, anti-tampering,
+anti-emulador e proxy/VPN
 **sem** instrumentação externa: o app é executado com o framework de
 hooking do próprio dispositivo, que é o ambiente que a proteção de fato
 fiscaliza.
@@ -28,6 +28,7 @@ instrumentation/
         ├── RootShield.java       # Camada de detecção de root
         ├── TamperShield.java     # Camada de integridade/assinatura
         ├── EmulatorShield.java   # Camada de emulador
+        ├── ProxyShield.java      # Camada de proxy/VPN
         ├── Evidence.java         # Emissor de evidência (logcat)
         ├── SilentProcess.java    # Processo sem efeito
         └── SilentOutputStream.java
@@ -68,12 +69,13 @@ Sem o toolchain o RASPilot continua funcionando: os checks usam o método
 export ANDROID_HOME="$HOME/Android"
 export JAVA_HOME="$ANDROID_HOME/jdk"
 
-./instrumentation/build.sh --hook bypass --root bypass --tamper bypass --emu off --target com.example.app --label bypass
+./instrumentation/build.sh --hook bypass --root bypass --tamper bypass --emu off --proxy bypass --target com.example.app --label bypass
 ```
 
 Opções: `--hook off|observe|bypass`, `--root off|observe|bypass`,
 `--tamper off|observe|bypass`, `--emu off|observe|probe|mask`,
-`--target PACOTE`, `--label NOME`, `--out CAMINHO_APK`.
+`--proxy off|observe|probe|bypass`, `--target PACOTE`, `--label NOME`,
+`--out CAMINHO_APK`.
 
 `RootShield` é compilado em **todas** as builds; `--root` define apenas o
 modo padrão embutido. O RASPilot usa a configuração em runtime
@@ -96,7 +98,7 @@ não são empacotadas no APK.
 O modo da fase é lido de uma propriedade do sistema:
 
 ```
-persist.raspilot.module.config = hook=<modo>;root=<modo>;tamper=<modo>;emu=<modo>;target=<pacote>;label=<rótulo>
+persist.raspilot.module.config = hook=<modo>;root=<modo>;tamper=<modo>;emu=<modo>;proxy=<modo>;target=<pacote>;label=<rótulo>
 ```
 
 Ela é lida no início do processo, o que permite trocar de fase sem
@@ -136,6 +138,11 @@ no bypass, devolvidas vazias (stream de `/dev/null`).
 
 A camada de emulador atua sobre `Build`, `SystemProperties.get`,
 `TelephonyManager`, `Settings.Secure` e `File.exists`.
+
+A camada de proxy/VPN atua sobre `System.getProperty`, `ProxySelector`,
+`android.net.Proxy`, `LinkProperties`, `NetworkCapabilities.hasTransport`,
+`Settings.Global/Secure`, `NetworkInterface` e `VpnService.prepare`. No
+modo probe o app enxerga proxy/VPN; no bypass os canais são ocultados.
 
 A camada de root observa/neutraliza `File.exists` (e variantes),
 `Runtime.exec`/`ProcessBuilder.start` com `su`/Magisk/busybox,

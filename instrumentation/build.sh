@@ -6,6 +6,7 @@
 #
 # Uso:
 #   ./build.sh [--hook off|observe|bypass] [--emu off|observe|probe|mask]
+#              [--proxy off|observe|probe|bypass]
 #              [--target PACOTE] [--label NOME] [--out CAMINHO_APK]
 #              [--hook-targets ARQUIVO_JSON]
 #
@@ -21,6 +22,7 @@ HOOK_MODE="off"
 ROOT_MODE="off"
 TAMPER_MODE="off"
 EMU_MODE="off"
+PROXY_MODE="off"
 TARGET=""
 LABEL="build"
 OUT="${SCRIPT_DIR}/build/raspilot-module.apk"
@@ -32,6 +34,7 @@ while [[ $# -gt 0 ]]; do
     --root)   ROOT_MODE="$2"; shift 2 ;;
     --tamper) TAMPER_MODE="$2"; shift 2 ;;
     --emu)    EMU_MODE="$2"; shift 2 ;;
+    --proxy)  PROXY_MODE="$2"; shift 2 ;;
     --target) TARGET="$2"; shift 2 ;;
     --label)  LABEL="$2"; shift 2 ;;
     --out)    OUT="$2"; shift 2 ;;
@@ -136,6 +139,7 @@ public final class RaspilotBaked {
     public static final String ROOT_MODE = "$(java_string "${ROOT_MODE}")";
     public static final String TAMPER_MODE = "$(java_string "${TAMPER_MODE}")";
     public static final String EMULATOR_MODE = "$(java_string "${EMU_MODE}")";
+    public static final String PROXY_MODE = "$(java_string "${PROXY_MODE}")";
     public static final String TARGET_PACKAGE = "$(java_string "${TARGET}")";
     public static final String LABEL = "$(java_string "${LABEL}")";
 

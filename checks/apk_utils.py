@@ -20,6 +20,8 @@ import re
 import zipfile
 from typing import Dict, List, Tuple
 
+import paths
+
 logger = logging.getLogger("raspilot.checks.apk_utils")
 
 # Forma das assinaturas: (tipo, [(needle_bytes, descrição), ...]).
@@ -63,9 +65,7 @@ def _apk_cache_dir(package_name: str, remotes: List[str]) -> str:
     Returns:
         Caminho absoluto do diretório de cache.
     """
-    root = os.environ.get("RASPILOT_CACHE_DIR") or os.path.join(
-        os.path.expanduser("~"), ".raspilot", "cache", "apk"
-    )
+    root = str(paths.cache_dir("apk"))
     digest = hashlib.sha1(
         (package_name + "\n" + "\n".join(remotes)).encode("utf-8", errors="ignore")
     ).hexdigest()[:16]

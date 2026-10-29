@@ -93,7 +93,8 @@ def test_config_serializa_propriedade():
         hook="bypass", emulator="probe", target="com.example.app", label="fase"
     )
     assert config.as_property() == (
-        "hook=bypass;root=off;tamper=off;emu=probe;target=com.example.app;label=fase"
+        "hook=bypass;root=off;tamper=off;emu=probe;proxy=off;"
+        "target=com.example.app;label=fase"
     )
 
 
@@ -110,7 +111,16 @@ def test_config_argumentos_de_build():
     config = ModuleConfig(hook="observe", emulator="off", target="a.b", label="x")
     args = config.as_build_args()
     assert args[:2] == ["--hook", "observe"]
+    assert "--proxy" in args
     assert "a.b" in args and "x" in args
+
+
+def test_config_camada_proxy():
+    """A camada de proxy/VPN também é configurável por fase."""
+    config = ModuleConfig(proxy="bypass", target="com.example.app")
+    assert "proxy=bypass" in config.as_property()
+    assert "--proxy" in config.as_build_args()
+    assert "bypass" in config.as_build_args()
 
 
 def test_config_fingerprint_estavel():
@@ -365,7 +375,8 @@ def test_apply_runtime_config_confirma_propriedade():
     dm = FakeDM({
         "setprop": "",
         "getprop persist.raspilot.module.config":
-            "hook=bypass;root=off;tamper=off;emu=off;target=com.example.app;label=x",
+            "hook=bypass;root=off;tamper=off;emu=off;proxy=off;"
+            "target=com.example.app;label=x",
     })
     manager = XposedManager(dm, "com.example.app")
     config = ModuleConfig(hook="bypass", emulator="off", target="com.example.app",

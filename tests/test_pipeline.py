@@ -14,6 +14,8 @@ import pytest
 import checks.anti_emulator as anti_emulator_mod
 import checks.anti_frida as anti_frida_mod
 import checks.anti_hooking as anti_hooking_mod
+import checks.anti_proxy as anti_proxy_mod
+import checks.anti_tampering as anti_tampering_mod
 import checks.combined as combined_mod
 import checks.ssl_pinning as ssl_pinning_mod
 import main as mainmod
@@ -37,6 +39,22 @@ SHELL = {
     "dumpsys sensorservice": "  - a\n  - b\n  - c\n",
     "settings get secure bluetooth_address": "a4:cf:12:00:00:01",
     "&& echo alive": "alive",
+}
+
+
+PROXY_RESULT = {
+    "protection_detected": False,
+    "proxy_detected": False,
+    "vpn_detected": False,
+    "bypass_successful": None,
+    "static_detection": {
+        "static_detected": False,
+        "types": [],
+        "evidence": [],
+    },
+    "app_detection": {"detected": False},
+    "status_hint": "FALHOU",
+    "verdict_reason": "nenhuma checagem de proxy/VPN observada",
 }
 
 
@@ -99,8 +117,14 @@ def fast_windows():
     with mock.patch.object(anti_frida_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
          mock.patch.object(anti_hooking_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
          mock.patch.object(anti_emulator_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
+         mock.patch.object(anti_tampering_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
+         mock.patch.object(anti_proxy_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
          mock.patch.object(ssl_pinning_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
-         mock.patch.object(combined_mod, "OBSERVATION_POLL_INTERVAL", 0.0):
+         mock.patch.object(combined_mod, "OBSERVATION_POLL_INTERVAL", 0.0), \
+         mock.patch.object(
+             anti_proxy_mod.AntiProxyCheck, "run_all",
+             return_value=PROXY_RESULT,
+         ):
         yield
 
 
@@ -169,12 +193,28 @@ def test_pipeline_end_to_end(tmp_path, fast_windows, runtime_mocks, capsys):
     # o check não encontra proteção anti-emulador.
     assert doc["summary"]["anti_emulator"]["status"] == "FALHOU"
     assert doc["summary"]["anti_hooking"]["status"] == "FALHOU"
+    assert doc["summary"]["anti_proxy"]["status"] == "FALHOU"
 
     html = htmls[0].read_text(encoding="utf-8")
     assert "RASPilot" in html
 
     out = capsys.readouterr().out
     assert "RASPilot — Relatório de Auditoria RASP" in out
+
+    # A execução cria uma sessão retomável com os artefatos estáveis.
+    from sessions import SessionStore
+
+    states = SessionStore().list()
+    assert len(states) == 1
+    state = states[0]
+    assert state.stage == "full"
+    assert state.status == "succeeded"
+    assert state.device["serial"] == "SER1"
+    session_dir = tmp_path / "raspilot_home" / "sessions" / state.session_id
+    assert (session_dir / "report.json").is_file()
+    assert (session_dir / "summary.json").is_file()
+    assert (session_dir / "report.html").is_file()
+    assert (session_dir / "checks" / "anti_root.json").is_file()
 
 
 def test_pipeline_skip_marks_skip(tmp_path, fast_windows, runtime_mocks):

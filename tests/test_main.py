@@ -7,6 +7,7 @@ import json
 import pytest
 
 import main as mainmod
+import service
 
 
 class TestParseArgs:
@@ -43,6 +44,7 @@ class TestParseArgs:
         args = mainmod.parse_args(["--package", "com.example.app"])
         assert args.hook_method == "auto"
         assert args.emulator_method == "auto"
+        assert args.proxy_method == "auto"
         assert args.module_apk is None
 
     def test_module_flags_are_accepted(self, tmp_path):
@@ -53,10 +55,12 @@ class TestParseArgs:
             "--package", "com.example.app",
             "--hook-method", "module",
             "--emulator-method", "frida",
+            "--proxy-method", "frida",
             "--module-apk", str(apk),
         ])
         assert args.hook_method == "module"
         assert args.emulator_method == "frida"
+        assert args.proxy_method == "frida"
         assert args.module_apk == str(apk)
 
     def test_unknown_method_exits(self):
@@ -81,7 +85,7 @@ class TestParseArgs:
         """A lista de checks conhecidos cobre as verificações."""
         assert set(mainmod.KNOWN_CHECKS) == {
             "anti_root", "anti_frida", "anti_tampering",
-            "anti_emulator", "anti_hooking", "ssl_pinning",
+            "anti_emulator", "anti_hooking", "anti_proxy", "ssl_pinning",
         }
 
     def test_avd_flags_are_optional(self):
@@ -171,6 +175,41 @@ class TestStagedFlags:
         assert args.apk == str(apk)
         assert args.json_only is True
 
+    def test_session_flags(self):
+        """--session dispensa --package e habilita retomada."""
+        args = mainmod.parse_args([
+            "--session", "20260101_000000_com.example_abc",
+            "--stage", "bypass",
+            "--state-dir", "/tmp/state",
+        ])
+        assert args.session == "20260101_000000_com.example_abc"
+        assert args.stage == "bypass"
+        assert args.state_dir == "/tmp/state"
+        assert args.package is None
+
+    def test_report_stage_requires_session(self):
+        with pytest.raises(SystemExit) as exc:
+            mainmod.parse_args([
+                "--package", "com.example.app",
+                "--stage", "report",
+            ])
+        assert exc.value.code == 2
+
+    def test_bypass_without_session_exits(self):
+        """Bypass não pode rodar sem um detect prévio na mesma sessão."""
+        with pytest.raises(SystemExit) as exc:
+            mainmod.parse_args([
+                "--package", "com.example.app",
+                "--stage", "bypass",
+            ])
+        assert exc.value.code == 2
+
+    def test_list_and_show_sessions_do_not_require_package(self):
+        args = mainmod.parse_args(["--list-sessions"])
+        assert args.list_sessions is True
+        args = mainmod.parse_args(["--show-session", "abc"])
+        assert args.show_session == "abc"
+
     def test_static_stage_runs_without_device(self, tmp_path, monkeypatch):
         profile = {
             "available": True,
@@ -188,7 +227,7 @@ class TestStagedFlags:
             },
         }
         monkeypatch.setattr(
-            mainmod, "build_static_profile", lambda *a, **k: profile
+            service, "build_static_profile", lambda *a, **k: profile
         )
         args = mainmod.parse_args([
             "--package", "com.example.app",
@@ -201,8 +240,10 @@ class TestStagedFlags:
         files = list(tmp_path.glob("*_static.json"))
         assert len(files) == 1
         doc = json.loads(files[0].read_text(encoding="utf-8"))
-        assert doc["metadata"]["run"]["stage"] == "static"
-        assert doc["static_profile"]["engine"] == "builtin"
+        # Formato único: o arquivo estático é o perfil puro (o mesmo
+        # recurso exposto pela sessão/MCP), sem invólucro de relatório.
+        assert doc["engine"] == "builtin"
+        assert doc["available"] is True
 
 
 class TestRepackFlags:

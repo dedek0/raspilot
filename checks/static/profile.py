@@ -23,6 +23,7 @@ import zipfile
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 
+import paths
 from checks.apk_utils import pull_apk, scan_apk
 from checks.static.engine import AscEngine, apk_digest, asc_available
 from checks.taxonomy import is_app_evidence, marker_owner, owner_counts
@@ -68,6 +69,12 @@ _KNOWN_MARKERS: Tuple[Tuple[str, str, str], ...] = (
     ("emulator", "goldfish", "goldfish"),
     ("emulator", "ranchu", "ranchu"),
     ("frida", "frida", "Frida"),
+    ("proxy", "ProxyDetector", "detector de proxy"),
+    ("proxy", "ProxyCheck", "checagem de proxy"),
+    ("proxy", "AntiProxy", "anti-proxy"),
+    ("proxy", "VpnDetector", "detector de VPN"),
+    ("proxy", "VpnCheck", "checagem de VPN"),
+    ("proxy", "VpnService", "referência a VpnService"),
 )
 
 _PROFILE_MEMO: Dict[tuple, dict] = {}
@@ -156,6 +163,7 @@ def _builtin_signatures() -> List[tuple]:
     try:
         from checks.anti_hooking import STATIC_SIGNATURES as hook_signatures
         from checks.anti_emulator import STATIC_SIGNATURES as emulator_signatures
+        from checks.anti_proxy import STATIC_SIGNATURES as proxy_signatures
         from checks.ssl_pinning import STATIC_SIGNATURES as ssl_signatures
     except Exception:  # pragma: no cover - proteção contra import circular
         logger.debug("Não foi possível importar todas as assinaturas", exc_info=True)
@@ -190,6 +198,16 @@ def _builtin_signatures() -> List[tuple]:
         signatures.append(
             (
                 "pinning",
+                [
+                    (needle, f"{signature_type}: {description}")
+                    for needle, description in needles
+                ],
+            )
+        )
+    for signature_type, needles in proxy_signatures:
+        signatures.append(
+            (
+                "proxy",
                 [
                     (needle, f"{signature_type}: {description}")
                     for needle, description in needles
@@ -251,6 +269,21 @@ def _builtin_confidence(vector: str, description: str) -> str:
             return "medium"
         # okhttp3/CertificatePinner, Flutter e Conscrypt podem estar
         # empacotados sem que o app faça pinning.
+        return "low"
+    if vector == "proxy":
+        if any(token in text for token in (
+            "http.proxyhost", "https.proxyhost", "socksproxyhost",
+            "gethttpproxy", "getdefaultproxy", "proxyinfo",
+            "transport_vpn", "vpnservice", "http_proxy", "https_proxy",
+            "proxydetector", "vpndetector", "proxycheck", "vpncheck",
+            "antiproxy",
+        )):
+            return "high"
+        if any(token in text for token in (
+            "proxyselector", "networkinterface", "getnetworkinterfaces",
+            "connectivitymanager", "getlinkproperties",
+        )):
+            return "medium"
         return "low"
     return "medium"
 
@@ -669,12 +702,7 @@ def _coverage(vectors: Dict[str, dict], engine: str) -> Dict[str, dict]:
 
 def _profile_cache_path(digest: str, engine: str, version: Optional[str], vectors: List[str]) -> str:
     """Caminho do cache em disco para um perfil."""
-    root = os.environ.get("RASPILOT_STATIC_CACHE_DIR")
-    if not root:
-        base = os.environ.get("RASPILOT_CACHE_DIR")
-        root = os.path.join(base, "static") if base else os.path.join(
-            os.path.expanduser("~"), ".raspilot", "cache", "static"
-        )
+    root = str(paths.static_cache_dir())
     key = "-".join(
         [
             "profile",
@@ -836,9 +864,19 @@ def build_static_profile(
 
         profile = {
             "available": True,
+            "profile_version": PROFILE_VERSION,
             "engine": effective_engine,
             "version": version,
             "package": package_name,
+            "apk": {
+                "sha256": digest,
+                "paths": [os.path.abspath(path) for path in apks],
+                "names": [os.path.basename(path) for path in apks],
+                "size_bytes": sum(
+                    os.path.getsize(path) for path in apks
+                    if os.path.isfile(path)
+                ),
+            },
             "vectors": vectors_summary,
             "coverage": coverage,
             "manifest": asc_data.get("manifest") or {"available": False},

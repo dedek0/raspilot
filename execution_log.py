@@ -67,6 +67,7 @@ BYPASS_ACTIONS = {
     "anti_frida": "Tentar sobreviver à instrumentação com evasão anti-Frida",
     "anti_hooking": "Tentar neutralizar as checagens anti-hook do app",
     "anti_emulator": "Tentar ocultar os artefatos decisivos de emulador",
+    "anti_proxy": "Tentar ocultar proxy/VPN do app",
     "ssl_pinning": "Tentar contornar o SSL pinning e interceptar conexões",
 }
 
@@ -76,6 +77,7 @@ STATIC_ACTIONS = {
     "anti_frida": "Analisar o APK por assinaturas anti-Frida",
     "anti_hooking": "Analisar o APK por assinaturas anti-hook",
     "anti_emulator": "Analisar o APK por assinaturas anti-emulador",
+    "anti_proxy": "Analisar o APK por APIs de proxy/VPN",
     "ssl_pinning": "Analisar o APK por assinaturas de SSL pinning",
 }
 
@@ -85,6 +87,7 @@ DYNAMIC_ACTIONS = {
     "anti_frida": "Observar a detecção de Frida pelo app durante a janela",
     "anti_hooking": "Observar as checagens anti-hook do app durante a janela",
     "anti_emulator": "Fazer o app enxergar um emulador e observar a reação",
+    "anti_proxy": "Fazer o app enxergar proxy/VPN e observar a reação",
 }
 
 STATUS_OUTCOMES = {
@@ -241,8 +244,18 @@ def _static_entry(trace: List[dict], check_name: str, detection: Any) -> None:
     detected = bool(
         detection.get("static_detected") or detection.get("pinning_detected")
     )
+    suspected = bool(
+        detection.get("asc_weak_only")
+        or detection.get("pinning_suspected")
+    )
     outcome = "detected" if detected else "not_detected"
+    if suspected and not detected:
+        # Indício fraco (ex.: biblioteca de pinning sem uso comprovado)
+        # não é detecção. A trilha precisa dizer isso, e não "nada".
+        outcome = "suspected"
     details = detection.get("details") or ""
+    if suspected and not detected and not details:
+        details = "há indícios fracos, mas a proteção não foi confirmada"
     if detection.get("available") is False and not detected:
         outcome = "skipped"
         details = details or "análise estática não executada"
@@ -252,13 +265,16 @@ def _static_entry(trace: List[dict], check_name: str, detection: Any) -> None:
         principal = detection.get("primary") or detection.get("type")
         if principal:
             details = f"principal={principal}; {details}".strip("; ")
+    evidence = detection.get("evidence")
+    if not evidence and suspected:
+        evidence = detection.get("asc_weak_evidence")
     trace.append(
         _entry(
             "static",
             STATIC_ACTIONS.get(check_name, "Analisar o APK"),
             outcome,
             details,
-            detection.get("evidence"),
+            evidence,
         )
     )
 
@@ -418,7 +434,9 @@ def _bypass_entry(trace: List[dict], check_name: str, result: dict) -> None:
     # bruto da camada de bypass.
     reported_bypass = result.get("bypass_successful")
     if reported_bypass is None and reason:
-        outcome = "inconclusive"
+        # "Bloqueado" é a evidência mais forte quando o app encerra
+        # durante o probe; não rebaixe para inconclusivo.
+        outcome = "blocked" if details.get("blocked") else "inconclusive"
     elif reported_bypass is True:
         outcome = "success"
     elif reported_bypass is False:
@@ -502,6 +520,14 @@ def _verdict_text(check_name: str, result: dict) -> str:
             f"bypass_successful={result.get('bypass_successful')}; "
             f"método={result.get('bypass_method') or 'n/a'}"
         )
+    if check_name == "anti_proxy":
+        return (
+            f"protection_detected={bool(result.get('protection_detected'))}; "
+            f"proxy={bool(result.get('proxy_detected'))}; "
+            f"vpn={bool(result.get('vpn_detected'))}; "
+            f"bypass_successful={result.get('bypass_successful')}; "
+            f"método={result.get('bypass_method') or result.get('probe_method') or 'n/a'}"
+        )
     if check_name == "anti_frida":
         app_detection = result.get("app_detection") or {}
         return (
@@ -525,11 +551,19 @@ def _verdict_text(check_name: str, result: dict) -> str:
             f"bypass={result.get('bypass_method') or 'n/a'}"
         )
     if check_name == "ssl_pinning":
-        return (
+        text = (
             f"pinning_detected={bool(result.get('pinning_detected'))}; "
             f"tipo={result.get('pinning_type') or 'n/a'}; "
             f"bypass_successful={result.get('bypass_successful')}"
         )
+        if result.get("pinning_suspected"):
+            text += "; suspeita=sim (não confirmado)"
+        reason = result.get("bypass_skipped_reason") or result.get(
+            "blocked_reason"
+        )
+        if reason and not result.get("pinning_detected"):
+            text += f"; motivo={_text(reason, 220)}"
+        return text
     return "veredito consolidado"
 
 
@@ -645,15 +679,30 @@ def build_execution_log(
         _static_entry(trace, check_name, result.get("static_detection"))
         _dynamic_entry(trace, check_name, result.get("app_detection"))
         _bypass_entry(trace, check_name, result)
+    elif check_name == "anti_proxy":
+        _static_entry(trace, check_name, result.get("static_detection"))
+        _dynamic_entry(trace, check_name, result.get("app_detection"))
+        _bypass_entry(trace, check_name, result)
     elif check_name == "ssl_pinning":
-        _static_entry(
-            trace,
-            check_name,
-            result.get("detection") or result,
-        )
+        detection = result.get("detection") or result
+        _static_entry(trace, check_name, detection)
         if result.get("pinning_detected"):
             _bypass_entry(trace, check_name, result)
-        elif not result.get("pinning_detected"):
+        elif result.get("pinning_suspected"):
+            bypass = result.get("bypass_details")
+            if isinstance(bypass, dict) and bypass:
+                _bypass_entry(trace, check_name, result)
+            else:
+                trace.append(
+                    _entry(
+                        "bypass",
+                        BYPASS_ACTIONS[check_name],
+                        "inconclusive",
+                        result.get("bypass_skipped_reason")
+                        or "indícios fracos; probe de SSL não executado",
+                    )
+                )
+        else:
             trace.append(
                 _entry(
                     "bypass",

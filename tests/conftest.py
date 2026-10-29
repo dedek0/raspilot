@@ -20,6 +20,17 @@ from checks.ssl_pinning import SSLPinningCheck
 ShellResponse = Union[str, Dict[str, object]]
 
 
+@pytest.fixture(autouse=True)
+def isolated_raspilot_home(tmp_path, monkeypatch):
+    """Isola estado/caches em ``tmp_path`` para nenhum teste tocar o home."""
+    monkeypatch.setenv("RASPILOT_HOME", str(tmp_path / "raspilot_home"))
+    monkeypatch.delenv("RASPILOT_STATE_DIR", raising=False)
+    monkeypatch.delenv("RASPILOT_CACHE_DIR", raising=False)
+    monkeypatch.delenv("RASPILOT_STATIC_CACHE_DIR", raising=False)
+    monkeypatch.delenv("RASPILOT_SESSIONS_KEEP", raising=False)
+    yield
+
+
 class FakeShellDM:
     """Substituto do ``DeviceManager`` para testes de checks.
 

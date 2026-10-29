@@ -104,6 +104,8 @@ class ModuleConfig:
             ``bypass``).
         emulator: Modo da camada de emulador (``off``, ``observe``,
             ``probe``, ``mask``).
+        proxy: Modo da camada de proxy/VPN (``off``, ``observe``,
+            ``probe``, ``bypass``).
         target: Pacote alvo (vazio = qualquer pacote no escopo).
         label: Rótulo da execução, usado na correlação de evidência.
         hook_targets: Métodos do próprio app achados pela análise
@@ -118,6 +120,7 @@ class ModuleConfig:
     root: str = "off"
     tamper: str = "off"
     emulator: str = "off"
+    proxy: str = "off"
     target: str = ""
     label: str = ""
     hook_targets: Tuple[Tuple[str, str], ...] = ()
@@ -133,6 +136,7 @@ class ModuleConfig:
             f"root={self.root}",
             f"tamper={self.tamper}",
             f"emu={self.emulator}",
+            f"proxy={self.proxy}",
             f"target={self.target}",
             f"label={self.label}",
         ]
@@ -149,6 +153,7 @@ class ModuleConfig:
             "--root", self.root,
             "--tamper", self.tamper,
             "--emu", self.emulator,
+            "--proxy", self.proxy,
             "--target", self.target,
             "--label", self.label,
         ]

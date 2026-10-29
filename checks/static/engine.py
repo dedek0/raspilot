@@ -23,6 +23,8 @@ import sys
 from importlib import metadata, util
 from typing import Any, Dict, List, Optional
 
+import paths
+
 logger = logging.getLogger("raspilot.static.engine")
 
 # Versão usada como referência de compatibilidade. A instalação não é
@@ -58,16 +60,10 @@ def asc_version() -> Optional[str]:
 def _cache_root() -> str:
     """Diretório de cache dos resultados do ASC.
 
-    Respeita ``RASPILOT_STATIC_CACHE_DIR`` e ``RASPILOT_CACHE_DIR`` para
-    que o operador possa isolar o cache em testes/CI.
+    Respeita ``RASPILOT_STATIC_CACHE_DIR``, ``RASPILOT_CACHE_DIR`` e
+    ``RASPILOT_HOME`` (ver :mod:`paths`).
     """
-    explicit = os.environ.get("RASPILOT_STATIC_CACHE_DIR")
-    if explicit:
-        return explicit
-    base = os.environ.get("RASPILOT_CACHE_DIR")
-    if base:
-        return os.path.join(base, "static")
-    return os.path.join(os.path.expanduser("~"), ".raspilot", "cache", "static")
+    return str(paths.static_cache_dir())
 
 
 def _cache_enabled() -> bool:

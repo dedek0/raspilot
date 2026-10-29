@@ -33,12 +33,19 @@ public final class RaspilotConfig {
     public static final String EMU_PROBE = "probe";
     public static final String EMU_MASK = "mask";
 
+    /** Modo da camada de proxy/VPN. */
+    public static final String PROXY_OFF = "off";
+    public static final String PROXY_OBSERVE = "observe";
+    public static final String PROXY_PROBE = "probe";
+    public static final String PROXY_BYPASS = "bypass";
+
     private static RaspilotConfig instance;
 
     public final String hookMode;
     public final String rootMode;
     public final String tamperMode;
     public final String emulatorMode;
+    public final String proxyMode;
     public final String targetPackage;
     public final String label;
     public final boolean runtimeOverride;
@@ -51,12 +58,14 @@ public final class RaspilotConfig {
     public final String[][] hookTargets;
 
     private RaspilotConfig(String hookMode, String rootMode, String tamperMode,
-                            String emulatorMode, String targetPackage, String label,
+                            String emulatorMode, String proxyMode,
+                            String targetPackage, String label,
                             boolean runtimeOverride, String[][] hookTargets) {
         this.hookMode = hookMode;
         this.rootMode = rootMode;
         this.tamperMode = tamperMode;
         this.emulatorMode = emulatorMode;
+        this.proxyMode = proxyMode;
         this.targetPackage = targetPackage;
         this.label = label;
         this.runtimeOverride = runtimeOverride;
@@ -76,6 +85,12 @@ public final class RaspilotConfig {
         String root = RaspilotBaked.ROOT_MODE;
         String tamper = RaspilotBaked.TAMPER_MODE;
         String emu = RaspilotBaked.EMULATOR_MODE;
+        String proxy = "off";
+        try {
+            proxy = RaspilotBaked.PROXY_MODE;
+        } catch (Throwable ignored) {
+            // APK antigo sem a camada de proxy: mantem desligado.
+        }
         String target = RaspilotBaked.TARGET_PACKAGE;
         String label = RaspilotBaked.LABEL;
         boolean overridden = false;
@@ -102,6 +117,9 @@ public final class RaspilotConfig {
                 } else if ("emu".equals(key)) {
                     emu = value;
                     overridden = true;
+                } else if ("proxy".equals(key)) {
+                    proxy = value;
+                    overridden = true;
                 } else if ("target".equals(key)) {
                     target = value;
                     overridden = true;
@@ -113,7 +131,7 @@ public final class RaspilotConfig {
         }
 
         instance = new RaspilotConfig(
-                hook, root, tamper, emu, target, label, overridden,
+                hook, root, tamper, emu, proxy, target, label, overridden,
                 RaspilotBaked.HOOK_TARGETS);
         return instance;
     }
@@ -215,5 +233,32 @@ public final class RaspilotConfig {
      */
     public boolean emulatorProbe() {
         return EMU_PROBE.equals(emulatorMode);
+    }
+
+    /**
+     * Informa se a camada de proxy/VPN deve ser aplicada.
+     *
+     * @return True quando o modo nao e "off".
+     */
+    public boolean proxyEnabled() {
+        return !PROXY_OFF.equals(proxyMode);
+    }
+
+    /**
+     * Informa se o app deve enxergar proxy/VPN no probe.
+     *
+     * @return True no modo probe.
+     */
+    public boolean proxyProbe() {
+        return PROXY_PROBE.equals(proxyMode);
+    }
+
+    /**
+     * Informa se proxy/VPN deve ser ocultado do app.
+     *
+     * @return True no modo bypass.
+     */
+    public boolean proxyBypass() {
+        return PROXY_BYPASS.equals(proxyMode);
     }
 }
