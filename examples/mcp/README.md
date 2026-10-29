@@ -51,23 +51,23 @@ Prefira manter HTTP atrás de um reverse proxy com TLS.
 
 ## Ferramentas
 
-- `raspilot_iniciar_avaliacao`
+- `raspilot_start_assessment`
 - `raspilot_status`
-- `raspilot_aguardar`
-- `raspilot_cancelar`
-- `raspilot_listar_sessoes`
-- `raspilot_obter_relatorio`
-- `raspilot_obter_resumo`
-- `raspilot_listar_recursos`
-- `raspilot_executar_check`
-- `raspilot_verificar_anti_root`
-- `raspilot_verificar_anti_frida`
-- `raspilot_verificar_anti_tampering`
-- `raspilot_verificar_anti_emulator`
-- `raspilot_verificar_anti_hooking`
-- `raspilot_verificar_proxy_vpn`
+- `raspilot_wait`
+- `raspilot_cancel`
+- `raspilot_list_sessions`
+- `raspilot_get_report`
+- `raspilot_get_summary`
+- `raspilot_list_resources`
+- `raspilot_run_check`
+- `raspilot_check_anti_root`
+- `raspilot_check_anti_frida`
+- `raspilot_check_anti_tampering`
+- `raspilot_check_anti_emulator`
+- `raspilot_check_anti_hooking`
+- `raspilot_check_proxy_vpn`
 - `raspilot_bypass_ssl_pinning`
-- `raspilot_testar_repack` (destrutivo, duas etapas)
+- `raspilot_test_repack` (destrutivo, duas etapas)
 
 Recursos: `raspilot://sessions`,
 `raspilot://sessions/{id}/session.json`, `summary.json`, `report.json`,

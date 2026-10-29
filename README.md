@@ -1204,7 +1204,8 @@ Antes de implementar o MCP:
 - [x] **Ferramentas session-aware:** `mcp_api.RaspilotTools` define a
   superfície em torno de `session_id` (não `device_id`), com retorno
   `{session_id, status, ...}` e recursos `raspilot://sessions/...`.
-  É uma fachada sem transporte; o servidor MCP será um adaptador fino.
+  É uma fachada sem transporte; o servidor MCP (`mcp_server.py`) é um
+  adaptador fino sobre ela.
 - [x] **Confirmação do repack:** `request_repack` persiste
   `pending_action` em `session.json`; `run_repack` consome um token de
   uso único, com escopo de sessão/device e expiração. Não há
@@ -1286,20 +1287,25 @@ sobre `session_id`, e as execuções longas usam `run_async()` + polling de
 
 Ferramentas expostas:
 
-- `raspilot_iniciar_avaliacao(package_name, device_id, stage, mode, only, skip)`
+- `raspilot_start_assessment(package_name, device_id, stage, mode, only, skip)`
 - `raspilot_status(session_id)`
-- `raspilot_aguardar(session_id, timeout)`
-- `raspilot_cancelar(session_id)`
-- `raspilot_listar_sessoes()`
-- `raspilot_obter_relatorio(session_id, format)`
-- `raspilot_obter_resumo(session_id)`
-- `raspilot_listar_recursos(session_id)`
-- `raspilot_executar_check(session_id, check, mode)`
-- `raspilot_verificar_anti_root`, `anti_frida`, `anti_tampering`,
-  `anti_emulator`, `anti_hooking`, `proxy_vpn`
+- `raspilot_wait(session_id, timeout)`
+- `raspilot_cancel(session_id)`
+- `raspilot_list_sessions()`
+- `raspilot_get_report(session_id, format)`
+- `raspilot_get_summary(session_id)`
+- `raspilot_list_resources(session_id)`
+- `raspilot_run_check(session_id, check, mode)`
+- `raspilot_check_anti_root`, `raspilot_check_anti_frida`,
+  `raspilot_check_anti_tampering`, `raspilot_check_anti_emulator`,
+  `raspilot_check_anti_hooking`, `raspilot_check_proxy_vpn`
 - `raspilot_bypass_ssl_pinning(session_id)`
-- `raspilot_testar_repack(session_id, variants, gadget, confirmation)` —
+- `raspilot_test_repack(session_id, variants, gadget, confirmation)` —
   duas etapas, destrutivo
+
+Os nomes das tools são em **inglês** para compatibilidade com qualquer
+harness MCP; a fachada Python (`mcp_api.RaspilotTools`) mantém os
+métodos em português.
 
 Recursos: `raspilot://sessions`,
 `raspilot://sessions/{id}/session.json`, `summary.json`, `report.json`,

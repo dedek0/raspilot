@@ -34,10 +34,10 @@ def test_lists_tools_and_resource_templates(tmp_path):
     async def check():
         tools = await server.list_tools()
         names = {tool.name for tool in tools}
-        assert "raspilot_iniciar_avaliacao" in names
+        assert "raspilot_start_assessment" in names
         assert "raspilot_status" in names
-        assert "raspilot_executar_check" in names
-        assert "raspilot_testar_repack" in names
+        assert "raspilot_run_check" in names
+        assert "raspilot_test_repack" in names
         templates = await server.list_resource_templates()
         uris = {item.uri_template for item in templates}
         assert "raspilot://sessions/{session_id}/session.json" in uris
@@ -95,7 +95,7 @@ def test_tool_errors_are_structured(tmp_path, monkeypatch):
     async def check():
         missing_device = _payload(
             await server.call_tool(
-                "raspilot_iniciar_avaliacao",
+                "raspilot_start_assessment",
                 {"package_name": "com.example.app"},
             )
         )
@@ -112,7 +112,7 @@ def test_tool_errors_are_structured(tmp_path, monkeypatch):
 
         bad_check = _payload(
             await server.call_tool(
-                "raspilot_executar_check",
+                "raspilot_run_check",
                 {"session_id": "nao-existe", "check": "nao_existe"},
             )
         )
@@ -132,7 +132,7 @@ def test_wait_timeout_is_structured(tmp_path):
     async def check():
         payload = _payload(
             await server.call_tool(
-                "raspilot_aguardar",
+                "raspilot_wait",
                 {"session_id": state.session_id, "timeout": 0.2, "poll": 0.05},
             )
         )
@@ -151,7 +151,7 @@ def test_repack_two_step_token(tmp_path):
     async def check():
         planning = _payload(
             await server.call_tool(
-                "raspilot_testar_repack",
+                "raspilot_test_repack",
                 {"session_id": state.session_id, "variants": ["dex"]},
             )
         )
@@ -162,7 +162,7 @@ def test_repack_two_step_token(tmp_path):
 
         bad = _payload(
             await server.call_tool(
-                "raspilot_testar_repack",
+                "raspilot_test_repack",
                 {"session_id": state.session_id, "confirmation": "errado"},
             )
         )

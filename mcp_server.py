@@ -129,8 +129,8 @@ def create_server(tools: Optional[RaspilotTools] = None) -> MCPServer:
         version=TOOL_VERSION,
         instructions=(
             "RASPilot audits Android apps for RASP protections. Start with "
-            "raspilot_iniciar_avaliacao (session_id-based workflow), then "
-            "poll raspilot_status or call raspilot_aguardar. Reports and "
+            "raspilot_start_assessment (session_id-based workflow), then "
+            "poll raspilot_status or call raspilot_wait. Reports and "
             "checks are exposed as raspilot:// resources. Destructive repack "
             "requires two calls (request confirmation, then present the token). "
             "All audit tools operate on session_id, never on an ad-hoc run."
@@ -140,14 +140,14 @@ def create_server(tools: Optional[RaspilotTools] = None) -> MCPServer:
 
     # -- ciclo de vida -------------------------------------------------
     @server.tool(
-        name="raspilot_iniciar_avaliacao",
+        name="raspilot_start_assessment",
         description=(
             "Create a session and start an assessment asynchronously. "
             "Returns {session_id, status:'running'} immediately. Requires an "
             "explicit device_id or RASPILOT_DEVICE. stage: static|detect|full."
         ),
     )
-    def iniciar_avaliacao(
+    def start_assessment(
         package_name: str,
         device_id: Optional[str] = None,
         stage: str = "full",
@@ -175,10 +175,10 @@ def create_server(tools: Optional[RaspilotTools] = None) -> MCPServer:
         return _call(toolset.status, session_id)
 
     @server.tool(
-        name="raspilot_aguardar",
+        name="raspilot_wait",
         description="Wait until a session leaves pending/running (or time out).",
     )
-    def aguardar(
+    def wait_session(
         session_id: str,
         timeout: Optional[float] = None,
         poll: float = 0.5,
@@ -188,28 +188,28 @@ def create_server(tools: Optional[RaspilotTools] = None) -> MCPServer:
         )
 
     @server.tool(
-        name="raspilot_cancelar",
+        name="raspilot_cancel",
         description="Request cancellation between checks (idempotent).",
     )
-    def cancelar(session_id: str) -> Dict[str, Any]:
+    def cancel(session_id: str) -> Dict[str, Any]:
         return _call(toolset.cancelar, session_id)
 
     @server.tool(
-        name="raspilot_listar_sessoes",
+        name="raspilot_list_sessions",
         description="List sessions, newest first, with pending action hints.",
     )
-    def listar_sessoes() -> Dict[str, Any]:
+    def list_sessions() -> Dict[str, Any]:
         return _call(toolset.listar_sessoes)
 
     # -- relatórios ----------------------------------------------------
     @server.tool(
-        name="raspilot_obter_relatorio",
+        name="raspilot_get_report",
         description=(
             "Return a saved report: format=json|summary|html|paths. "
             "Never runs the pipeline; use report stage/service first."
         ),
     )
-    def obter_relatorio(
+    def get_report(
         session_id: str,
         format: str = "json",
         timeout: Optional[float] = None,
@@ -222,28 +222,28 @@ def create_server(tools: Optional[RaspilotTools] = None) -> MCPServer:
         )
 
     @server.tool(
-        name="raspilot_obter_resumo",
+        name="raspilot_get_summary",
         description="Shortcut for the session's summary.json.",
     )
-    def obter_resumo(session_id: str) -> Dict[str, Any]:
+    def get_summary(session_id: str) -> Dict[str, Any]:
         return _call(toolset.obter_resumo, session_id)
 
     @server.tool(
-        name="raspilot_listar_recursos",
+        name="raspilot_list_resources",
         description="List the stable raspilot:// resource URIs for a session.",
     )
-    def listar_recursos(session_id: str) -> Dict[str, Any]:
+    def list_resources(session_id: str) -> Dict[str, Any]:
         return _call(toolset.listar_recursos, session_id)
 
     # -- checks individuais --------------------------------------------
     @server.tool(
-        name="raspilot_executar_check",
+        name="raspilot_run_check",
         description=(
             "Run one check on an existing session without overwriting the "
             "other checks. check must be one of the known RASP checks."
         ),
     )
-    def executar_check(
+    def run_check(
         session_id: str,
         check: str,
         mode: Optional[str] = None,
@@ -257,48 +257,48 @@ def create_server(tools: Optional[RaspilotTools] = None) -> MCPServer:
             timeout=timeout,
         )
 
-    @server.tool(name="raspilot_verificar_anti_root")
-    def verificar_anti_root(
+    @server.tool(name="raspilot_check_anti_root")
+    def check_anti_root(
         session_id: str, timeout: Optional[float] = None
     ) -> Dict[str, Any]:
         return _call(
             toolset.verificar_anti_root, session_id, timeout=timeout
         )
 
-    @server.tool(name="raspilot_verificar_anti_frida")
-    def verificar_anti_frida(
+    @server.tool(name="raspilot_check_anti_frida")
+    def check_anti_frida(
         session_id: str, timeout: Optional[float] = None
     ) -> Dict[str, Any]:
         return _call(
             toolset.verificar_anti_frida, session_id, timeout=timeout
         )
 
-    @server.tool(name="raspilot_verificar_anti_tampering")
-    def verificar_anti_tampering(
+    @server.tool(name="raspilot_check_anti_tampering")
+    def check_anti_tampering(
         session_id: str, timeout: Optional[float] = None
     ) -> Dict[str, Any]:
         return _call(
             toolset.verificar_anti_tampering, session_id, timeout=timeout
         )
 
-    @server.tool(name="raspilot_verificar_anti_emulator")
-    def verificar_anti_emulator(
+    @server.tool(name="raspilot_check_anti_emulator")
+    def check_anti_emulator(
         session_id: str, timeout: Optional[float] = None
     ) -> Dict[str, Any]:
         return _call(
             toolset.verificar_anti_emulator, session_id, timeout=timeout
         )
 
-    @server.tool(name="raspilot_verificar_anti_hooking")
-    def verificar_anti_hooking(
+    @server.tool(name="raspilot_check_anti_hooking")
+    def check_anti_hooking(
         session_id: str, timeout: Optional[float] = None
     ) -> Dict[str, Any]:
         return _call(
             toolset.verificar_anti_hooking, session_id, timeout=timeout
         )
 
-    @server.tool(name="raspilot_verificar_proxy_vpn")
-    def verificar_proxy_vpn(
+    @server.tool(name="raspilot_check_proxy_vpn")
+    def check_proxy_vpn(
         session_id: str, timeout: Optional[float] = None
     ) -> Dict[str, Any]:
         return _call(
@@ -315,13 +315,13 @@ def create_server(tools: Optional[RaspilotTools] = None) -> MCPServer:
 
     # -- repack destrutivo --------------------------------------------
     @server.tool(
-        name="raspilot_testar_repack",
+        name="raspilot_test_repack",
         description=(
             "Destructive repack in two steps. Without confirmation, returns "
             "a single-use token. With confirmation, executes once."
         ),
     )
-    def testar_repack(
+    def test_repack(
         session_id: str,
         variants: Optional[List[str]] = None,
         gadget: Optional[str] = None,
