@@ -647,3 +647,42 @@ def test_status_payload_exposes_skip_and_error_codes(tmp_path):
     assert payload["checks"]["anti_frida"]["outcome"] == "error"
     assert payload["errors"][0]["code"] == "check_error"
     assert payload["error_code"] == "check_error"
+
+
+def test_run_check_preserves_previous_results_and_stage(tmp_path, monkeypatch):
+    store = SessionStore(str(tmp_path / "sessions"))
+    state = store.create("com.example.app")
+    state.stage = "detect"
+    state.static = {
+        "available": True,
+        "apk": {"sha256": "same"},
+        "summary": {"vectors": {}},
+    }
+    state.results = {"anti_root": {"is_rooted": False}}
+    store.save(state)
+
+    def fake_checks(svc):
+        svc.reporter.collect(
+            "anti_frida",
+            {"vulnerable": True, "frida_present": True},
+        )
+
+    monkeypatch.setattr(RaspilotService, "_run_checks", fake_checks)
+    monkeypatch.setattr(
+        RaspilotService, "_static_matches_device", lambda self: True
+    )
+    config = _config(
+        tmp_path,
+        stage="detect",
+        session_id=state.session_id,
+        static_engine="builtin",
+    )
+    svc = RaspilotService.resume(config, store=store, device=FakeDevice())
+    payload = svc.run_check("anti_frida")
+
+    saved = store.load(state.session_id)
+    assert saved.stage == "detect"
+    assert saved.results["anti_root"] == {"is_rooted": False}
+    assert saved.results["anti_frida"]["vulnerable"] is True
+    assert payload["check"] == "anti_frida"
+    assert payload["result"]["vulnerable"] is True

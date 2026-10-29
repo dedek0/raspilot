@@ -1,13 +1,14 @@
 # RASPilot — dependências do servidor MCP (opcional).
 #
-# A fase MCP ainda não foi iniciada. Este arquivo existe para manter a
-# dependência separada do núcleo (requirements.txt): instalar o RASPilot
-# para uso via CLI não deve puxar o SDK do MCP.
+# A camada de ferramentas está em mcp_api.py; o adaptador de transporte
+# está em mcp_server.py. O SDK oficial 2.x expõe MCPServer
+# (mcp.server.mcpserver), sucessor do FastMCP 1.x.
 #
-# Transporte decidido no checklist pré-MCP:
+# Transporte:
 #   - padrão: stdio (stdout reservado ao protocolo; logs em stderr);
-#   - HTTP opcional: exigir token bearer e bind em loopback por padrão.
+#   - HTTP opcional: host loopback por padrão; host não-loopback exige
+#     --auth-token (Bearer).
 #
-# Instalação futura:
+# Instalação:
 #     pip install -r requirements.txt -r requirements-mcp.txt
-mcp>=1.0.0
+mcp>=2.0.0,<3.0.0

@@ -364,6 +364,7 @@ class RaspilotService:
         self._owns_device = device is None
         self._cancel = threading.Event()
         self._future: Optional[Future] = None
+        self._suppress_skip_collect = False
         if state is not None:
             self.static_profile = state.static
 
@@ -587,6 +588,8 @@ class RaspilotService:
     ) -> Optional[dict]:
         """Executa um check com isolamento de falhas e coleta de métricas."""
         if skipped:
+            if self._suppress_skip_collect:
+                return None
             result: dict = {"skipped": True}
             if skip_reason:
                 result["skip_reason"] = skip_reason
@@ -832,6 +835,48 @@ class RaspilotService:
         self.config.stage = "full"
         return self.run_dynamic()
 
+    def run_check(self, check: str, mode: Optional[str] = None) -> dict:
+        """Executa um único check sobre a sessão existente.
+
+        Diferente de ``--only``, não sobrescreve os resultados anteriores
+        dos demais checks e não avança a etapa da sessão. Serve às
+        ferramentas MCP por check.
+        """
+        if check not in KNOWN_CHECKS:
+            raise SessionStateError(
+                f"check inválido: {check!r}; conhecidos: "
+                + ", ".join(KNOWN_CHECKS)
+            )
+        if self.state is None or self.store is None:
+            raise SessionStateError("run_check exige uma sessão carregada")
+        state = self.state
+        target = state.stage if state.stage in (
+            "detect", "bypass", "full",
+        ) else "detect"
+        original_stage = self.config.stage
+        original_mode = self.config.mode
+        self.config.stage = target
+        if mode:
+            self.config.mode = mode
+        self._suppress_skip_collect = True
+        try:
+            self.run_dynamic(
+                mode=self.config.mode,
+                skip=set(KNOWN_CHECKS) - {check},
+                static_profile=state.static,
+                validate_stage=False,
+                target_stage=target,
+                action=check,
+            )
+        finally:
+            self._suppress_skip_collect = False
+            self.config.stage = original_stage
+            self.config.mode = original_mode
+        payload = self.status()
+        payload["check"] = check
+        payload["result"] = (state.results or {}).get(check)
+        return payload
+
     def save_state(self) -> None:
         """Persiste o estado atual (útil entre chamadas MCP)."""
         if self.state is not None and self.store is not None:
@@ -1032,6 +1077,9 @@ class RaspilotService:
         mode: Optional[str] = None,
         skip: Optional[Iterable[str]] = None,
         static_profile: Optional[dict] = None,
+        validate_stage: bool = True,
+        target_stage: Optional[str] = None,
+        action: Optional[str] = None,
     ) -> RunResult:
         """Executa o pipeline dinâmico (detect/bypass/full).
 
@@ -1040,6 +1088,12 @@ class RaspilotService:
             skip: Conjunto de checks a pular. Se omitido, aplica
                 ``--only``/``--skip`` da configuração.
             static_profile: Perfil já carregado (retomada de sessão).
+            validate_stage: Quando False, permite executar um check
+                isolado sem reaplicar a regra bypass ⇐ detect.
+            target_stage: Etapa persistida após a execução; se omitido,
+                usa a etapa inferida do modo.
+            action: Valor de ``last_action``; se omitido, usa
+                ``config.stage``.
 
         Returns:
             Resultado com relatório salvo e métricas por check.
@@ -1052,7 +1106,8 @@ class RaspilotService:
         elif not self.skip:
             self._effective_skip()
 
-        self._validate_stage()
+        if validate_stage:
+            self._validate_stage()
 
         set_js_runtime(config.js_runtime)
         self.timings = {}
@@ -1134,7 +1189,9 @@ class RaspilotService:
                     timings=dict(self.timings),
                     errors=list(self.errors),
                 )
-                self._persist_session(result)
+                self._persist_session(
+                    result, target=target_stage, action=action
+                )
                 return result
             except RunCancelled:
                 self._mark_finished("cancelled")

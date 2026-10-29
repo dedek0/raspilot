@@ -1,0 +1,4 @@
+[mcp_servers.raspilot]
+command = "/ABSOLUTE/PATH/.venv/bin/python"
+args = ["/ABSOLUTE/PATH/mcp_server.py"]
+env = { RASPILOT_DEVICE = "SERIAL_DO_APARELHO", RASPILOT_STATE_DIR = "/ABSOLUTE/PATH/.raspilot/sessions" }

@@ -1178,7 +1178,7 @@ IDs estáveis. O MCP continua **depois** desta fase.
 
 **Status:** fase 3 (sessões/serviço) e o vetor proxy/VPN estão
 implementados. O checklist pré-MCP (itens 1–10) foi fechado no device
-conectado; o servidor MCP **ainda não foi iniciado**.
+conectado; o servidor MCP foi implementado em `mcp_server.py`.
 
 Antes de implementar o MCP:
 
@@ -1225,7 +1225,8 @@ Antes de implementar o MCP:
   novos casos de `tests/test_sessions.py` exercitam as ferramentas com
   `RaspilotService`/device mockados, sem aparelho.
 
-O checklist pré-MCP está fechado; o servidor MCP pode ser iniciado.
+O checklist pré-MCP está fechado; o servidor MCP está implementado em
+`mcp_server.py` (stdio por padrão).
 
 ### Contrato pré-MCP (implementado)
 
@@ -1270,41 +1271,54 @@ contrato MCP. `RASPILOT_DEVICE` pode definir o padrão.
 de repack e as ferramentas com serviço/device mockados; nenhum teste
 abre ADB ou Frida.
 
-## Integração MCP (planejada, não iniciada)
+## Integração MCP (servidor implementado)
 
-A base está pronta: ferramentas MCP devem operar sobre `session_id`
-(criado por `--session`/`RaspilotService.create`) e não sobre uma
-execução isolada. Ferramentas longas usam `RaspilotService.run_async()` e
-consultam `session.json`/`progress` (ou
-`raspilot://sessions/{id}/session.json`) até o estado sair de `running`;
-o lock por device garante uma execução por aparelho.
+O servidor fica em `mcp_server.py` e usa o SDK oficial `mcp` 2.x
+(`MCPServer`, sucessor do FastMCP 1.x). O transporte padrão é **stdio**,
+aceito por Claude Code, OpenCode, Codex e qualquer harness MCP; SSE e
+Streamable HTTP são opcionais (loopback por padrão; host não-loopback
+exige bearer token).
 
-Formato planejado das ferramentas:
+A camada de ferramentas continua em `mcp_api.RaspilotTools`: tudo opera
+sobre `session_id`, e as execuções longas usam `run_async()` + polling de
+`session.json`/`progress` (ou do recurso
+`raspilot://sessions/{id}/session.json`).
 
-| Ferramenta MCP planejada | Mapeamento interno |
-|---|---|
-| `raspilot_iniciar_avaliacao(package_name, device_id=None, stage="full", mode=None) -> {session_id, status}` | `RaspilotService.create()` + `run_async()` |
-| `raspilot_status(session_id) -> dict` | `SessionStore.load()` + `progress`/`status` |
-| `raspilot_cancelar(session_id) -> dict` | `RaspilotService.request_cancel()` |
-| `raspilot_listar_sessoes() -> list` | `SessionStore.list()` |
-| `raspilot_obter_relatorio(session_id, format="json") -> dict` | recurso `report.json`/`summary.json` |
-| `raspilot_verificar_anti_root(session_id) -> dict` | `AntiRootCheck(dm).run_all(...)` |
-| `raspilot_verificar_anti_frida(session_id) -> dict` | `AntiFridaCheck(dm).run_all(session, pid)` |
-| `raspilot_verificar_anti_tampering(session_id) -> dict` | `AntiTamperingCheck(dm).run_all(...)` |
-| `raspilot_verificar_anti_emulator(session_id) -> dict` | `AntiEmulatorCheck(dm).run_all(package)` |
-| `raspilot_verificar_anti_hooking(session_id) -> dict` | `AntiHookingCheck(dm).run_all(package)` |
-| `raspilot_verificar_proxy_vpn(session_id) -> dict` | `AntiProxyCheck(dm).run_all(package)` |
-| `raspilot_bypass_ssl_pinning(session_id) -> dict` | `SSLPinningCheck(dm).run_all(package)` |
-| `raspilot_testar_repack(session_id, variants, gadget=None, confirmation=None) -> dict` | `RepackTester(...).run()` — duas etapas, destrutivo |
+Ferramentas expostas:
 
-Os recursos previstos são os já implementados pela sessão:
-`raspilot://sessions`, `raspilot://sessions/{id}/session.json`,
-`summary.json`, `report.json`, `report.html`, `static.json` e
-`checks/{check}.json`.
+- `raspilot_iniciar_avaliacao(package_name, device_id, stage, mode, only, skip)`
+- `raspilot_status(session_id)`
+- `raspilot_aguardar(session_id, timeout)`
+- `raspilot_cancelar(session_id)`
+- `raspilot_listar_sessoes()`
+- `raspilot_obter_relatorio(session_id, format)`
+- `raspilot_obter_resumo(session_id)`
+- `raspilot_listar_recursos(session_id)`
+- `raspilot_executar_check(session_id, check, mode)`
+- `raspilot_verificar_anti_root`, `anti_frida`, `anti_tampering`,
+  `anti_emulator`, `anti_hooking`, `proxy_vpn`
+- `raspilot_bypass_ssl_pinning(session_id)`
+- `raspilot_testar_repack(session_id, variants, gadget, confirmation)` —
+  duas etapas, destrutivo
 
-A fachada `mcp_api.RaspilotTools` já implementa o núcleo
-(iniciar/status/aguardar/cancelar/listar/relatório/recursos/repack); as
-ferramentas por check entram junto com o servidor MCP.
+Recursos: `raspilot://sessions`,
+`raspilot://sessions/{id}/session.json`, `summary.json`, `report.json`,
+`report.html`, `static.json` e `checks/{check}.json`.
+
+Configuração universal:
+
+```bash
+/ABSOLUTE/PATH/.venv/bin/python /ABSOLUTE/PATH/mcp_server.py
+```
+
+Exemplos prontos para Claude Code, OpenCode e Codex estão em
+`examples/mcp/`. Variáveis: `RASPILOT_DEVICE`, `RASPILOT_STATE_DIR`,
+`RASPILOT_OUTPUT_DIR`, `RASPILOT_TIMEOUT`, `RASPILOT_MCP_TOKEN` e
+`RASPILOT_LOG_LEVEL`. O modo stdio mantém stdout limpo (só protocolo);
+logs vão para stderr.
+
+As ferramentas por check executam um único check sobre a sessão sem
+sobrescrever os resultados anteriores e sem avançar a etapa da sessão.
 
 O JSON emitido pelo RASPilot segue um schema estável
 (`metadata` / `summary` / `execution_log` / `details`) pensado para leitura

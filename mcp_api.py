@@ -316,6 +316,59 @@ class RaspilotTools:
         except SessionError as exc:
             raise _to_tool_error(exc) from exc
 
+    def executar_check(
+        self,
+        session_id: str,
+        check: str,
+        mode: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> dict:
+        """Executa um único check na sessão, preservando os demais."""
+        session_id = _require_session_id(session_id)
+        if check not in KNOWN_CHECKS:
+            raise ToolError(
+                f"check inválido: {check!r}",
+                code="invalid_argument",
+                details={"known": list(KNOWN_CHECKS)},
+            )
+        state = self._state(session_id)
+        service = self._service(self._config_from_state(state), resume=True)
+        limit = _clamp_timeout(timeout, self.run_timeout)
+        future = self._executor.submit(service.run_check, check, mode)
+        try:
+            future.result(timeout=limit)
+        except FutureTimeout as exc:
+            raise ToolTimeout(
+                f"check {check} da sessão {session_id} não terminou em "
+                f"{limit:g}s; acompanhe com status ou cancele"
+            ) from exc
+        except BaseException as exc:  # noqa: BLE001 - fronteira da ferramenta
+            raise _to_tool_error(exc) from exc
+        return self.store.status_payload(service.state)
+
+    def verificar_anti_root(self, session_id: str, timeout: Optional[float] = None) -> dict:
+        return self.executar_check(session_id, "anti_root", timeout=timeout)
+
+    def verificar_anti_frida(self, session_id: str, timeout: Optional[float] = None) -> dict:
+        return self.executar_check(session_id, "anti_frida", timeout=timeout)
+
+    def verificar_anti_tampering(self, session_id: str, timeout: Optional[float] = None) -> dict:
+        return self.executar_check(session_id, "anti_tampering", timeout=timeout)
+
+    def verificar_anti_emulator(self, session_id: str, timeout: Optional[float] = None) -> dict:
+        return self.executar_check(session_id, "anti_emulator", timeout=timeout)
+
+    def verificar_anti_hooking(self, session_id: str, timeout: Optional[float] = None) -> dict:
+        return self.executar_check(session_id, "anti_hooking", timeout=timeout)
+
+    def verificar_proxy_vpn(self, session_id: str, timeout: Optional[float] = None) -> dict:
+        return self.executar_check(session_id, "anti_proxy", timeout=timeout)
+
+    def bypass_ssl_pinning(self, session_id: str, timeout: Optional[float] = None) -> dict:
+        return self.executar_check(
+            session_id, "ssl_pinning", mode="bypass", timeout=timeout
+        )
+
     def listar_sessoes(self) -> dict:
         """Lista sessões mais recentes primeiro."""
         states = self.store.list()
