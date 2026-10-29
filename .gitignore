@@ -14,3 +14,6 @@ reports/*
 dist/
 build/
 .DS_Store
+
+# Configuração local do OpenCode (use examples/mcp/ como base)
+/opencode.json
