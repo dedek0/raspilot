@@ -62,6 +62,9 @@ public final class RootShield {
         hookSystemProperties(bypass);
         hookPackageManager(bypass);
         hookRootBeer(bypass, classLoader);
+        hookDeveloperSettings(bypass);
+        hookInstallSource(bypass);
+        hookBuildFields(bypass);
     }
 
     private static boolean isRootPath(String path) {
@@ -359,5 +362,185 @@ public final class RootShield {
                 }
             }
         };
+    }
+
+    /** Chaves de desenvolvedor/ADB usadas por checagens de integridade. */
+    private static final String[] DEVELOPER_KEYS = {
+            "adb_enabled",
+            "development_settings_enabled",
+            "install_non_market_apps",
+            "verifier_verify_adb_installs",
+            "package_verifier_user_consent",
+            "package_verifier_enable",
+    };
+
+    private static boolean isDeveloperKey(String key) {
+        if (key == null) {
+            return false;
+        }
+        for (String candidate : DEVELOPER_KEYS) {
+            if (candidate.equals(key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void hookDeveloperSettings(final boolean bypass) {
+        if (!bypass) {
+            return;
+        }
+        for (String className : new String[]{
+                "android.provider.Settings$Global",
+                "android.provider.Settings$Secure",
+        }) {
+            try {
+                XposedHelpers.findAndHookMethod(
+                        className, XposedBridge.BOOTCLASSLOADER,
+                        "getString",
+                        android.content.ContentResolver.class, String.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                String key = String.valueOf(param.args[1]);
+                                if (!isDeveloperKey(key)) {
+                                    return;
+                                }
+                                param.setResult("0");
+                                Evidence.emit("neutralize", "root",
+                                        className + ".getString", key);
+                            }
+                        });
+            } catch (Throwable error) {
+                Evidence.error("root.developer.getString", error);
+            }
+            for (Class<?>[] types : new Class<?>[][]{
+                    {android.content.ContentResolver.class, String.class, int.class},
+                    {android.content.ContentResolver.class, String.class},
+            }) {
+                try {
+                    XC_MethodHook getIntHook = new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            String key = String.valueOf(param.args[1]);
+                            if (!isDeveloperKey(key)) {
+                                return;
+                            }
+                            param.setResult(0);
+                            Evidence.emit("neutralize", "root",
+                                    className + ".getInt", key);
+                        }
+                    };
+                    if (types.length == 3) {
+                        XposedHelpers.findAndHookMethod(
+                                className, XposedBridge.BOOTCLASSLOADER,
+                                "getInt", types[0], types[1], types[2],
+                                getIntHook);
+                    } else {
+                        XposedHelpers.findAndHookMethod(
+                                className, XposedBridge.BOOTCLASSLOADER,
+                                "getInt", types[0], types[1], getIntHook);
+                    }
+                } catch (Throwable ignored) {
+                    // Overload pode não existir na versão do Android.
+                }
+            }
+        }
+        try {
+            XposedHelpers.findAndHookMethod(
+                    android.os.Debug.class, "isDebuggerConnected",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            param.setResult(false);
+                            Evidence.emit("neutralize", "root",
+                                    "Debug.isDebuggerConnected", "false");
+                        }
+                    });
+        } catch (Throwable ignored) {
+            // Sem efeito em versões que não expõem o método.
+        }
+    }
+
+    private static void hookInstallSource(final boolean bypass) {
+        if (!bypass) {
+            return;
+        }
+        try {
+            Class<?> clazz = XposedHelpers.findClass(
+                    "android.app.ApplicationPackageManager",
+                    XposedBridge.BOOTCLASSLOADER);
+            XposedBridge.hookAllMethods(clazz, "getInstallerPackageName",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            param.setResult("com.android.vending");
+                            Evidence.emit("neutralize", "root",
+                                    "getInstallerPackageName", "loja oficial");
+                        }
+                    });
+        } catch (Throwable error) {
+            Evidence.error("root.installSource", error);
+        }
+        try {
+            Class<?> clazz = XposedHelpers.findClass(
+                    "android.content.pm.InstallSourceInfo",
+                    XposedBridge.BOOTCLASSLOADER);
+            for (String method : new String[]{
+                    "getInstallingPackageName",
+                    "getInitiatingPackageName",
+                    "getUpdateOwnerPackageName",
+            }) {
+                XposedBridge.hookAllMethods(clazz, method,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                param.setResult("com.android.vending");
+                                Evidence.emit("neutralize", "root",
+                                        "InstallSourceInfo." + method,
+                                        "loja oficial");
+                            }
+                        });
+            }
+            XposedBridge.hookAllMethods(clazz, "getOriginatingPackageName",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            param.setResult(null);
+                        }
+                    });
+            XposedBridge.hookAllMethods(clazz, "getPackageSource",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            param.setResult(2);
+                            Evidence.emit("neutralize", "root",
+                                    "InstallSourceInfo.getPackageSource", "store");
+                        }
+                    });
+        } catch (Throwable error) {
+            Evidence.error("root.installSourceInfo", error);
+        }
+    }
+
+    private static void hookBuildFields(final boolean bypass) {
+        if (!bypass) {
+            return;
+        }
+        try {
+            XposedHelpers.setStaticObjectField(
+                    android.os.Build.class, "TAGS", "release-keys");
+            XposedHelpers.setStaticObjectField(
+                    android.os.Build.class, "TYPE", "user");
+            String fingerprint = android.os.Build.FINGERPRINT;
+            if (fingerprint != null && fingerprint.contains("test-keys")) {
+                XposedHelpers.setStaticObjectField(
+                        android.os.Build.class, "FINGERPRINT",
+                        fingerprint.replace("test-keys", "release-keys"));
+            }
+            Evidence.emit("neutralize", "root", "Build", "release-keys/user");
+        } catch (Throwable error) {
+            Evidence.error("root.Build", error);
+        }
     }
 }

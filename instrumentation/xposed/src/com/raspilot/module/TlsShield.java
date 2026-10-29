@@ -318,12 +318,16 @@ public final class TlsShield {
         try {
             String reason = intent.getStringExtra("reasonCode");
             String external = intent.getStringExtra("externalID");
+            String host = intent.getStringExtra("host");
+            String timestamp = intent.getStringExtra("timestamp");
             if (reason == null && external == null) {
                 return;
             }
             Evidence.emit("observe", "tls", "event",
                     "action=" + action + " external=" + external
-                            + " reason=" + reason);
+                            + " reason=" + reason
+                            + " host=" + host
+                            + " timestamp=" + timestamp);
         } catch (Throwable ignored) {
             // Diagnóstico nunca derruba o processo.
         }
