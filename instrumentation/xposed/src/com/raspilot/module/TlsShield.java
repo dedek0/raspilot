@@ -1,5 +1,6 @@
 package com.raspilot.module;
 
+import android.content.Intent;
 import android.webkit.SslErrorHandler;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -66,6 +67,7 @@ public final class TlsShield {
         hookOkHttpPinners(classLoader);
         hookHostnameVerifiers(classLoader);
         hookWebView(classLoader);
+        filterNetworkEvents();
         Evidence.emit("neutralize", "tls", "TlsShield.install",
                 "validação de certificado neutralizada");
     }
@@ -244,5 +246,98 @@ public final class TlsShield {
         } catch (Throwable error) {
             Evidence.error("tls.WebView", error);
         }
+    }
+
+    /** Eventos de ameaça de rede/TLS que o app não precisa ver. */
+    private static final String[] PROXY_TLS_EVENTS = {
+            "NetworkProxyConfigured",
+            "SslCertificateValidationFailed",
+            "SslIntegrityCheckFail",
+            "SslNonSslConnection",
+    };
+
+    private static void filterNetworkEvents() {
+        try {
+            Class<?> clazz = Class.forName("android.app.ContextImpl");
+            XC_MethodHook callback = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    for (Object arg : param.args) {
+                        if (!(arg instanceof Intent)) {
+                            continue;
+                        }
+                        Intent intent = (Intent) arg;
+                        String action = intent.getAction();
+                        logNetworkEvent(intent, action);
+                        if (isProxyTlsEvent(action)) {
+                            param.setResult(null);
+                            Evidence.emit("neutralize", "tls",
+                                    "event", String.valueOf(action));
+                            return;
+                        }
+                    }
+                }
+            };
+            for (String name : new String[]{
+                    "sendBroadcast",
+                    "sendOrderedBroadcast",
+                    "sendBroadcastAsUser",
+                    "sendOrderedBroadcastAsUser",
+            }) {
+                XposedBridge.hookAllMethods(clazz, name, callback);
+            }
+        } catch (Throwable error) {
+            Evidence.error("tls.ContextImpl", error);
+        }
+        try {
+            Class<?> clazz = Class.forName(
+                    "androidx.localbroadcastmanager.content.LocalBroadcastManager");
+            XposedBridge.hookAllMethods(clazz, "sendBroadcast",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            for (Object arg : param.args) {
+                                if (arg instanceof Intent
+                                        && isProxyTlsEvent(
+                                                ((Intent) arg).getAction())) {
+                                    param.setResult(null);
+                                    Evidence.emit("neutralize", "tls",
+                                            "event-local",
+                                            String.valueOf(((Intent) arg).getAction()));
+                                    return;
+                                }
+                            }
+                        }
+                    });
+        } catch (Throwable ignored) {
+            // App pode não empacotar o LocalBroadcastManager.
+        }
+    }
+
+    private static void logNetworkEvent(Intent intent, String action) {
+        try {
+            String reason = intent.getStringExtra("reasonCode");
+            String external = intent.getStringExtra("externalID");
+            if (reason == null && external == null) {
+                return;
+            }
+            Evidence.emit("observe", "tls", "event",
+                    "action=" + action + " external=" + external
+                            + " reason=" + reason);
+        } catch (Throwable ignored) {
+            // Diagnóstico nunca derruba o processo.
+        }
+    }
+
+    private static boolean isProxyTlsEvent(String action) {
+        if (action == null) {
+            return false;
+        }
+        for (String event : PROXY_TLS_EVENTS) {
+            if (event.equals(action)) {
+                return true;
+            }
+        }
+        return false;
     }
 }

@@ -151,8 +151,11 @@ No modo `proxy=bypass`, a camada TLS (`TlsShield`) também é instalada:
 `com.android.okhttp`), `HostnameVerifier` e `WebViewClient.onReceivedSslError`
 passam a aceitar o CA do proxy de auditoria. Isso é necessário porque,
 com um proxy MITM, a validação de certificado falha antes da checagem de
-proxy. Pinning nativo (BoringSSL, Flutter) continua fora do módulo e
-aparece como limitação no relatório.
+proxy. O `TlsShield` também filtra eventos de proxy/TLS reportados por
+broadcast (`NetworkProxyConfigured`, `SslCertificateValidationFailed`,
+`SslIntegrityCheckFail`, `SslNonSslConnection`) depois da neutralização.
+Pinning nativo (BoringSSL, Flutter) continua fora do módulo e aparece
+como limitação no relatório.
 
 A camada de root observa/neutraliza `File.exists` (e variantes),
 `Runtime.exec`/`ProcessBuilder.start` com `su`/Magisk/busybox,

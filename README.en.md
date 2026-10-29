@@ -778,8 +778,10 @@ the report exposes `gadget.script_ran`. The marker check uses `run-as`
   `SSLContext.init`, `TrustManagerFactory`,
   `X509TrustManagerExtensions`, `Conscrypt.Platform.checkServerTrusted`,
   `CertificatePinner` and `WebViewClient.onReceivedSslError` accept the
-  audit proxy CA. Native pinning (BoringSSL/Flutter) remains outside the
-  module and is reported as a limitation.
+  audit proxy CA. `TlsShield` also filters proxy/TLS event broadcasts
+  (`NetworkProxyConfigured`, `SslCertificateValidationFailed`, etc.)
+  emitted after neutralisation. Native pinning (BoringSSL/Flutter)
+  remains outside the module and is reported as a limitation.
 - **Semantics**: `detected` requires a strong query (`proxy`/`vpn`) or
   an observed reaction. The result separates `reaction_observed`
   (threat log or app death) from `query_only` (the app queried the

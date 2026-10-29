@@ -153,6 +153,28 @@ def test_module_bypass_records_tls_layer():
     assert "Conscrypt.Platform.checkServerTrusted" in result["tls_methods"]
 
 
+def test_module_bypass_records_network_event_filter():
+    evidence = [
+        {
+            "kind": "neutralize", "channel": "tls",
+            "method": "event", "detail": "NetworkProxyConfigured",
+        },
+        {
+            "kind": "observe", "channel": "tls", "method": "event",
+            "detail": "action=SslCertificateValidationFailed reason=1779",
+        },
+    ]
+    check = AntiProxyCheck(
+        object(), method="module", xposed=FakeXposed(evidence)
+    )
+    result = check.attempt_module_bypass("com.example.app", window=1)
+    assert result["events_suppressed"] == 1
+    assert any(
+        "SslCertificateValidationFailed" in item
+        for item in result["tls_events"]
+    )
+
+
 def _clean_profile():
     return {
         "available": True,

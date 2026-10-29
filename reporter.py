@@ -575,6 +575,10 @@ class Reporter:
                     summary["tls_neutralized"] = int(
                         result.get("bypass_tls_neutralized")
                     )
+                if result.get("bypass_events_suppressed"):
+                    summary["events_suppressed"] = int(
+                        result.get("bypass_events_suppressed")
+                    )
                 summary["channels"] = (result.get("app_detection") or {}).get(
                     "channels"
                 ) or {}

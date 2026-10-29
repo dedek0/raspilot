@@ -481,6 +481,20 @@ class AntiProxyCheck:
                 for item in run.get("evidence") or []
                 if item.get("channel") == "tls"
             })[:10],
+            "events_suppressed": sum(
+                1
+                for item in run.get("evidence") or []
+                if item.get("channel") == "tls"
+                and item.get("kind") == "neutralize"
+                and item.get("method") in ("event", "event-local")
+            ),
+            "tls_events": sorted({
+                str(item.get("detail"))
+                for item in run.get("evidence") or []
+                if item.get("channel") == "tls"
+                and item.get("kind") == "observe"
+                and item.get("method") == "event"
+            })[:10],
             "death_cause": logcat.get("death"),
             "death_classification": death,
             "logcat": logcat,
@@ -1031,6 +1045,9 @@ class AntiProxyCheck:
             "bypass_details": bypass_details,
             "bypass_tls_neutralized": int(
                 (bypass_details or {}).get("tls_neutralized") or 0
+            ),
+            "bypass_events_suppressed": int(
+                (bypass_details or {}).get("events_suppressed") or 0
             ),
             "probe_method": probe_method,
             "protection_sources": protection_sources,

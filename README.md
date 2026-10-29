@@ -800,8 +800,11 @@ usa `run-as` (app debuggable) ou root.
   (`TlsShield`): `SSLContext.init`, `TrustManagerFactory`,
   `X509TrustManagerExtensions`, `Conscrypt.Platform.checkServerTrusted`,
   `CertificatePinner` e `WebViewClient.onReceivedSslError` passam a
-  aceitar o CA do proxy de auditoria. Pinning nativo (BoringSSL/Flutter)
-  continua fora do módulo e fica registrado como limitação.
+  aceitar o CA do proxy de auditoria. O `TlsShield` também filtra
+  broadcasts de evento de proxy/TLS (`NetworkProxyConfigured`,
+  `SslCertificateValidationFailed` etc.) emitidos após a neutralização.
+  Pinning nativo (BoringSSL/Flutter) continua fora do módulo e fica
+  registrado como limitação.
 - **Semântica**: `detected` exige consulta forte (`proxy`/`vpn`) ou
   reação observada. O resultado separa `reaction_observed` (log de
   ameaça ou morte do app) de `query_only` (o app consultou o canal, mas
