@@ -1,0 +1,13 @@
+# RASPilot — dependências do servidor MCP (opcional).
+#
+# A fase MCP ainda não foi iniciada. Este arquivo existe para manter a
+# dependência separada do núcleo (requirements.txt): instalar o RASPilot
+# para uso via CLI não deve puxar o SDK do MCP.
+#
+# Transporte decidido no checklist pré-MCP:
+#   - padrão: stdio (stdout reservado ao protocolo; logs em stderr);
+#   - HTTP opcional: exigir token bearer e bind em loopback por padrão.
+#
+# Instalação futura:
+#     pip install -r requirements.txt -r requirements-mcp.txt
+mcp>=1.0.0

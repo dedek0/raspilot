@@ -276,9 +276,11 @@ class Reporter:
             static_present = bool(static.get("static_detected"))
             dynamic = bool(app.get("detected"))
             observation = str(app.get("observation_status") or "")
+            query_only = bool(app.get("query_only"))
             if dynamic:
                 detection = cls._verdict(
-                    "detected", "Detectado",
+                    "detected",
+                    "Detectado (consulta)" if query_only else "Detectado",
                     app.get("details") or "checagem observada em runtime",
                     sources=list(Reporter._protection_sources(result)),
                 )
@@ -565,6 +567,14 @@ class Reporter:
                     result.get("proxy_detected")
                 )
                 summary["vpn_detected"] = bool(result.get("vpn_detected"))
+                summary["reaction_observed"] = bool(
+                    result.get("reaction_observed")
+                )
+                summary["query_only"] = bool(result.get("query_only"))
+                if result.get("bypass_tls_neutralized"):
+                    summary["tls_neutralized"] = int(
+                        result.get("bypass_tls_neutralized")
+                    )
                 summary["channels"] = (result.get("app_detection") or {}).get(
                     "channels"
                 ) or {}
@@ -744,6 +754,9 @@ class Reporter:
             "device": self.device_info,
             "package": self.package_name,
         }
+        session_id = (self.run_context or {}).get("session_id")
+        if session_id:
+            metadata["session_id"] = session_id
         if self.run_context:
             metadata["run"] = self.run_context
 

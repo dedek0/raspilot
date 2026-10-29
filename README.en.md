@@ -774,8 +774,17 @@ the report exposes `gadget.script_ran`. The marker check uses `run-as`
   `ProxySelector.select`, `Proxy.getDefaultHost/Port`,
   `LinkProperties.getHttpProxy`, `NetworkCapabilities.hasTransport`,
   `Settings.Global/Secure`, `NetworkInterface` and `VpnService.prepare`.
+  On the `module` path the bypass also installs `TlsShield`:
+  `SSLContext.init`, `TrustManagerFactory`,
+  `X509TrustManagerExtensions`, `Conscrypt.Platform.checkServerTrusted`,
+  `CertificatePinner` and `WebViewClient.onReceivedSslError` accept the
+  audit proxy CA. Native pinning (BoringSSL/Flutter) remains outside the
+  module and is reported as a limitation.
 - **Semantics**: `detected` requires a strong query (`proxy`/`vpn`) or
-  an observed reaction. Without a query, bypass is `SKIP`, not
+  an observed reaction. The result separates `reaction_observed`
+  (threat log or app death) from `query_only` (the app queried the
+  channel but did not block or react): a strong query is attack-surface
+  evidence, not proof of blocking. Without a query, bypass is `SKIP`, not
   “resisted”. A death caused by the instrumentation agent (anti-Frida)
   is not treated as proxy protection resistance.
 - **Limitation**: `getifaddrs`/`/proc/net/route` and native checks are
@@ -806,11 +815,13 @@ trace of external injection. It is also what allows the anti-emulator and
 anti-root checks to run without instrumentation: the app sees an
 emulator/root environment while running normally.
 
-The module has four configurable layers: `hook` (anti-hook), `root`
+The module has five configurable layers: `hook` (anti-hook), `root`
 (anti-root), `tamper` (integrity/signature), `emu` (anti-emulator) and `proxy`
 (proxy/VPN). Anti-root uses `RootShield` to
 observe/neutralise RootBeer, `File`, `Runtime.exec`, `SystemProperties`
-and `PackageManager`.
+and `PackageManager`. In `proxy=bypass` mode, `TlsShield` also
+neutralises certificate validation (audit proxy CA): otherwise the TLS
+handshake fails before the proxy check.
 
 ### How it works
 
@@ -1120,39 +1131,99 @@ phase.
 ## Next steps before MCP (checklist)
 
 **Status:** phase 3 (sessions/service) and the proxy/VPN vector are
-implemented. The MCP server has **not** been started.
+implemented. The pre-MCP checklist (items 1–10) is closed on the
+connected device; the MCP server has **not** been started.
 
 Before implementing MCP:
 
-- [ ] **Full device smoke:** `static → detect → bypass → report`, with
-  the `anti_proxy` check through both `--proxy-method module` and
-  `frida`. The current validation covered each path separately; the full
-  pipeline with the new vector is still pending.
-- [ ] **Updated module:** validate the module APK with `ProxyShield` on
-  a clean device. A `--module-apk` built before this change lacks the
-  layer and must be rebuilt.
-- [ ] **Async contract:** settle `run_async`, `session.status`/`progress`,
-  `cancel_requested`, per-tool timeout and orphaned `running` sessions
-  after a process crash.
-- [ ] **Session-aware tools:** define MCP signatures around `session_id`
-  (not `device_id`), returning `{session_id, status, ...}` and
-  `raspilot://sessions/...` resources.
-- [ ] **Repack confirmation:** persist the two-step flow in the session
-  (pending action/token), never reusing a confirmation across sessions
-  or devices.
-- [ ] **Concurrency:** two calls on the same device must fail fast with
-  `SessionBusy`; different devices may run in parallel.
-- [ ] **Transport/packaging:** choose `FastMCP` stdio vs HTTP, add a
-  separate dependency, keep stdout clean and logs on stderr (the service
-  is already headless).
-- [ ] **Limits/security:** per-tool timeout, cancellation, explicit
-  device selection and authentication for an HTTP transport.
-- [ ] **Schema/observability:** expose `metadata.session_id`, report
-  paths, `summary.json` and error/skip/cancel codes.
-- [ ] **MCP integration tests:** exercise the tools with a mocked
-  `RaspilotService`, without a device.
+- [x] **Full device smoke:** run on 2026-10-29 on an SM-A035M
+  (Android 13, `R9QT800CECN`) with `static → detect → bypass → report`.
+  **module** path on a test app: VPN detected and
+  `bypass_successful=true` (`ProxyShield` hid `TRANSPORT_VPN`); the full
+  pipeline (all checks) was also run with `--proxy-method module`.
+  **frida** path on a test app (bypass executed) and on a protected app
+  (agent killed by the protection → `SKIP` with an explicit reason). The
+  state-only report (`--stage report`) was also validated.
+- [x] **Updated module:** APK rebuilt with `ProxyShield` (`classes.dex`
+  contains `ProxyShield.install`) and validated on the connected device
+  with `--module-apk`. **Caveat:** the phone is not factory-clean
+  (Vector/root/other modules); repeat on a clean device for the literal
+  criterion.
+- [x] **Async contract:** `run_async()` marks `status="running"` with
+  `progress.pid`/`heartbeat_at` before submit; `status`, `progress`,
+  `cancel_requested`, `wait(timeout)` and per-tool timeouts are stable.
+  A `running` session whose owner process died becomes `interrupted` on
+  read (`SessionStore.reconcile`).
+- [x] **Session-aware tools:** `mcp_api.RaspilotTools` defines the
+  surface around `session_id` (not `device_id`), returning
+  `{session_id, status, ...}` and `raspilot://sessions/...` resources.
+  It is a transport-free facade; the MCP server will be a thin adapter.
+- [x] **Repack confirmation:** `request_repack` persists
+  `pending_action` in `session.json`; `run_repack` consumes a single-use
+  token scoped to the session/device, with expiry. It cannot be reused
+  across sessions or devices.
+- [x] **Concurrency:** simultaneous calls on the same device fail fast
+  with `SessionBusy` (on-disk lock + in-process registry); different
+  devices run in parallel.
+- [x] **Transport/packaging:** stdio is the default (clean stdout, logs
+  on stderr) and HTTP is optional with a bearer token. The dependency is
+  separate in `requirements-mcp.txt`.
+- [x] **Limits/security:** per-tool timeout, idempotent cancellation,
+  explicit device selection (`device_id` or `RASPILOT_DEVICE`) and
+  mandatory authentication on HTTP.
+- [x] **Schema/observability:** `metadata.session_id` in the report;
+  `status` exposes `report.json`/`summary.json`/`report.html` paths,
+  resources, `checks[].outcome` and stable error/skip/cancel codes.
+- [x] **MCP integration tests:** `tests/test_mcp_contract.py` and the new
+  `tests/test_sessions.py` cases exercise the tools with a mocked
+  `RaspilotService`/device, without a phone.
 
-MCP starts only after these items are closed.
+The pre-MCP checklist is closed; the MCP server can start.
+
+### Pre-MCP contract (implemented)
+
+**Session status:** `pending`, `running`, `succeeded`, `failed`,
+`cancelled` and `interrupted`. `interrupted` is set when the process
+that owned the `running` session disappeared; `cancelled` is always an
+explicit request.
+
+**Async cycle:**
+
+```python
+service = RaspilotService.create(config, store=store)
+service.run_async()                 # returns immediately
+service.status()                    # reads session.json, non-blocking
+service.wait(timeout=600)           # RunTimeout if it does not finish
+RaspilotService.cancel_session(sid) # idempotent, cross-process too
+```
+
+**Stable codes:** `session_not_found`, `session_busy`,
+`invalid_session_state`, `confirmation_required`,
+`confirmation_expired`, `confirmation_mismatch`,
+`invalid_confirmation`, `device_required`, `timeout`, `cancelled`,
+`interrupted`, `check_error`, `connect_error` and `pipeline_error`.
+
+**Tools (`mcp_api.RaspilotTools`):**
+
+| Method | Contract |
+|---|---|
+| `iniciar_avaliacao(package_name, device_id, stage, mode, only, skip)` | creates a session + `run_async`; returns `{session_id, status: "running"}` |
+| `status(session_id)` | consolidated payload, never runs checks |
+| `aguardar(session_id, timeout)` | waits to leave `pending`/`running`; `ToolTimeout` |
+| `cancelar(session_id)` | idempotent; writes `cancel_requested` |
+| `listar_sessoes()` | compact list, newest first |
+| `obter_relatorio(session_id, format)` | `json`, `summary`, `html` or `paths` |
+| `listar_recursos(session_id)` | `raspilot://sessions/...` URIs |
+| `testar_repack(session_id, …, confirmation=None)` | without a token: returns one; with a token: runs once |
+
+`iniciar_avaliacao` rejects `stage="bypass"` on a new session (bypass
+needs a prior `detect`) and requires an explicit device — there is no
+implicit selection in the MCP contract. `RASPILOT_DEVICE` may set the
+default.
+
+**Tests:** `pytest -q` covers sessions, the async contract, repack
+confirmation and the tools with a mocked service/device; no test opens
+ADB or Frida.
 
 ## MCP integration (planned, not started)
 
@@ -1185,6 +1256,10 @@ Planned resources are the ones already implemented by the session:
 `raspilot://sessions`, `raspilot://sessions/{id}/session.json`,
 `summary.json`, `report.json`, `report.html`, `static.json` and
 `checks/{check}.json`.
+
+The `mcp_api.RaspilotTools` facade already implements the core
+(start/status/wait/cancel/list/report/resources/repack); the per-check
+tools arrive with the MCP server.
 
 The JSON emitted by RASPilot follows a stable schema
 (`metadata` / `summary` / `execution_log` / `details`) designed for direct

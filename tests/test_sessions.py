@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,7 @@ import main as mainmod
 import service as service_mod
 import sessions as sessions_mod
 from service import RaspilotService, RunConfig, SessionStateError
-from sessions import SessionBusy, SessionNotFound, SessionStore
+from sessions import SessionBusy, SessionConfirmationError, SessionNotFound, SessionStore
 
 
 class FakeDevice:
@@ -435,3 +436,214 @@ def test_async_run_updates_state(tmp_path, monkeypatch):
     state = store.load(svc.state.session_id)
     assert state.status == "succeeded"
     assert state.stage == "full"
+
+
+def test_run_async_marks_running_with_pid_and_heartbeat(tmp_path, monkeypatch):
+    import threading
+
+    gate = threading.Event()
+
+    def blocked_checks(self):
+        gate.wait(10)
+
+    monkeypatch.setattr(RaspilotService, "_run_checks", blocked_checks)
+    config = _config(tmp_path, stage="full")
+    store = SessionStore(str(tmp_path / "sessions"))
+    svc = RaspilotService.create(config, store=store, device=FakeDevice())
+    future = svc.run_async()
+    try:
+        running = store.load(svc.state.session_id)
+        assert running.status == "running"
+        assert running.progress["pid"] == service_mod.os.getpid()
+        assert running.progress["heartbeat_at"]
+    finally:
+        gate.set()
+    future.result(timeout=30)
+
+
+def test_second_run_async_fails_with_session_busy(tmp_path, monkeypatch):
+    import threading
+
+    gate = threading.Event()
+    monkeypatch.setattr(
+        RaspilotService, "_run_checks", lambda self: gate.wait(10)
+    )
+    config = _config(tmp_path, stage="full")
+    store = SessionStore(str(tmp_path / "sessions"))
+    svc = RaspilotService.create(config, store=store, device=FakeDevice())
+    future = svc.run_async()
+    try:
+        with pytest.raises(SessionBusy):
+            svc.run_async()
+    finally:
+        gate.set()
+    future.result(timeout=30)
+
+
+def test_cancel_session_before_start(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions"))
+    state = store.create("com.example.app")
+    payload = RaspilotService.cancel_session(state.session_id, store=store)
+    assert payload["cancel_requested"] is True
+
+    config = _config(tmp_path, stage="detect", session_id=state.session_id)
+    svc = RaspilotService.resume(config, store=store, device=FakeDevice())
+    with pytest.raises(SessionStateError, match="cancel"):
+        svc._validate_stage()
+
+
+def test_cancel_running_session(tmp_path, monkeypatch):
+    import threading
+
+    gate = threading.Event()
+    started = threading.Event()
+
+    def slow_checks(self):
+        started.set()
+        gate.wait(10)
+        if self._cancel.is_set():
+            raise service_mod.RunCancelled("cancelada")
+        _fake_results(self)
+
+    monkeypatch.setattr(RaspilotService, "_run_checks", slow_checks)
+    config = _config(tmp_path, stage="full")
+    store = SessionStore(str(tmp_path / "sessions"))
+    svc = RaspilotService.create(config, store=store, device=FakeDevice())
+    future = svc.run_async()
+    assert started.wait(10)
+    assert store.load(svc.state.session_id).status == "running"
+
+    svc.request_cancel()
+    gate.set()
+    with pytest.raises(service_mod.RunCancelled):
+        future.result(timeout=30)
+
+    state = store.load(svc.state.session_id)
+    assert state.status == "cancelled"
+    assert state.cancel_requested is True
+    assert store.status_payload(state)["error_code"] == "cancelled"
+
+
+def test_same_device_fails_fast_with_session_busy(tmp_path, monkeypatch):
+    monkeypatch.setattr(RaspilotService, "_run_checks", _fake_results)
+    config = _config(tmp_path, stage="full")
+    store = SessionStore(str(tmp_path / "sessions"))
+    svc = RaspilotService.create(config, store=store, device=FakeDevice())
+    with store.lock("device:SER1"):
+        with pytest.raises(SessionBusy):
+            svc.run_dynamic()
+
+    state = store.load(svc.state.session_id)
+    assert state.status == "failed"
+    assert any(
+        item.get("code") == "session_busy" for item in state.errors
+    )
+
+
+def test_orphan_running_session_is_interrupted(tmp_path, monkeypatch):
+    monkeypatch.setattr(sessions_mod, "_pid_alive", lambda pid: False)
+    store = SessionStore(str(tmp_path / "sessions"))
+    state = store.create("com.example.app")
+    state.status = "running"
+    state.progress = {
+        "pid": 424242,
+        "heartbeat_at": state.updated_at,
+    }
+    store.save(state)
+
+    loaded = store.load(state.session_id)
+    assert loaded.status == "interrupted"
+    assert loaded.progress["interrupted"] is True
+    assert any(item.get("code") == "interrupted" for item in loaded.errors)
+    payload = store.status_payload(loaded)
+    assert payload["error_code"] == "interrupted"
+
+
+def test_orphan_without_pid_uses_heartbeat(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions"))
+    state = store.create("com.example.app")
+    state.status = "running"
+    old = (
+        datetime.now(timezone.utc) - timedelta(hours=2)
+    ).isoformat()
+    state.progress = {"heartbeat_at": old}
+    store.save(state)
+
+    assert store.load(state.session_id).status == "interrupted"
+
+
+def test_repack_confirmation_is_scoped_and_single_use(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions"))
+    state = store.create("com.example.app")
+    state.device = {"serial": "SER1"}
+    store.save(state)
+
+    pending = store.request_action(
+        state,
+        "repack",
+        {"variants": ["asset"], "destructive": True},
+        ttl=60,
+        device="SER1",
+    )
+    assert pending["token"] not in {
+        value
+        for value in store.pending_action_payload(state).values()
+        if isinstance(value, str)
+    }
+
+    with pytest.raises(SessionConfirmationError) as excinfo:
+        store.confirm_action(
+            state, pending["token"], action="repack", device="SER2"
+        )
+    assert excinfo.value.code == "confirmation_mismatch"
+
+    # A tentativa com device errado não consumiu o token.
+    payload = store.confirm_action(
+        state, pending["token"], action="repack", device="SER1"
+    )
+    assert payload["variants"] == ["asset"]
+
+    with pytest.raises(SessionConfirmationError) as excinfo:
+        store.confirm_action(
+            state, pending["token"], action="repack", device="SER1"
+        )
+    assert excinfo.value.code == "confirmation_required"
+
+
+def test_repack_confirmation_expires(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions"))
+    state = store.create("com.example.app")
+    state.device = {"serial": "SER1"}
+    pending = store.request_action(
+        state, "repack", {}, ttl=-1, device="SER1"
+    )
+    with pytest.raises(SessionConfirmationError) as excinfo:
+        store.confirm_action(
+            state, pending["token"], action="repack", device="SER1"
+        )
+    assert excinfo.value.code == "confirmation_expired"
+    assert store.load(state.session_id).pending_action is None
+
+
+def test_status_payload_exposes_skip_and_error_codes(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions"))
+    state = store.create("com.example.app")
+    state.results = {
+        "anti_root": {"skipped": True, "skip_reason": "sem Java"},
+        "anti_frida": {"error": "falhou"},
+    }
+    state.skips = {"anti_root": "sem Java"}
+    state.errors = [
+        {
+            "check": "anti_frida",
+            "error": "falhou",
+            "code": "check_error",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+        }
+    ]
+    store.save(state)
+    payload = store.status_payload(state)
+    assert payload["checks"]["anti_root"]["outcome"] == "skipped"
+    assert payload["checks"]["anti_frida"]["outcome"] == "error"
+    assert payload["errors"][0]["code"] == "check_error"
+    assert payload["error_code"] == "check_error"

@@ -29,6 +29,7 @@ instrumentation/
         ├── TamperShield.java     # Camada de integridade/assinatura
         ├── EmulatorShield.java   # Camada de emulador
         ├── ProxyShield.java      # Camada de proxy/VPN
+        ├── TlsShield.java        # Neutralização TLS (CA de proxy/pinning)
         ├── Evidence.java         # Emissor de evidência (logcat)
         ├── SilentProcess.java    # Processo sem efeito
         └── SilentOutputStream.java
@@ -143,6 +144,15 @@ A camada de proxy/VPN atua sobre `System.getProperty`, `ProxySelector`,
 `android.net.Proxy`, `LinkProperties`, `NetworkCapabilities.hasTransport`,
 `Settings.Global/Secure`, `NetworkInterface` e `VpnService.prepare`. No
 modo probe o app enxerga proxy/VPN; no bypass os canais são ocultados.
+
+No modo `proxy=bypass`, a camada TLS (`TlsShield`) também é instalada:
+`SSLContext.init`, `TrustManagerFactory`, `X509TrustManagerExtensions`,
+`Conscrypt.Platform.checkServerTrusted`, `CertificatePinner` (OkHttp e
+`com.android.okhttp`), `HostnameVerifier` e `WebViewClient.onReceivedSslError`
+passam a aceitar o CA do proxy de auditoria. Isso é necessário porque,
+com um proxy MITM, a validação de certificado falha antes da checagem de
+proxy. Pinning nativo (BoringSSL, Flutter) continua fora do módulo e
+aparece como limitação no relatório.
 
 A camada de root observa/neutraliza `File.exists` (e variantes),
 `Runtime.exec`/`ProcessBuilder.start` com `su`/Magisk/busybox,

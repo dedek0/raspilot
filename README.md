@@ -796,10 +796,19 @@ usa `run-as` (app debuggable) ou root.
   `ProxySelector.select`, `Proxy.getDefaultHost/Port`,
   `LinkProperties.getHttpProxy`, `NetworkCapabilities.hasTransport`,
   `Settings.Global/Secure`, `NetworkInterface` e `VpnService.prepare`.
+  No caminho `module`, o bypass também instala a camada TLS
+  (`TlsShield`): `SSLContext.init`, `TrustManagerFactory`,
+  `X509TrustManagerExtensions`, `Conscrypt.Platform.checkServerTrusted`,
+  `CertificatePinner` e `WebViewClient.onReceivedSslError` passam a
+  aceitar o CA do proxy de auditoria. Pinning nativo (BoringSSL/Flutter)
+  continua fora do módulo e fica registrado como limitação.
 - **Semântica**: `detected` exige consulta forte (`proxy`/`vpn`) ou
-  reação observada. Sem tráfego/consulta, o bypass fica `SKIP`, não
-  “resistiu”. Uma morte causada pelo agente de instrumentação (anti-Frida)
-  não é contada como resistência da proteção de proxy.
+  reação observada. O resultado separa `reaction_observed` (log de
+  ameaça ou morte do app) de `query_only` (o app consultou o canal, mas
+  não bloqueou nem reagiu): uma consulta forte é evidência de
+  superfície, não prova de bloqueio. Sem tráfego/consulta, o bypass fica
+  `SKIP`, não “resistiu”. Uma morte causada pelo agente de instrumentação
+  (anti-Frida) não é contada como resistência da proteção de proxy.
 - **Limite**: `getifaddrs`/`/proc/net/route` e verificações nativas não
   são cobertas pelo módulo/script; o relatório registra isso em
   `device_coverage.not_covered`.
@@ -844,11 +853,13 @@ O módulo neutraliza as consultas do app e o auditor observa o resultado
 anti-emulador e o anti-root sem depender da instrumentação: o app enxerga
 um emulador/root enquanto roda normalmente.
 
-O módulo tem quatro camadas configuráveis: `hook` (anti-hook), `root`
+O módulo tem cinco camadas configuráveis: `hook` (anti-hook), `root`
 (anti-root), `tamper` (integridade/assinatura), `emu` (anti-emulador) e `proxy`
 (proxy/VPN). O anti-root usa `RootShield` para
 observar/neutralizar RootBeer, `File`, `Runtime.exec`, `SystemProperties`
-e `PackageManager`.
+e `PackageManager`. No modo `proxy=bypass`, o `TlsShield` também
+neutraliza a validação de certificado (CA do proxy de auditoria): sem
+isso o handshake TLS falha antes da checagem de proxy.
 
 ### Como funciona
 
@@ -1163,39 +1174,98 @@ IDs estáveis. O MCP continua **depois** desta fase.
 ## Próximos passos antes do MCP (checklist)
 
 **Status:** fase 3 (sessões/serviço) e o vetor proxy/VPN estão
-implementados. O servidor MCP **ainda não foi iniciado**.
+implementados. O checklist pré-MCP (itens 1–10) foi fechado no device
+conectado; o servidor MCP **ainda não foi iniciado**.
 
 Antes de implementar o MCP:
 
-- [ ] **Smoke completo em device:** `static → detect → bypass → report`,
-  com o check `anti_proxy` nos caminhos `--proxy-method module` e
-  `frida`. A validação atual cobriu os caminhos isoladamente; falta o
-  pipeline completo com o novo vetor.
-- [ ] **Módulo atualizado:** validar o APK do módulo com `ProxyShield`
-  em um device limpo. Um `--module-apk` gerado antes desta mudança não
-  contém essa camada e precisa ser reconstruído.
-- [ ] **Contrato assíncrono:** fechar semântica de `run_async`,
-  `session.status`/`progress`, `cancel_requested`, timeout por tool e
-  tratamento de sessão `running` órfã após queda do processo.
-- [ ] **Ferramentas session-aware:** definir as assinaturas MCP em torno
-  de `session_id` (não `device_id`), com retorno
+- [x] **Smoke completo em device:** executado em 2026-10-29 no
+  SM-A035M (Android 13, `R9QT800CECN`) com
+  `static → detect → bypass → report`. Caminho **module** em um app de
+  teste: detecção de VPN e `bypass_successful=true`
+  (`ProxyShield` ocultou `TRANSPORT_VPN`); pipeline completo (todos os
+  checks) também foi rodado com `--proxy-method module`. Caminho
+  **frida** em app de teste (bypass executado) e em app protegido
+  (agente derrubado pela proteção → `SKIP` com motivo explícito). O
+  relatório só de estado (`--stage report`) também foi validado.
+- [x] **Módulo atualizado:** APK reconstruído com `ProxyShield`
+  (`classes.dex` contém `ProxyShield.install`) e validado no device
+  conectado com `--module-apk`. **Ressalva:** o aparelho não é
+  factory-clean (Vector/root/outros módulos); repetir em um device limpo
+  para o critério literal.
+- [x] **Contrato assíncrono:** `run_async()` marca `status="running"`
+  com `progress.pid`/`heartbeat_at` antes do submit; `status`,
+  `progress`, `cancel_requested`, `wait(timeout)` e timeout por
+  ferramenta são estáveis. Sessão `running` cujo processo dono morreu
+  vira `interrupted` na leitura (`SessionStore.reconcile`).
+- [x] **Ferramentas session-aware:** `mcp_api.RaspilotTools` define a
+  superfície em torno de `session_id` (não `device_id`), com retorno
   `{session_id, status, ...}` e recursos `raspilot://sessions/...`.
-- [ ] **Confirmação do repack:** persistir o fluxo em duas etapas na
-  própria sessão (ação pendente/token), sem reutilizar confirmação entre
-  sessões ou devices.
-- [ ] **Concorrência:** duas chamadas no mesmo device devem falhar rápido
-  com `SessionBusy`; devices diferentes podem rodar em paralelo.
-- [ ] **Transporte/empacotamento:** decidir `FastMCP` stdio vs HTTP,
-  adicionar dependência separada, manter stdout limpo e logs em stderr
-  (o serviço já é headless).
-- [ ] **Limites/segurança:** timeout por tool, cancelamento, seleção
-  explícita de device e autenticação caso o transporte seja HTTP.
-- [ ] **Schema/observabilidade:** expor `metadata.session_id`, caminhos
-  dos relatórios, `summary.json` e códigos de erro/skip/cancel.
-- [ ] **Testes de integração MCP:** exercitar as ferramentas com
-  `RaspilotService` mockado, sem device.
+  É uma fachada sem transporte; o servidor MCP será um adaptador fino.
+- [x] **Confirmação do repack:** `request_repack` persiste
+  `pending_action` em `session.json`; `run_repack` consome um token de
+  uso único, com escopo de sessão/device e expiração. Não há
+  reutilização entre sessões ou aparelhos.
+- [x] **Concorrência:** chamadas simultâneas no mesmo device falham
+  rápido com `SessionBusy` (lock em disco + registro em processo);
+  devices diferentes rodam em paralelo.
+- [x] **Transporte/empacotamento:** decidido stdio como padrão (stdout
+  limpo, logs em stderr) e HTTP opcional com token bearer. A dependência
+  fica separada em `requirements-mcp.txt`.
+- [x] **Limites/segurança:** timeout por ferramenta, cancelamento
+  idempotente, seleção explícita de device (`device_id` ou
+  `RASPILOT_DEVICE`) e autenticação obrigatória no transporte HTTP.
+- [x] **Schema/observabilidade:** `metadata.session_id` no relatório;
+  `status` expõe caminhos de `report.json`/`summary.json`/`report.html`,
+  recursos, `checks[].outcome` e códigos estáveis de erro/skip/cancel.
+- [x] **Testes de integração MCP:** `tests/test_mcp_contract.py` e os
+  novos casos de `tests/test_sessions.py` exercitam as ferramentas com
+  `RaspilotService`/device mockados, sem aparelho.
 
-O MCP só começa depois que esses itens estiverem fechados.
+O checklist pré-MCP está fechado; o servidor MCP pode ser iniciado.
+
+### Contrato pré-MCP (implementado)
+
+**Status da sessão:** `pending`, `running`, `succeeded`, `failed`,
+`cancelled` e `interrupted`. `interrupted` é atribuído quando o processo
+dono do `running` desapareceu; `cancelled` é sempre um pedido explícito.
+
+**Ciclo assíncrono:**
+
+```python
+service = RaspilotService.create(config, store=store)
+service.run_async()                 # retorna imediatamente
+service.status()                    # lê session.json, não bloqueia
+service.wait(timeout=600)           # RunTimeout se não terminar
+RaspilotService.cancel_session(sid) # idempotente, inclusive cross-process
+```
+
+**Códigos estáveis:** `session_not_found`, `session_busy`,
+`invalid_session_state`, `confirmation_required`,
+`confirmation_expired`, `confirmation_mismatch`,
+`invalid_confirmation`, `device_required`, `timeout`, `cancelled`,
+`interrupted`, `check_error`, `connect_error` e `pipeline_error`.
+
+**Ferramentas (`mcp_api.RaspilotTools`):**
+
+| Método | Contrato |
+|---|---|
+| `iniciar_avaliacao(package_name, device_id, stage, mode, only, skip)` | cria sessão + `run_async`; devolve `{session_id, status: "running"}` |
+| `status(session_id)` | payload consolidado, sem executar checks |
+| `aguardar(session_id, timeout)` | espera sair de `pending`/`running`; `ToolTimeout` |
+| `cancelar(session_id)` | idempotente; grava `cancel_requested` |
+| `listar_sessoes()` | lista resumida, mais recentes primeiro |
+| `obter_relatorio(session_id, format)` | `json`, `summary`, `html` ou `paths` |
+| `listar_recursos(session_id)` | URIs `raspilot://sessions/...` |
+| `testar_repack(session_id, …, confirmation=None)` | sem token: devolve token; com token: executa uma vez |
+
+`iniciar_avaliacao` recusa `stage="bypass"` numa sessão nova (bypass exige
+`detect` prévio) e exige device explícito — não há seleção implícita no
+contrato MCP. `RASPILOT_DEVICE` pode definir o padrão.
+
+**Testes:** `pytest -q` cobre sessões, contrato assíncrono, confirmação
+de repack e as ferramentas com serviço/device mockados; nenhum teste
+abre ADB ou Frida.
 
 ## Integração MCP (planejada, não iniciada)
 
@@ -1228,6 +1298,10 @@ Os recursos previstos são os já implementados pela sessão:
 `raspilot://sessions`, `raspilot://sessions/{id}/session.json`,
 `summary.json`, `report.json`, `report.html`, `static.json` e
 `checks/{check}.json`.
+
+A fachada `mcp_api.RaspilotTools` já implementa o núcleo
+(iniciar/status/aguardar/cancelar/listar/relatório/recursos/repack); as
+ferramentas por check entram junto com o servidor MCP.
 
 O JSON emitido pelo RASPilot segue um schema estável
 (`metadata` / `summary` / `execution_log` / `details`) pensado para leitura

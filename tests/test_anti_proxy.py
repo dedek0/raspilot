@@ -18,8 +18,9 @@ def _make_apk(path, blobs: dict) -> str:
 class FakeXposed:
     """Gerenciador de módulo fake com evidência pré-definida."""
 
-    def __init__(self, evidence):
+    def __init__(self, evidence, lines=None):
         self.evidence = evidence
+        self.lines = list(lines or [])
         self.calls = []
 
     def detect(self):
@@ -33,7 +34,7 @@ class FakeXposed:
                 "pid": 123,
                 "app_alive_at_end": True,
                 "evidence": self.evidence,
-                "lines": [],
+                "lines": self.lines,
                 "module_ready": True,
             },
             "error": None,
@@ -84,6 +85,30 @@ def test_module_probe_parses_proxy_queries():
     assert result["detected"] is True
     assert result["strong_signals"]
     assert result["channels"]["proxy"]
+    # A consulta forte conta como detecção, mas não é uma reação do app.
+    assert result["reaction_observed"] is False
+    assert result["query_only"] is True
+    assert "sem reação" in result["details"]
+
+
+def test_module_probe_marks_observed_threat_as_reaction():
+    evidence = [
+        {
+            "kind": "observe", "channel": "proxy:vpn",
+            "method": "NetworkCapabilities.hasTransport", "detail": "TRANSPORT_VPN",
+        },
+    ]
+    lines = [
+        "10-29 13:00:00.000 123 456 I C6Bank: vpn detected: blocking access"
+    ]
+    check = AntiProxyCheck(
+        object(), method="module", xposed=FakeXposed(evidence, lines=lines)
+    )
+    result = check.attempt_module_probe("com.example.app", window=1)
+    assert result["detected"] is True
+    assert result["reaction_observed"] is True
+    assert result["query_only"] is False
+    assert result["details"].startswith("app reagiu")
 
 
 def test_module_bypass_reports_success_with_masked_channel():
@@ -104,6 +129,28 @@ def test_module_bypass_reports_success_with_masked_channel():
     assert result["success"] is True
     assert result["masked_channels"]
     assert result["evidence_strength"] == "masked"
+    assert result["tls_neutralized"] == 0
+
+
+def test_module_bypass_records_tls_layer():
+    evidence = [
+        {
+            "kind": "neutralize", "channel": "tls",
+            "method": "SSLContext.init", "detail": "trust manager permissivo",
+        },
+        {
+            "kind": "neutralize", "channel": "tls",
+            "method": "Conscrypt.Platform.checkServerTrusted",
+            "detail": "validação ignorada",
+        },
+    ]
+    check = AntiProxyCheck(
+        object(), method="module", xposed=FakeXposed(evidence)
+    )
+    result = check.attempt_module_bypass("com.example.app", window=1)
+    assert result["tls_neutralized"] == 2
+    assert "SSLContext.init" in result["tls_methods"]
+    assert "Conscrypt.Platform.checkServerTrusted" in result["tls_methods"]
 
 
 def _clean_profile():

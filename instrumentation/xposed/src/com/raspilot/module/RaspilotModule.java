@@ -51,6 +51,11 @@ public class RaspilotModule implements IXposedHookLoadPackage, IXposedHookZygote
             }
             if (config.proxyEnabled()) {
                 ProxyShield.install(config, classLoader);
+                if (config.proxyBypass()) {
+                    // Um proxy de auditoria exige aceitar o CA do proxy;
+                    // sem isso o handshake falha antes da checagem de proxy.
+                    TlsShield.install(classLoader);
+                }
             }
             Evidence.emit("ready", "module", "handleLoadPackage",
                     "pkg=" + pkg + " hook=" + config.hookMode

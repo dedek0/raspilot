@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set
@@ -48,9 +49,12 @@ from reporter import Reporter
 from script_loader import safe_detach, set_js_runtime
 from sessions import (
     SessionBusy,
+    SessionConfirmationError,
     SessionError,
     SessionState,
     SessionStore,
+    SessionTimeout,
+    wait_for_status,
 )
 
 logger = logging.getLogger("raspilot.service")
@@ -65,13 +69,29 @@ KNOWN_CHECKS = (
 # por device em SessionStore serializa o que precisa ser serializado.
 _EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="raspilot-run")
 
+# Registro em processo das sessões em execução. O lock em disco cobre
+# outros processos; este mapa permite cancelar/consultar sem redescobrir
+# o serviço e evita duas execuções no mesmo session_id neste processo.
+_RUNNING_LOCK = threading.Lock()
+_RUNNING_SERVICES: Dict[str, "RaspilotService"] = {}
+
 
 class RunCancelled(Exception):
     """Execução cancelada entre dois checks."""
 
+    code = "cancelled"
+
+
+class RunTimeout(SessionTimeout):
+    """A ferramenta esgotou o tempo de espera pela execução."""
+
+    code = "timeout"
+
 
 class SessionStateError(SessionError):
     """Estado de sessão incompatível com a etapa pedida."""
+
+    code = "invalid_session_state"
 
 
 # ----------------------------------------------------------------------
@@ -343,6 +363,7 @@ class RaspilotService:
         self._avd: Optional[AvdManager] = None
         self._owns_device = device is None
         self._cancel = threading.Event()
+        self._future: Optional[Future] = None
         if state is not None:
             self.static_profile = state.static
 
@@ -403,19 +424,139 @@ class RaspilotService:
         )
 
     def request_cancel(self) -> None:
-        """Solicita cancelamento entre dois checks."""
+        """Solicita cancelamento entre dois checks.
+
+        O flag é gravado em ``session.json`` e também no evento local.
+        Uma sessão que ainda não começou é cancelada imediatamente; uma
+        que já está rodando para no próximo limite entre checks.
+        """
         self._cancel.set()
-        if self.state is not None and self.store is not None:
-            self.state.cancel_requested = True
+        if self.state is None or self.store is None:
+            return
+        self.state.cancel_requested = True
+        self.state.progress = dict(self.state.progress or {})
+        self.state.progress["cancel_requested_at"] = self._now()
+        self.state.progress["updated_at"] = self._now()
+        self.store.save(self.state)
+        future = self._future
+        if future is not None and future.cancel():
+            self.state.status = "cancelled"
+            self.state.progress["finished_at"] = self._now()
+            self.state.progress["current_check"] = None
             self.store.save(self.state)
+
+    @classmethod
+    def cancel_session(
+        cls, session_id: str, store: Optional[SessionStore] = None
+    ) -> dict:
+        """Cancela uma sessão, esteja ela local ou em outro processo.
+
+        Chamadas repetidas são idempotentes para sessões já encerradas.
+        """
+        store = store or SessionStore()
+        with _RUNNING_LOCK:
+            service = _RUNNING_SERVICES.get(session_id)
+        if service is not None:
+            service.request_cancel()
+            return store.status_payload(service.state)
+        state = store.load(session_id)
+        if state.status in ("pending", "running"):
+            state.cancel_requested = True
+            state.progress = dict(state.progress or {})
+            state.progress["cancel_requested_at"] = cls._now()
+            state.progress["updated_at"] = cls._now()
+            store.save(state)
+        return store.status_payload(state)
 
     def run_async(self) -> Future:
         """Executa :meth:`run` no executor compartilhado.
 
-        O estado é persistido durante a execução; um cliente MCP pode
-        acompanhar ``session.json``/``progress`` enquanto o future roda.
+        O estado é marcado como ``running`` antes do submit e o
+        ``run_async`` retorna imediatamente. Um cliente MCP acompanha
+        ``session.json``/``progress`` (ou chama :meth:`wait`); um segundo
+        ``run_async`` para a mesma sessão falha com :class:`SessionBusy`.
         """
-        return _EXECUTOR.submit(self.run)
+        session_id = self.state.session_id if self.state is not None else None
+        if session_id:
+            with _RUNNING_LOCK:
+                if session_id in _RUNNING_SERVICES:
+                    raise SessionBusy(
+                        f"a sessão {session_id} já está em execução"
+                    )
+                _RUNNING_SERVICES[session_id] = self
+        self._mark_running(self.config.stage)
+        try:
+            future = _EXECUTOR.submit(self.run)
+        except Exception:
+            if session_id:
+                with _RUNNING_LOCK:
+                    _RUNNING_SERVICES.pop(session_id, None)
+            raise
+        self._future = future
+        if session_id:
+            future.add_done_callback(
+                lambda _future, sid=session_id: self._end_async(sid)
+            )
+        return future
+
+    def _end_async(self, session_id: str) -> None:
+        with _RUNNING_LOCK:
+            _RUNNING_SERVICES.pop(session_id, None)
+
+    def wait(self, timeout: float = 0.0, poll: float = 0.5) -> dict:
+        """Aguarda a execução local e devolve o status consolidado.
+
+        Raises:
+            RunTimeout: quando ``timeout > 0`` e a execução não terminou.
+        """
+        if self.state is None:
+            raise SessionStateError("status exige uma sessão carregada")
+        future = self._future
+        if future is not None:
+            try:
+                future.result(timeout=None if timeout <= 0 else timeout)
+            except FutureTimeout as exc:
+                raise RunTimeout(
+                    f"sessão {self.state.session_id} não terminou em "
+                    f"{timeout:g}s"
+                ) from exc
+            except Exception:
+                # A falha já está registrada em session.json/errors.
+                logger.debug("Execução assíncrona terminou com erro", exc_info=True)
+        elif timeout > 0 and self.store is not None:
+            wait_for_status(self.store, self.state.session_id, timeout, poll)
+        return self.status()
+
+    def _mark_running(self, stage: str, total: Optional[int] = None) -> None:
+        """Grava ``running`` com PID/heartbeat antes de qualquer check."""
+        if self.state is None or self.store is None:
+            return
+        now = self._now()
+        self.state.status = "running"
+        self.state.progress = {
+            "stage": stage,
+            "pid": os.getpid(),
+            "started_at": now,
+            "heartbeat_at": now,
+            "updated_at": now,
+            "current_check": None,
+        }
+        if total is not None:
+            self.state.progress["total"] = total
+        self.store.save(self.state)
+
+    def _cancel_requested_on_disk(self) -> bool:
+        """Lê ``cancel_requested`` do disco (cancelamento entre processos)."""
+        if self.state is None or self.store is None:
+            return False
+        try:
+            state = self.store.load(self.state.session_id)
+        except SessionError:
+            return False
+        if state.cancel_requested:
+            self.state.cancel_requested = True
+            return True
+        return False
 
     # -- utilidades ----------------------------------------------------
     @staticmethod
@@ -458,7 +599,7 @@ class RaspilotService:
             )
             return None
 
-        if self._cancel.is_set():
+        if self._cancel.is_set() or self._cancel_requested_on_disk():
             raise RunCancelled("execução cancelada antes de " + check_name)
         if self.state is not None:
             self._persist_progress(check_name, done=False)
@@ -478,6 +619,7 @@ class RaspilotService:
             self.errors.append({
                 "check": check_name,
                 "error": str(exc),
+                "code": "check_error",
                 "timestamp": self._now(),
             })
             self.reporter.collect(check_name, {"error": str(exc)})
@@ -494,12 +636,15 @@ class RaspilotService:
         return result
 
     def _persist_progress(self, check_name: str, done: bool) -> None:
-        """Atualiza ``session.json`` após/antes de cada check."""
+        """Atualiza ``session.json`` e o heartbeat após/antes de cada check."""
         if self.state is None or self.store is None:
             return
+        now = self._now()
         progress = self.state.progress
         progress["current_check"] = None if done else check_name
-        progress["updated_at"] = self._now()
+        progress["updated_at"] = now
+        progress["heartbeat_at"] = now
+        progress["pid"] = os.getpid()
         if done:
             progress["completed"] = int(progress.get("completed") or 0) + 1
         self.store.save(self.state)
@@ -601,13 +746,7 @@ class RaspilotService:
         é responsabilidade do CLI/sessão.
         """
         if self.state is not None and self.store is not None:
-            self.state.status = "running"
-            self.state.progress = {
-                "stage": "static",
-                "started_at": self._now(),
-                "updated_at": self._now(),
-            }
-            self.store.save(self.state)
+            self._mark_running("static")
         try:
             if not self.config.apk:
                 self._connect()
@@ -710,6 +849,184 @@ class RaspilotService:
             return {}
         return self.store.resources(self.state)
 
+    def status(self) -> dict:
+        """Status consolidado da sessão (sem executar checks)."""
+        if self.state is None:
+            raise SessionStateError("status exige uma sessão carregada")
+        if self.store is None:
+            raise SessionStateError("status exige um SessionStore")
+        return self.store.status_payload(self.state)
+
+    # -- repack destrutivo (confirmação em duas etapas) -----------------
+    def _device_serial(self) -> str:
+        saved = (self.state.device or {}) if self.state is not None else {}
+        return str(self.config.device_id or saved.get("serial") or "")
+
+    def request_repack(
+        self,
+        variants: Optional[Iterable[str]] = None,
+        gadget: Optional[str] = None,
+        ttl: float = 900.0,
+    ) -> dict:
+        """Etapa 1 do repack: persiste uma ação pendente na sessão.
+
+        Não desinstala nada. Devolve o token de confirmação e o prazo;
+        a etapa 2 (:meth:`run_repack`) consome o token uma única vez.
+        """
+        if self.state is None or self.store is None:
+            raise SessionStateError(
+                "o repack exige uma sessão (RaspilotService.create/resume)"
+            )
+        serial = self._device_serial()
+        if not serial:
+            error = SessionStateError(
+                "selecione o device antes de pedir confirmação de repack"
+            )
+            error.code = "device_required"
+            raise error
+        payload = {
+            "variants": list(
+                variants or self.config.tamper_variants or ["asset", "dex"]
+            ),
+            "gadget": gadget,
+            "destructive": True,
+            "wipes_app_data": True,
+        }
+        self.store.request_action(
+            self.state, "repack", payload, ttl=ttl, device=serial
+        )
+        pending = self.store.pending_action_payload(
+            self.state, reveal_token=True
+        ) or {}
+        return {
+            "session_id": self.state.session_id,
+            "status": "confirmation_required",
+            "destructive": True,
+            "package": self.state.package,
+            "device": serial,
+            "confirmation_token": pending.get("confirmation_token"),
+            "expires_at": pending.get("expires_at"),
+            "variants": payload["variants"],
+            "gadget": gadget,
+        }
+
+    def run_repack(
+        self,
+        confirmation: str,
+        variants: Optional[Iterable[str]] = None,
+        gadget: Optional[str] = None,
+    ) -> dict:
+        """Etapa 2 do repack: valida o token e executa o teste destrutivo.
+
+        O token é de uso único, pertence a esta sessão e ao device atual.
+        Sem token válido nada é desinstalado.
+        """
+        if self.state is None or self.store is None:
+            raise SessionStateError(
+                "o repack exige uma sessão (RaspilotService.create/resume)"
+            )
+        serial = self._device_serial()
+        payload = self.store.confirm_action(
+            self.state,
+            confirmation,
+            action="repack",
+            device=serial,
+        )
+        chosen = list(
+            variants
+            or payload.get("variants")
+            or self.config.tamper_variants
+            or ["asset", "dex"]
+        )
+        gadget_value = gadget or payload.get("gadget")
+        self.config.tamper_method = "repack"
+        self.config.tamper_allow_reinstall = True
+        self.config.tamper_variants = chosen
+        if gadget_value:
+            self.config.tamper_gadget = str(gadget_value)
+        return self._run_repack(chosen, gadget_value)
+
+    def _run_repack(
+        self, variants: Iterable[str], gadget: Optional[str]
+    ) -> dict:
+        from checks.tamper_repack import RepackTester
+
+        config = self.config
+        self.timings = {}
+        self.errors = []
+        self._mark_running("repack")
+        try:
+            self._connect()
+            self.device_info = self.dm.get_device_info()
+            self._validate_device()
+            serial = self.device_info.get("serial") or "default"
+            with self._device_lock(serial):
+                self._prepare_reporter()
+                self.reporter.static_profile = self.static_profile
+                self._annotate_static_context()
+                if self.state is not None:
+                    self.reporter.run_context["session_id"] = (
+                        self.state.session_id
+                    )
+                probe = RepackTester(
+                    self.dm,
+                    config.package,
+                    apk_path=config.apk,
+                    output_dir=self._artifacts_dir(),
+                    window=config.window,
+                    variants=tuple(variants),
+                    installer=config.tamper_installer,
+                    allow_reinstall=True,
+                    restore=not config.tamper_no_restore,
+                    keep_artifacts=config.tamper_keep_artifacts,
+                    timeout=config.tamper_timeout,
+                    gadget_path=(
+                        str(gadget) if gadget else config.tamper_gadget
+                    ),
+                    gadget_port=config.tamper_gadget_port,
+                    gadget_mode=config.tamper_gadget_mode,
+                    gadget_script=config.tamper_gadget_script,
+                    key_path=config.tamper_key,
+                    key_alias=config.tamper_key_alias,
+                    key_pass=config.tamper_key_pass,
+                    store_pass=config.tamper_store_pass,
+                ).run()
+                self.reporter.collect(
+                    "anti_tampering",
+                    {
+                        "method": "repack",
+                        "static_detected": False,
+                        **probe,
+                    },
+                )
+                result = RunResult(
+                    reporter=self.reporter,
+                    device_info=dict(self.device_info),
+                    static_profile=self.static_profile,
+                )
+                self._persist_session(
+                    result, target=self.state.stage, action="repack"
+                )
+                return {
+                    "session_id": self.state.session_id,
+                    "status": self.state.status,
+                    "package": config.package,
+                    "device": serial,
+                    "probe": probe,
+                    "reports": dict(self.state.reports),
+                }
+        except Exception as exc:
+            self.errors.append({
+                "check": "anti_tampering",
+                "error": str(exc),
+                "code": "check_error",
+                "timestamp": self._now(),
+            })
+            self._mark_finished("failed")
+            raise
+        finally:
+            self._cleanup()
+
     def run_dynamic(
         self,
         mode: Optional[str] = None,
@@ -745,16 +1062,15 @@ class RaspilotService:
 
         if self.state is not None:
             self.state.cancel_requested = False
-            self.state.status = "running"
             self.state.mode = config.mode
-            self.state.progress = {
-                "stage": config.stage,
-                "started_at": self._now(),
-                "updated_at": self._now(),
+            self._mark_running(
+                config.stage,
+                total=len(set(KNOWN_CHECKS) - self.skip),
+            )
+            self.state.progress.update({
                 "completed": 0,
-                "total": len(set(KNOWN_CHECKS) - self.skip),
                 "current_check": None,
-            }
+            })
             if self.store is not None:
                 self.store.save(self.state)
 
@@ -766,6 +1082,7 @@ class RaspilotService:
             self.errors.append({
                 "check": "connect",
                 "error": str(exc),
+                "code": "connect_error",
                 "timestamp": self._now(),
             })
             self._mark_finished("failed")
@@ -801,7 +1118,7 @@ class RaspilotService:
                     )
                 self._xposed = self._prepare_instrumentation()
 
-                if self._cancel.is_set():
+                if self._cancel.is_set() or self._cancel_requested_on_disk():
                     raise RunCancelled("execução cancelada")
                 self._run_checks()
 
@@ -826,6 +1143,7 @@ class RaspilotService:
                 self.errors.append({
                     "check": "pipeline",
                     "error": str(exc),
+                    "code": "pipeline_error",
                     "timestamp": self._now(),
                 })
                 self._mark_finished("failed")
@@ -848,6 +1166,7 @@ class RaspilotService:
                 self.errors.append({
                     "check": "lock",
                     "error": str(exc),
+                    "code": "session_busy",
                     "timestamp": self._now(),
                 })
                 self._mark_finished("failed")
@@ -959,16 +1278,26 @@ class RaspilotService:
         """Registra o desfecho da execução no estado da sessão."""
         if self.state is None or self.store is None:
             return
+        now = self._now()
         self.state.status = status
         self.state.errors.extend(self.errors)
-        self.state.progress["finished_at"] = self._now()
+        self.state.progress = dict(self.state.progress or {})
+        self.state.progress["finished_at"] = now
+        self.state.progress["heartbeat_at"] = now
         self.state.progress["current_check"] = None
-        self.state.updated_at = self._now()
+        if status == "cancelled":
+            self.state.progress["code"] = "cancelled"
+        self.state.updated_at = now
         self.store.save(self.state)
         if status == "succeeded":
             self.store.prune()
 
-    def _persist_session(self, result: RunResult) -> None:
+    def _persist_session(
+        self,
+        result: RunResult,
+        target: Optional[str] = None,
+        action: Optional[str] = None,
+    ) -> None:
         """Grava relatório, summary, checks e estado da sessão."""
         state = self.state
         store = self.store
@@ -987,13 +1316,14 @@ class RaspilotService:
             if payload.get("skipped")
         }
         state.run_context = dict(result.reporter.run_context)
-        state.last_action = self.config.stage
-        if self.config.mode == "detect":
-            target = "detect"
-        elif self.config.stage == "full":
-            target = "full"
-        else:
-            target = "bypass"
+        state.last_action = action or self.config.stage
+        if target is None:
+            if self.config.mode == "detect":
+                target = "detect"
+            elif self.config.stage == "full":
+                target = "full"
+            else:
+                target = "bypass"
         state.advance(target)
         state.status = "succeeded" if state.results else "failed"
         state.progress.update({
@@ -1035,11 +1365,13 @@ class RaspilotService:
                 "generate_report exige uma sessão carregada"
             )
         state = self.state
+        run_context = dict(state.run_context or {})
+        run_context.setdefault("session_id", state.session_id)
         reporter = Reporter(
             device_info=state.device or {},
             package_name=state.package,
             output_dir=state.directory,
-            run_context=state.run_context,
+            run_context=run_context,
             timestamp=_existing_report_timestamp(store=self.store, state=state)
             or _parse_iso(state.created_at),
             static_profile=state.static,

@@ -382,6 +382,7 @@ class AntiProxyCheck:
                 found.append(entry)
                 strong.append(entry)
         death = None if alive else "unclassified_death"
+        reaction = bool(threat_lines) or not alive
         if not alive and death in ("rasp_kill", "rasp_reaction"):
             entry = f"app_terminated: processo encerrou durante o probe ({death})"
             if entry not in found:
@@ -407,15 +408,21 @@ class AntiProxyCheck:
             "app_alive_at_end": alive,
             "observed": True,
             "observation_status": observation_status,
+            "reaction_observed": reaction,
+            "query_only": bool(strong) and not reaction,
             "death_cause": logcat.get("death"),
             "death_classification": death,
             "logcat": logcat,
             "logcat_evidence": format_evidence(logcat),
             "details": (
                 f"app reagiu à presença de proxy/VPN: {'; '.join(strong[:5])}"
-                if strong else (
-                    "app consultou APIs de rede, sem reação"
-                    if weak else "nenhuma checagem de proxy/VPN observada"
+                if strong and reaction else (
+                    "app consultou canal forte de proxy/VPN, sem reação "
+                    f"observada: {'; '.join(strong[:5])}"
+                    if strong else (
+                        "app consultou APIs de rede, sem canal forte nem reação"
+                        if weak else "nenhuma checagem de proxy/VPN observada"
+                    )
                 )
             ),
             **({"error": error} if error else {}),
@@ -464,6 +471,16 @@ class AntiProxyCheck:
             "masked_channels": masked,
             "exposed_channels": exposed,
             "detection_signals": signals,
+            "tls_neutralized": sum(
+                1
+                for item in run.get("evidence") or []
+                if item.get("channel") == "tls"
+            ),
+            "tls_methods": sorted({
+                str(item.get("method"))
+                for item in run.get("evidence") or []
+                if item.get("channel") == "tls"
+            })[:10],
             "death_cause": logcat.get("death"),
             "death_classification": death,
             "logcat": logcat,
@@ -496,6 +513,8 @@ class AntiProxyCheck:
             "app_alive_at_end": None,
             "observed": False,
             "observation_status": "error",
+            "reaction_observed": False,
+            "query_only": False,
             "method": method,
         }
 
@@ -674,6 +693,9 @@ class AntiProxyCheck:
         elif java_load_error and not strong:
             observation_status = "error"
             error = f"hooks Java de proxy/VPN não carregaram: {java_load_error}"
+        reaction = bool(threat_lines) or (
+            not alive and death in ("rasp_kill", "rasp_reaction")
+        )
         return {
             "detected": bool(strong),
             "detection_methods_found": found,
@@ -686,6 +708,8 @@ class AntiProxyCheck:
             "died_after": died_after,
             "observed": True,
             "observation_status": observation_status,
+            "reaction_observed": reaction,
+            "query_only": bool(strong) and not reaction,
             "death_cause": logcat.get("death"),
             "death_classification": death,
             "baseline": baseline,
@@ -696,9 +720,13 @@ class AntiProxyCheck:
             "mode": mode,
             "details": (
                 f"app reagiu à presença de proxy/VPN: {'; '.join(strong[:5])}"
-                if strong else (
-                    "app consultou APIs de rede, sem reação"
-                    if weak else "nenhuma checagem de proxy/VPN observada"
+                if strong and reaction else (
+                    "app consultou canal forte de proxy/VPN, sem reação "
+                    f"observada: {'; '.join(strong[:5])}"
+                    if strong else (
+                        "app consultou APIs de rede, sem canal forte nem reação"
+                        if weak else "nenhuma checagem de proxy/VPN observada"
+                    )
                 )
             ),
             **({"error": error} if error else {}),
@@ -993,10 +1021,17 @@ class AntiProxyCheck:
             "protection_detected": protection_detected,
             "proxy_detected": proxy_detected,
             "vpn_detected": vpn_detected,
+            "reaction_observed": bool(
+                app_detection.get("reaction_observed")
+            ),
+            "query_only": bool(app_detection.get("query_only")),
             "bypass_successful": bypass_successful,
             "bypass_method": bypass_method if bypass_details else None,
             "bypass_skipped_reason": bypass_skipped_reason,
             "bypass_details": bypass_details,
+            "bypass_tls_neutralized": int(
+                (bypass_details or {}).get("tls_neutralized") or 0
+            ),
             "probe_method": probe_method,
             "protection_sources": protection_sources,
             "static_detection": static,
