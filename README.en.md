@@ -1117,45 +1117,81 @@ generate a report from saved state alone, invalidate inconsistent state
 and expose artifacts through stable IDs. MCP remains **after** this
 phase.
 
-## MCP integration (next phase — planned)
+## Next steps before MCP (checklist)
+
+**Status:** phase 3 (sessions/service) and the proxy/VPN vector are
+implemented. The MCP server has **not** been started.
+
+Before implementing MCP:
+
+- [ ] **Full device smoke:** `static → detect → bypass → report`, with
+  the `anti_proxy` check through both `--proxy-method module` and
+  `frida`. The current validation covered each path separately; the full
+  pipeline with the new vector is still pending.
+- [ ] **Updated module:** validate the module APK with `ProxyShield` on
+  a clean device. A `--module-apk` built before this change lacks the
+  layer and must be rebuilt.
+- [ ] **Async contract:** settle `run_async`, `session.status`/`progress`,
+  `cancel_requested`, per-tool timeout and orphaned `running` sessions
+  after a process crash.
+- [ ] **Session-aware tools:** define MCP signatures around `session_id`
+  (not `device_id`), returning `{session_id, status, ...}` and
+  `raspilot://sessions/...` resources.
+- [ ] **Repack confirmation:** persist the two-step flow in the session
+  (pending action/token), never reusing a confirmation across sessions
+  or devices.
+- [ ] **Concurrency:** two calls on the same device must fail fast with
+  `SessionBusy`; different devices may run in parallel.
+- [ ] **Transport/packaging:** choose `FastMCP` stdio vs HTTP, add a
+  separate dependency, keep stdout clean and logs on stderr (the service
+  is already headless).
+- [ ] **Limits/security:** per-tool timeout, cancellation, explicit
+  device selection and authentication for an HTTP transport.
+- [ ] **Schema/observability:** expose `metadata.session_id`, report
+  paths, `summary.json` and error/skip/cancel codes.
+- [ ] **MCP integration tests:** exercise the tools with a mocked
+  `RaspilotService`, without a device.
+
+MCP starts only after these items are closed.
+
+## MCP integration (planned, not started)
 
 The foundation is ready: MCP tools should operate on a `session_id`
 (created by `--session`/`RaspilotService.create`) rather than an isolated
-run. Long-running tools should use `RaspilotService.run_async()` and poll
+run. Long-running tools use `RaspilotService.run_async()` and poll
 `session.json`/`progress` (or the
 `raspilot://sessions/{id}/session.json` resource) until the state leaves
 `running`; the per-device lock guarantees one run per device.
 
-Every check's `run_all()` is a pure function: it receives an injected
-`DeviceManager` and returns a `dict`, with no global side effects — ready to
-be wrapped as MCP tools with `FastMCP`:
+Planned tool shape:
 
 | Planned MCP tool | Internal mapping |
 |---|---|
-| `raspilot_start_assessment(package_name, device_id=None) -> dict` | `DeviceManager.connect_adb()` + `setup_frida_server()` + pipeline |
-| `raspilot_check_anti_root(device_id) -> dict` | `AntiRootCheck(dm).run_all()` |
-| `raspilot_check_anti_frida(device_id) -> dict` | `AntiFridaCheck(dm).run_all(session, pid)` |
-| `raspilot_check_anti_tampering(device_id, package_name) -> dict` | `AntiTamperingCheck(dm).run_all(...)` |
-| `raspilot_test_repack(device_id, package_name, variants, gadget=None) -> dict` | `RepackTester(...).run()` — requires explicit confirmation before reinstalling |
-| `raspilot_check_anti_emulator(device_id, package_name) -> dict` | `AntiEmulatorCheck(dm).run_all(package)` |
-| `raspilot_check_anti_hooking(device_id, package_name) -> dict` | `AntiHookingCheck(dm).run_all(package)` |
-| `raspilot_bypass_ssl_pinning(device_id, package_name) -> dict` | `SSLPinningCheck(dm).run_all(package)` |
-| `raspilot_verificar_proxy_vpn(device_id, package_name) -> dict` | `AntiProxyCheck(dm).run_all(package)` |
-| `raspilot_get_report() -> dict` | `Reporter.generate_json()` |
+| `raspilot_start_assessment(package_name, device_id=None, stage="full", mode=None) -> {session_id, status}` | `RaspilotService.create()` + `run_async()` |
+| `raspilot_status(session_id) -> dict` | `SessionStore.load()` + `progress`/`status` |
+| `raspilot_cancel(session_id) -> dict` | `RaspilotService.request_cancel()` |
+| `raspilot_list_sessions() -> list` | `SessionStore.list()` |
+| `raspilot_get_report(session_id, format="json") -> dict` | `report.json`/`summary.json` resource |
+| `raspilot_check_anti_root(session_id) -> dict` | `AntiRootCheck(dm).run_all(...)` |
+| `raspilot_check_anti_frida(session_id) -> dict` | `AntiFridaCheck(dm).run_all(session, pid)` |
+| `raspilot_check_anti_tampering(session_id) -> dict` | `AntiTamperingCheck(dm).run_all(...)` |
+| `raspilot_check_anti_emulator(session_id) -> dict` | `AntiEmulatorCheck(dm).run_all(package)` |
+| `raspilot_check_anti_hooking(session_id) -> dict` | `AntiHookingCheck(dm).run_all(package)` |
+| `raspilot_check_proxy_vpn(session_id) -> dict` | `AntiProxyCheck(dm).run_all(package)` |
+| `raspilot_bypass_ssl_pinning(session_id) -> dict` | `SSLPinningCheck(dm).run_all(package)` |
+| `raspilot_test_repack(session_id, variants, gadget=None, confirmation=None) -> dict` | `RepackTester(...).run()` — two steps, destructive |
 
-The JSON emitted by RASPilot already follows a stable schema
+Planned resources are the ones already implemented by the session:
+`raspilot://sessions`, `raspilot://sessions/{id}/session.json`,
+`summary.json`, `report.json`, `report.html`, `static.json` and
+`checks/{check}.json`.
+
+The JSON emitted by RASPilot follows a stable schema
 (`metadata` / `summary` / `execution_log` / `details`) designed for direct
 LLM reading. `metadata.schema_version` (currently **5**) detects
 incompatible changes and `metadata.run` records the execution context
 (CLI arguments, Frida version, port, sha256 hashes of the injection
-scripts, target pid and
-baseline result) so the run can be reproduced.
-
-For MCP, the pipeline is already prepared with staged analysis and clean
-output: `--stage static|detect|bypass`, `--only`, `--apk` and
-`--json-only`. Each MCP tool can map to a stage/check and return a
-`dict` with `summary` + report path, leaving the full JSON/HTML as a
-*resource*. Cross-call state/session belongs to the next phase.
+scripts, target pid and baseline result).
 
 ---
 

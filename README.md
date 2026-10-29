@@ -1160,48 +1160,81 @@ Critérios atendidos: retomar sem repetir o estático, gerar relatório só
 do estado salvo, invalidar estado inconsistente e expor artefatos por
 IDs estáveis. O MCP continua **depois** desta fase.
 
-## Integração MCP (próxima fase — planejada)
+## Próximos passos antes do MCP (checklist)
 
-A base já está pronta: as ferramentas MCP devem operar sobre
-`session_id` (criado por `--session`/`RaspilotService.create`) e não
-sobre uma execução isolada. Ferramentas longas devem usar
-`RaspilotService.run_async()` e consultar `session.json`/`progress` (ou
-o recurso `raspilot://sessions/{id}/session.json`) até o estado sair de
-`running`; o lock por device garante uma execução por aparelho.
+**Status:** fase 3 (sessões/serviço) e o vetor proxy/VPN estão
+implementados. O servidor MCP **ainda não foi iniciado**.
 
-Os `run_all()` de cada check são funções puras: recebem o `DeviceManager`
-injetado e retornam `dict`, sem efeitos colaterais globais — prontos para
-serem envolvidos como ferramentas MCP com `FastMCP`:
+Antes de implementar o MCP:
+
+- [ ] **Smoke completo em device:** `static → detect → bypass → report`,
+  com o check `anti_proxy` nos caminhos `--proxy-method module` e
+  `frida`. A validação atual cobriu os caminhos isoladamente; falta o
+  pipeline completo com o novo vetor.
+- [ ] **Módulo atualizado:** validar o APK do módulo com `ProxyShield`
+  em um device limpo. Um `--module-apk` gerado antes desta mudança não
+  contém essa camada e precisa ser reconstruído.
+- [ ] **Contrato assíncrono:** fechar semântica de `run_async`,
+  `session.status`/`progress`, `cancel_requested`, timeout por tool e
+  tratamento de sessão `running` órfã após queda do processo.
+- [ ] **Ferramentas session-aware:** definir as assinaturas MCP em torno
+  de `session_id` (não `device_id`), com retorno
+  `{session_id, status, ...}` e recursos `raspilot://sessions/...`.
+- [ ] **Confirmação do repack:** persistir o fluxo em duas etapas na
+  própria sessão (ação pendente/token), sem reutilizar confirmação entre
+  sessões ou devices.
+- [ ] **Concorrência:** duas chamadas no mesmo device devem falhar rápido
+  com `SessionBusy`; devices diferentes podem rodar em paralelo.
+- [ ] **Transporte/empacotamento:** decidir `FastMCP` stdio vs HTTP,
+  adicionar dependência separada, manter stdout limpo e logs em stderr
+  (o serviço já é headless).
+- [ ] **Limites/segurança:** timeout por tool, cancelamento, seleção
+  explícita de device e autenticação caso o transporte seja HTTP.
+- [ ] **Schema/observabilidade:** expor `metadata.session_id`, caminhos
+  dos relatórios, `summary.json` e códigos de erro/skip/cancel.
+- [ ] **Testes de integração MCP:** exercitar as ferramentas com
+  `RaspilotService` mockado, sem device.
+
+O MCP só começa depois que esses itens estiverem fechados.
+
+## Integração MCP (planejada, não iniciada)
+
+A base está pronta: ferramentas MCP devem operar sobre `session_id`
+(criado por `--session`/`RaspilotService.create`) e não sobre uma
+execução isolada. Ferramentas longas usam `RaspilotService.run_async()` e
+consultam `session.json`/`progress` (ou
+`raspilot://sessions/{id}/session.json`) até o estado sair de `running`;
+o lock por device garante uma execução por aparelho.
+
+Formato planejado das ferramentas:
 
 | Ferramenta MCP planejada | Mapeamento interno |
 |---|---|
-| `raspilot_iniciar_avaliacao(package_name, device_id=None) -> dict` | `DeviceManager.connect_adb()` + `setup_frida_server()` + pipeline |
-| `raspilot_verificar_anti_root(device_id) -> dict` | `AntiRootCheck(dm).run_all()` |
-| `raspilot_verificar_anti_frida(device_id) -> dict` | `AntiFridaCheck(dm).run_all(session, pid)` |
-| `raspilot_verificar_anti_tampering(device_id, package_name) -> dict` | `AntiTamperingCheck(dm).run_all(...)` |
-| `raspilot_testar_repack(device_id, package_name, variants, gadget=None) -> dict` | `RepackTester(...).run()` — exige confirmação explícita antes de reinstalar |
-| `raspilot_verificar_anti_emulator(device_id, package_name) -> dict` | `AntiEmulatorCheck(dm).run_all(package)` |
-| `raspilot_verificar_anti_hooking(device_id, package_name) -> dict` | `AntiHookingCheck(dm).run_all(package)` |
-| `raspilot_verificar_proxy_vpn(device_id, package_name) -> dict` | `AntiProxyCheck(dm).run_all(package)` |
-| `raspilot_bypass_ssl_pinning(device_id, package_name) -> dict` | `SSLPinningCheck(dm).run_all(package)` |
-| `raspilot_obter_relatorio() -> dict` | `Reporter.generate_json()` |
+| `raspilot_iniciar_avaliacao(package_name, device_id=None, stage="full", mode=None) -> {session_id, status}` | `RaspilotService.create()` + `run_async()` |
+| `raspilot_status(session_id) -> dict` | `SessionStore.load()` + `progress`/`status` |
+| `raspilot_cancelar(session_id) -> dict` | `RaspilotService.request_cancel()` |
+| `raspilot_listar_sessoes() -> list` | `SessionStore.list()` |
+| `raspilot_obter_relatorio(session_id, format="json") -> dict` | recurso `report.json`/`summary.json` |
+| `raspilot_verificar_anti_root(session_id) -> dict` | `AntiRootCheck(dm).run_all(...)` |
+| `raspilot_verificar_anti_frida(session_id) -> dict` | `AntiFridaCheck(dm).run_all(session, pid)` |
+| `raspilot_verificar_anti_tampering(session_id) -> dict` | `AntiTamperingCheck(dm).run_all(...)` |
+| `raspilot_verificar_anti_emulator(session_id) -> dict` | `AntiEmulatorCheck(dm).run_all(package)` |
+| `raspilot_verificar_anti_hooking(session_id) -> dict` | `AntiHookingCheck(dm).run_all(package)` |
+| `raspilot_verificar_proxy_vpn(session_id) -> dict` | `AntiProxyCheck(dm).run_all(package)` |
+| `raspilot_bypass_ssl_pinning(session_id) -> dict` | `SSLPinningCheck(dm).run_all(package)` |
+| `raspilot_testar_repack(session_id, variants, gadget=None, confirmation=None) -> dict` | `RepackTester(...).run()` — duas etapas, destrutivo |
 
-O JSON emitido pelo RASPilot já segue um schema estável
+Os recursos previstos são os já implementados pela sessão:
+`raspilot://sessions`, `raspilot://sessions/{id}/session.json`,
+`summary.json`, `report.json`, `report.html`, `static.json` e
+`checks/{check}.json`.
+
+O JSON emitido pelo RASPilot segue um schema estável
 (`metadata` / `summary` / `execution_log` / `details`) pensado para leitura
 direta por LLMs. `metadata.schema_version` (atual **5**) permite detectar
 mudanças incompatíveis e `metadata.run` registra o contexto da execução
 (argumentos da CLI, versão do Frida, porta, hashes sha256 dos scripts de
-injeção, pid alvo e resultado do baseline) para que a execução possa ser
-reproduzida.
-
-Para MCP, o pipeline já foi preparado com análise por etapas e saída
-limpa: `--stage static|detect|bypass`, `--only`, `--apk` e `--json-only`.
-Cada ferramenta MCP pode mapear para uma etapa/check e retornar um `dict`
-com `summary` + caminho do relatório, deixando o JSON/HTML completo como
-*resource*. O repack deve ser uma ferramenta separada, com confirmação
-em duas etapas: a primeira informa que o app será desinstalado e que os
-dados serão perdidos; a segunda só executa com autorização explícita.
-O estado/sessão entre chamadas entra na fase seguinte.
+injeção, pid alvo e resultado do baseline).
 
 ---
 
